@@ -21,6 +21,8 @@ struct Slide {
     number: usize,
     /// Each element is one shape's worth of text (paragraphs joined by newlines).
     shapes: Vec<ShapeText>,
+    /// Inline image references for this slide (e.g., `![][image1]`).
+    images: Vec<String>,
 }
 
 /// Text extracted from a single shape, preserving paragraph structure.
@@ -65,20 +67,36 @@ struct TextRun {
 
 /// Extract plain text from a .pptx file.
 pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let slides = parse_pptx(data)?;
+    let (slides, _) = parse_pptx(data, false)?;
     Ok(render_plain(&slides))
 }
 
 /// Extract markdown-formatted text from a .pptx file.
-pub(crate) fn extract_markdown(data: &[u8]) -> crate::error::Result<String> {
-    let slides = parse_pptx(data)?;
-    Ok(render_markdown(&slides))
+///
+/// When `images` is true, embedded images are extracted and included as
+/// reference-style base64 images with definitions appended at the end.
+pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
+    let (slides, image_defs) = parse_pptx(data, images)?;
+    let mut md = render_markdown(&slides);
+    if !image_defs.is_empty() {
+        for def in &image_defs {
+            md.push_str(def);
+            md.push('\n');
+        }
+    }
+    Ok(md)
 }
 
 // ── Parsing ────────────────────────────────────────────────────────
 
-/// Parse the pptx archive into a list of slides.
-fn parse_pptx(data: &[u8]) -> crate::error::Result<Vec<Slide>> {
+/// Parse the pptx archive into slides and image reference definitions.
+///
+/// When `extract_images` is true, image relationships are loaded and
+/// `<p:pic>` elements are extracted as reference-style images.
+fn parse_pptx(
+    data: &[u8],
+    extract_images: bool,
+) -> crate::error::Result<(Vec<Slide>, Vec<String>)> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
 
@@ -86,6 +104,9 @@ fn parse_pptx(data: &[u8]) -> crate::error::Result<Vec<Slide>> {
     let slide_paths = discover_slides(&mut archive)?;
 
     let mut slides = Vec::new();
+    let mut all_image_defs = Vec::new();
+    let mut image_counter = 0usize;
+
     for (num, path) in slide_paths {
         let mut xml = String::new();
         match archive.by_name(&path) {
@@ -99,14 +120,98 @@ fn parse_pptx(data: &[u8]) -> crate::error::Result<Vec<Slide>> {
         let slide_rels_path = xml_util::rels_path(&path);
         let rels = xml_util::load_rels(&mut archive, &slide_rels_path);
 
+        // Optionally load image rels for this slide
+        let image_rels = if extract_images {
+            xml_util::load_image_rels(&mut archive, &slide_rels_path)
+        } else {
+            xml_util::Rels::new()
+        };
+
         let shapes = parse_slide_xml(&xml, &rels);
+
+        // Extract images from <p:pic> elements
+        let images = if extract_images && !image_rels.is_empty() {
+            let pic_rids = parse_slide_pic_rids(&xml);
+            let base_dir = path.rsplit_once('/').map_or("ppt", |(dir, _)| dir);
+            let mut inline_refs = Vec::new();
+            for rid in pic_rids {
+                if let Some(target) = image_rels.get(&rid) {
+                    if let Some(data) =
+                        xml_util::read_image_from_zip(&mut archive, target, base_dir)
+                    {
+                        image_counter += 1;
+                        let id = format!("image{image_counter}");
+                        if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
+                            inline_refs.push(img_ref.inline);
+                            all_image_defs.push(img_ref.definition);
+                        }
+                    }
+                }
+            }
+            inline_refs
+        } else {
+            Vec::new()
+        };
+
         slides.push(Slide {
             number: num,
             shapes,
+            images,
         });
     }
 
-    Ok(slides)
+    Ok((slides, all_image_defs))
+}
+
+/// Parse a slide's XML to extract rId values from `<p:pic>` → `<a:blip>` elements.
+///
+/// Returns the rIds in document order.
+fn parse_slide_pic_rids(xml: &str) -> Vec<String> {
+    let mut rids = Vec::new();
+    let mut reader = Reader::from_str(xml);
+    let mut in_pic = false;
+    let mut depth = 0u32;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                if e.local_name().as_ref() == b"pic" {
+                    in_pic = true;
+                    depth = 1;
+                } else if in_pic {
+                    depth += 1;
+                    if e.local_name().as_ref() == b"blip" {
+                        if let Some(rid) = get_attr(e, b"r:embed") {
+                            rids.push(rid);
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) if in_pic => {
+                if e.local_name().as_ref() == b"blip" {
+                    if let Some(rid) = get_attr(e, b"r:embed") {
+                        rids.push(rid);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if in_pic {
+                    if e.local_name().as_ref() == b"pic" {
+                        in_pic = false;
+                    } else {
+                        depth -= 1;
+                        if depth == 0 {
+                            in_pic = false;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    rids
 }
 
 /// Discover slide file paths from presentation.xml, in order.
@@ -601,7 +706,7 @@ fn render_markdown(slides: &[Slide]) -> String {
     let multiple = slides.len() > 1;
 
     for slide in slides {
-        if slide.shapes.is_empty() {
+        if slide.shapes.is_empty() && slide.images.is_empty() {
             continue;
         }
 
@@ -673,6 +778,12 @@ fn render_markdown(slides: &[Slide]) -> String {
             if prev_was_list {
                 out.push('\n');
             }
+        }
+
+        // Render embedded images after text content
+        for img_md in &slide.images {
+            out.push_str(img_md);
+            out.push_str("\n\n");
         }
     }
 
@@ -809,6 +920,7 @@ mod tests {
                     },
                 ],
             }],
+            images: Vec::new(),
         }];
 
         let md = render_markdown(&slides);
@@ -835,6 +947,7 @@ mod tests {
                     bullet: BulletKind::None,
                 }],
             }],
+            images: Vec::new(),
         }];
 
         let text = render_plain(&slides);
@@ -859,6 +972,7 @@ mod tests {
                         bullet: BulletKind::None,
                     }],
                 }],
+                images: Vec::new(),
             },
             Slide {
                 number: 2,
@@ -875,6 +989,7 @@ mod tests {
                         bullet: BulletKind::None,
                     }],
                 }],
+                images: Vec::new(),
             },
         ];
 
@@ -905,6 +1020,7 @@ mod tests {
                         bullet: BulletKind::None,
                     }],
                 }],
+                images: Vec::new(),
             },
             Slide {
                 number: 2,
@@ -921,6 +1037,7 @@ mod tests {
                         bullet: BulletKind::None,
                     }],
                 }],
+                images: Vec::new(),
             },
         ];
 
@@ -1093,6 +1210,7 @@ mod tests {
                     },
                 ],
             }],
+            images: Vec::new(),
         }];
 
         let md = render_markdown(&slides);
@@ -1131,6 +1249,7 @@ mod tests {
                     },
                 ],
             }],
+            images: Vec::new(),
         }];
 
         let md = render_markdown(&slides);
@@ -1168,6 +1287,7 @@ mod tests {
                     },
                 ],
             }],
+            images: Vec::new(),
         }];
 
         let text = render_plain(&slides);

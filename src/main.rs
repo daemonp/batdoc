@@ -38,10 +38,16 @@ Usage: batdoc [OPTIONS] [FILE...]
 Options:
   -p, --plain       Force plain text output (no colors, no decorations)
   -m, --markdown    Output as markdown (default when terminal detected)
+  -i, --images      Embed images as inline base64 data URIs in markdown
   -h, --help        Show this help
 
 When stdout is a terminal, output is pretty-printed as syntax-highlighted
 markdown with decorations. When piped, output is plain text.
+
+--images extracts embedded images from .docx, .pptx, and .xlsx files and
+includes them as ![](data:image/...;base64,...) in the markdown output.
+Most useful when piping to a file (batdoc --images report.docx > out.md).
+Ignored in plain text mode and for formats without image support (.doc, .xls, .pdf).
 
 Multiple files can be specified and will be processed in order.
 Use - to read from stdin explicitly.
@@ -89,6 +95,7 @@ enum Format {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut mode = Mode::Auto;
+    let mut images = false;
     let mut files: Vec<String> = Vec::new();
 
     for arg in &args {
@@ -99,6 +106,7 @@ fn main() {
             }
             "-p" | "--plain" => mode = Mode::Plain,
             "-m" | "--markdown" => mode = Mode::Markdown,
+            "-i" | "--images" => images = true,
             "-" => files.push("-".to_string()),
             s if s.starts_with('-') => {
                 eprintln!("batdoc: unknown option: {s}");
@@ -148,7 +156,7 @@ fn main() {
 
         let multiple = files.len() > 1;
 
-        if let Err(e) = run(&buf, &filename, mode, multiple && i > 0) {
+        if let Err(e) = run(&buf, &filename, mode, images, multiple && i > 0) {
             eprintln!("batdoc: {filename}: {e}");
             exit_code = 1;
         }
@@ -201,7 +209,13 @@ fn detect_format(data: &[u8]) -> error::Result<Format> {
     }
 }
 
-fn run(data: &[u8], filename: &str, mode: Mode, needs_separator: bool) -> error::Result<()> {
+fn run(
+    data: &[u8],
+    filename: &str,
+    mode: Mode,
+    images: bool,
+    needs_separator: bool,
+) -> error::Result<()> {
     let format = detect_format(data)?;
     let is_tty = io::stdout().is_terminal();
 
@@ -215,7 +229,7 @@ fn run(data: &[u8], filename: &str, mode: Mode, needs_separator: bool) -> error:
             io::stdout().write_all(text.as_bytes())?;
         }
         Mode::Markdown => {
-            let md = extract_markdown(data, format)?;
+            let md = extract_markdown(data, format, images)?;
             if is_tty {
                 pretty_print(&md, filename)?;
             } else {
@@ -224,7 +238,7 @@ fn run(data: &[u8], filename: &str, mode: Mode, needs_separator: bool) -> error:
         }
         Mode::Auto => {
             if is_tty {
-                let md = extract_markdown(data, format)?;
+                let md = extract_markdown(data, format, images)?;
                 pretty_print(&md, filename)?;
             } else {
                 let text = extract_plain(data, format)?;
@@ -247,13 +261,13 @@ fn extract_plain(data: &[u8], format: Format) -> error::Result<String> {
     }
 }
 
-fn extract_markdown(data: &[u8], format: Format) -> error::Result<String> {
+fn extract_markdown(data: &[u8], format: Format, images: bool) -> error::Result<String> {
     match format {
         Format::Doc => doc::extract_markdown(data),
         Format::Xls => xls::extract_markdown(data),
-        Format::Docx => docx::extract_markdown(data),
-        Format::Xlsx => xlsx::extract_markdown(data),
-        Format::Pptx => pptx::extract_markdown(data),
+        Format::Docx => docx::extract_markdown(data, images),
+        Format::Xlsx => xlsx::extract_markdown(data, images),
+        Format::Pptx => pptx::extract_markdown(data, images),
         Format::Pdf => pdf::extract_markdown(data),
     }
 }

@@ -21,9 +21,21 @@ pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
 }
 
 /// Extract markdown-formatted text from an .xlsx file.
-pub(crate) fn extract_markdown(data: &[u8]) -> crate::error::Result<String> {
+///
+/// When `images` is true, embedded images from drawings are extracted
+/// and appended as reference-style base64 images with definitions at the end.
+pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
     let sheets = parse_xlsx(data)?;
-    Ok(crate::sheet::render_markdown(&sheets))
+    let mut md = crate::sheet::render_markdown(&sheets);
+
+    if images {
+        let cursor = Cursor::new(data);
+        let mut archive = ZipArchive::new(cursor)?;
+        let sheet_info = discover_sheets(&mut archive)?;
+        append_sheet_images(&mut md, &sheet_info, &mut archive);
+    }
+
+    Ok(md)
 }
 
 // ── Parsing ────────────────────────────────────────────────────────
@@ -211,6 +223,158 @@ fn apply_hyperlinks(xml: &str, rels: &Rels, rows: &mut [Vec<String>]) {
             _ => {}
         }
     }
+}
+
+// ── Image extraction ─────────────────────────────────────────────
+
+/// Append embedded images from drawing overlays to the markdown output.
+///
+/// For each sheet that has a drawing relationship, parses the drawing XML
+/// to find `<a:blip>` references, reads the images from the ZIP, and
+/// appends them as reference-style markdown images. Inline refs go in the
+/// text flow; definitions are collected and appended at the document end.
+fn append_sheet_images(
+    md: &mut String,
+    sheet_info: &[(String, String)],
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+) {
+    let mut image_counter = 0usize;
+    let mut inline_refs = Vec::new();
+    let mut definitions = Vec::new();
+
+    for (_name, path) in sheet_info {
+        // Load the sheet's relationships to find drawing references
+        let sheet_rels_path = xml_util::rels_path(path);
+        let mut rels_xml = String::new();
+        if let Ok(mut entry) = archive.by_name(&sheet_rels_path) {
+            let _ = entry.read_to_string(&mut rels_xml);
+        } else {
+            continue;
+        }
+
+        // Find drawing relationships (Type ends with /drawing)
+        let drawing_targets = parse_drawing_rels(&rels_xml);
+        if drawing_targets.is_empty() {
+            continue;
+        }
+
+        let base_dir = path.rsplit_once('/').map_or("xl", |(dir, _)| dir);
+
+        for drawing_target in &drawing_targets {
+            // Resolve drawing path relative to the sheet
+            let drawing_path = if drawing_target.starts_with('/') {
+                drawing_target.trim_start_matches('/').to_string()
+            } else {
+                let raw = format!("{base_dir}/{drawing_target}");
+                // Normalize ../
+                normalize_dotdot(&raw)
+            };
+
+            // Read drawing XML
+            let mut drawing_xml = String::new();
+            if let Ok(mut entry) = archive.by_name(&drawing_path) {
+                let _ = entry.read_to_string(&mut drawing_xml);
+            } else {
+                continue;
+            }
+
+            // Load image rels for the drawing
+            let drawing_rels_path = xml_util::rels_path(&drawing_path);
+            let image_rels = xml_util::load_image_rels(archive, &drawing_rels_path);
+            if image_rels.is_empty() {
+                continue;
+            }
+
+            // Extract blip rIds from drawing XML
+            let rids = parse_drawing_blip_rids(&drawing_xml);
+            let drawing_base = drawing_path.rsplit_once('/').map_or("xl", |(dir, _)| dir);
+
+            for rid in &rids {
+                if let Some(target) = image_rels.get(rid) {
+                    if let Some(data) = xml_util::read_image_from_zip(archive, target, drawing_base)
+                    {
+                        image_counter += 1;
+                        let id = format!("image{image_counter}");
+                        if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
+                            inline_refs.push(img_ref.inline);
+                            definitions.push(img_ref.definition);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Append inline references in the text flow
+    for inline in &inline_refs {
+        md.push_str(inline);
+        md.push_str("\n\n");
+    }
+
+    // Append definitions at the end
+    for def in &definitions {
+        md.push_str(def);
+        md.push('\n');
+    }
+}
+
+/// Parse relationships XML to find drawing targets.
+fn parse_drawing_rels(xml: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut reader = Reader::from_str(xml);
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Empty(ref e) | Event::Start(ref e))
+                if e.local_name().as_ref() == b"Relationship" =>
+            {
+                let rel_type = get_attr(e, b"Type").unwrap_or_default();
+                let target = get_attr(e, b"Target").unwrap_or_default();
+                if rel_type.ends_with("/drawing") && !target.is_empty() {
+                    targets.push(target);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    targets
+}
+
+/// Extract blip rIds from drawing XML (`<a:blip r:embed="rIdN"/>`).
+fn parse_drawing_blip_rids(xml: &str) -> Vec<String> {
+    let mut rids = Vec::new();
+    let mut reader = Reader::from_str(xml);
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
+                if e.local_name().as_ref() == b"blip" {
+                    if let Some(rid) = get_attr(e, b"r:embed") {
+                        rids.push(rid);
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    rids
+}
+
+/// Normalize a path by resolving `..` segments.
+fn normalize_dotdot(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        if segment == ".." {
+            parts.pop();
+        } else if !segment.is_empty() && segment != "." {
+            parts.push(segment);
+        }
+    }
+    parts.join("/")
 }
 
 /// Extract the 0-based row number from a cell reference like "B3" → 2.

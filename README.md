@@ -83,12 +83,27 @@ cat FILE | batdoc [OPTIONS]
 
   -p, --plain       plain text, no highlighting
   -m, --markdown    force markdown (default on tty)
+  -i, --images      embed images as inline base64 data URIs
   -h, --help        help
 ```
 
+`--images` extracts embedded images from `.docx`, `.pptx`, and `.xlsx`
+files and includes them as `![](data:image/...;base64,...)` in the
+markdown output. Most useful when piping to a file:
+
+```
+batdoc --images report.docx > report.md
+```
+
+The resulting markdown is self-contained — no external image files
+needed. JPEG, PNG, GIF, WebP, and BMP images are supported; vector
+formats (EMF/WMF) are silently skipped. Ignored in plain text mode
+and for formats without OOXML image support (`.doc`, `.xls`, `.pdf`).
+
 ## Known limitations
 
-- Text only — no images, charts, or embedded objects.
+- `--images` supports `.docx`/`.pptx`/`.xlsx` only. Legacy `.doc`/`.xls`
+  images are in MSODRAW binary format and not extracted. No PDF images.
 - `.doc` heading/table detection is heuristic. It's good, not perfect.
 - Only BIFF8 (Excel 97+). Older BIFF5 `.xls` files won't parse.
 - No legacy `.ppt` support — only modern `.pptx`.
@@ -99,7 +114,7 @@ cat FILE | batdoc [OPTIONS]
 
 ## Dependencies
 
-Seven crates, no C, no system libs: `bat`, `cfb`, `encoding_rs`,
+Eight crates, no C, no system libs: `base64`, `bat`, `cfb`, `encoding_rs`,
 `pdf-extract`, `quick-xml`, `zip`, `is-terminal`.
 
 ## History

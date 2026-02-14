@@ -16,8 +16,17 @@ use crate::xml_util::{self, get_attr, Rels};
 /// Extracted document structure for rich output.
 #[derive(Debug)]
 enum Block {
-    Paragraph { style: ParaStyle, runs: Vec<Run> },
-    Table { rows: Vec<Row> }, // rows -> cells -> blocks
+    Paragraph {
+        style: ParaStyle,
+        runs: Vec<Run>,
+    },
+    Table {
+        rows: Vec<Row>,
+    }, // rows -> cells -> blocks
+    /// An embedded image, stored as a base64 data URI markdown tag.
+    Image {
+        markdown: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,23 +51,46 @@ type Row = Vec<Cell>;
 
 /// Extract plain text from a .docx file.
 pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let blocks = parse_docx(data)?;
+    let (blocks, _) = parse_docx(data, false)?;
     Ok(render_plain(&blocks))
 }
 
 /// Extract markdown-formatted text from a .docx file.
-pub(crate) fn extract_markdown(data: &[u8]) -> crate::error::Result<String> {
-    let blocks = parse_docx(data)?;
-    Ok(render_markdown(&blocks))
+///
+/// When `images` is true, embedded images are extracted and included as
+/// reference-style base64 images: `![][imageN]` inline with definitions
+/// appended at the end of the document.
+pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
+    let (blocks, image_defs) = parse_docx(data, images)?;
+    let mut md = render_markdown(&blocks);
+    if !image_defs.is_empty() {
+        for def in &image_defs {
+            md.push_str(def);
+            md.push('\n');
+        }
+    }
+    Ok(md)
 }
 
-/// Parse the docx XML into structured blocks.
-fn parse_docx(data: &[u8]) -> crate::error::Result<Vec<Block>> {
+/// Parse the docx XML into structured blocks and image reference definitions.
+///
+/// When `images` is true, image relationships are loaded and `<w:drawing>`
+/// elements are extracted as `Block::Image` entries with inline references.
+/// The second element of the tuple contains the reference definitions to
+/// append at the end of the document.
+fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<(Vec<Block>, Vec<String>)> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
 
     // Load hyperlink relationships (rId → URL)
     let rels = xml_util::load_rels(&mut archive, "word/_rels/document.xml.rels");
+
+    // Optionally load image relationships
+    let image_rels = if images {
+        xml_util::load_image_rels(&mut archive, "word/_rels/document.xml.rels")
+    } else {
+        xml_util::Rels::new()
+    };
 
     let mut xml = String::new();
     archive
@@ -69,9 +101,18 @@ fn parse_docx(data: &[u8]) -> crate::error::Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut in_body = false;
 
-    parse_body(&mut reader, &mut blocks, &mut in_body, &rels);
+    parse_body(&mut reader, &mut blocks, &mut in_body, &rels, &image_rels);
 
-    Ok(blocks)
+    // If images enabled, resolve image blocks by reading from the archive
+    let image_defs = if images {
+        let cursor = Cursor::new(data);
+        let mut archive = ZipArchive::new(cursor)?;
+        resolve_images(&mut blocks, &mut archive)
+    } else {
+        Vec::new()
+    };
+
+    Ok((blocks, image_defs))
 }
 
 /// Walk the XML and collect blocks from the document body.
@@ -80,6 +121,7 @@ fn parse_body(
     blocks: &mut Vec<Block>,
     in_body: &mut bool,
     rels: &Rels,
+    image_rels: &Rels,
 ) {
     loop {
         match reader.read_event() {
@@ -88,8 +130,8 @@ fn parse_body(
                 match name.as_ref() {
                     b"body" => *in_body = true,
                     b"p" if *in_body => {
-                        let block = parse_paragraph(reader, rels);
-                        blocks.push(block);
+                        let mut para_blocks = parse_paragraph(reader, rels, image_rels);
+                        blocks.append(&mut para_blocks);
                     }
                     b"tbl" if *in_body => {
                         let table = parse_table(reader, rels);
@@ -109,10 +151,16 @@ fn parse_body(
     }
 }
 
-/// Parse a `<w:p>` element into a `Block::Paragraph`.
-fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
+/// Parse a `<w:p>` element into blocks.
+///
+/// Normally returns a single `Block::Paragraph`, but when image extraction
+/// is active, any `<w:drawing>` elements (which live inside `<w:r>` runs)
+/// produce additional `Block::Image` entries. The paragraph is always first,
+/// followed by any images found.
+fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -> Vec<Block> {
     let mut style = ParaStyle::default();
     let mut runs: Vec<Run> = Vec::new();
+    let mut image_blocks: Vec<Block> = Vec::new();
 
     loop {
         match reader.read_event() {
@@ -121,14 +169,24 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
                 match name.as_ref() {
                     b"pPr" => parse_para_props(reader, &mut style),
                     b"r" => {
-                        if let Some(run) = parse_run(reader) {
+                        let (run_opt, img_opt) = parse_run(reader, image_rels);
+                        if let Some(run) = run_opt {
                             runs.push(run);
+                        }
+                        if let Some(blk) = img_opt {
+                            image_blocks.push(blk);
                         }
                     }
                     b"hyperlink" => {
                         // Resolve the hyperlink URL from r:id → rels map
                         let url = get_attr(e, b"r:id").and_then(|rid| rels.get(&rid).cloned());
-                        parse_hyperlink_runs(reader, &mut runs, url.as_deref());
+                        parse_hyperlink_runs(
+                            reader,
+                            &mut runs,
+                            url.as_deref(),
+                            image_rels,
+                            &mut image_blocks,
+                        );
                     }
                     _ => {}
                 }
@@ -161,7 +219,9 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
         }
     }
 
-    Block::Paragraph { style, runs }
+    let mut result = vec![Block::Paragraph { style, runs }];
+    result.append(&mut image_blocks);
+    result
 }
 
 /// Parse `<w:pPr>` to extract heading level and list info.
@@ -225,11 +285,16 @@ fn parse_heading_level(val: &str) -> Option<u8> {
     None
 }
 
-/// Parse a `<w:r>` element into a `Run`.
-fn parse_run(reader: &mut Reader<&[u8]>) -> Option<Run> {
+/// Parse a `<w:r>` element into a text `Run` and/or an image `Block`.
+///
+/// A run may contain text, a drawing (image), or both. When `image_rels`
+/// is non-empty and a `<w:drawing>` is found inside the run, the image
+/// reference is extracted and returned as a `Block::Image`.
+fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Option<Block>) {
     let mut bold = false;
     let mut italic = false;
     let mut text = String::new();
+    let mut image_block: Option<Block> = None;
 
     loop {
         match reader.read_event() {
@@ -245,6 +310,11 @@ fn parse_run(reader: &mut Reader<&[u8]>) -> Option<Run> {
                             }
                         }
                         // Note: the </w:t> end tag will be consumed below
+                    }
+                    b"drawing" if !image_rels.is_empty() => {
+                        if let Some(blk) = parse_drawing(reader, image_rels) {
+                            image_block = Some(blk);
+                        }
                     }
                     _ => {}
                 }
@@ -272,7 +342,7 @@ fn parse_run(reader: &mut Reader<&[u8]>) -> Option<Run> {
         }
     }
 
-    if text.is_empty() {
+    let run = if text.is_empty() {
         None
     } else {
         Some(Run {
@@ -281,7 +351,9 @@ fn parse_run(reader: &mut Reader<&[u8]>) -> Option<Run> {
             italic,
             link_url: None,
         })
-    }
+    };
+
+    (run, image_block)
 }
 
 /// Parse <w:rPr> to extract bold/italic.
@@ -320,14 +392,24 @@ fn parse_run_props(reader: &mut Reader<&[u8]>, bold: &mut bool, italic: &mut boo
 }
 
 /// Parse runs inside a `<w:hyperlink>` element, tagging each run with the URL.
-fn parse_hyperlink_runs(reader: &mut Reader<&[u8]>, runs: &mut Vec<Run>, url: Option<&str>) {
+fn parse_hyperlink_runs(
+    reader: &mut Reader<&[u8]>,
+    runs: &mut Vec<Run>,
+    url: Option<&str>,
+    image_rels: &Rels,
+    image_blocks: &mut Vec<Block>,
+) {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 if e.local_name().as_ref() == b"r" {
-                    if let Some(mut run) = parse_run(reader) {
+                    let (run_opt, img_opt) = parse_run(reader, image_rels);
+                    if let Some(mut run) = run_opt {
                         run.link_url = url.map(String::from);
                         runs.push(run);
+                    }
+                    if let Some(blk) = img_opt {
+                        image_blocks.push(blk);
                     }
                 }
             }
@@ -340,6 +422,97 @@ fn parse_hyperlink_runs(reader: &mut Reader<&[u8]>, runs: &mut Vec<Run>, url: Op
             _ => {}
         }
     }
+}
+
+/// Parse a `<w:drawing>` element to find an embedded image reference.
+///
+/// Walks into `<wp:inline>` or `<wp:anchor>` → `<a:graphic>` →
+/// `<a:graphicData>` → `<pic:blipFill>` → `<a:blip r:embed="rIdN"/>`.
+/// Returns a `Block::Image` with the image's ZIP path (to be resolved later)
+/// stored in the `markdown` field as a placeholder.
+fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block> {
+    let mut embed_rid: Option<String> = None;
+    let mut depth = 1u32;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                depth += 1;
+                if e.local_name().as_ref() == b"blip" {
+                    if let Some(rid) = get_attr(e, b"r:embed") {
+                        embed_rid = Some(rid);
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                if e.local_name().as_ref() == b"blip" {
+                    if let Some(rid) = get_attr(e, b"r:embed") {
+                        embed_rid = Some(rid);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if e.local_name().as_ref() == b"drawing" {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    let rid = embed_rid?;
+    let target = image_rels.get(&rid)?;
+
+    // Store the resolved ZIP path as a placeholder — will be replaced with
+    // actual base64 content in resolve_images()
+    let zip_path = if target.starts_with('/') {
+        target.trim_start_matches('/').to_string()
+    } else {
+        format!("word/{target}")
+    };
+
+    Some(Block::Image { markdown: zip_path })
+}
+
+/// Resolve `Block::Image` placeholders by reading image data from the ZIP
+/// archive and converting to reference-style base64 images.
+///
+/// Each image gets a unique label (`image1`, `image2`, ...). The `markdown`
+/// field is replaced with the inline reference (`![][image1]`), and the
+/// corresponding definitions are collected for appending at document end.
+///
+/// Images with unsupported formats (EMF, WMF, etc.) are silently removed.
+fn resolve_images(blocks: &mut Vec<Block>, archive: &mut ZipArchive<Cursor<&[u8]>>) -> Vec<String> {
+    let mut definitions = Vec::new();
+    let mut counter = 0usize;
+
+    for block in blocks.iter_mut() {
+        if let Block::Image { markdown } = block {
+            let zip_path = markdown.clone();
+            if let Some(data) = xml_util::read_image_from_zip(archive, &zip_path, "") {
+                counter += 1;
+                let id = format!("image{counter}");
+                if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
+                    *markdown = img_ref.inline;
+                    definitions.push(img_ref.definition);
+                } else {
+                    // Unsupported format — mark for removal
+                    *markdown = String::new();
+                }
+            } else {
+                *markdown = String::new();
+            }
+        }
+    }
+    // Remove empty image blocks (unsupported or unreadable)
+    blocks.retain(|b| !matches!(b, Block::Image { markdown } if markdown.is_empty()));
+
+    definitions
 }
 
 /// Parse a `<w:tbl>` element into a `Block::Table`.
@@ -395,7 +568,11 @@ fn parse_table_row(reader: &mut Reader<&[u8]>, rels: &Rels) -> Row {
 }
 
 /// Parse a `<w:tc>` element into a list of blocks.
+///
+/// Images inside table cells are not extracted (impractical in markdown
+/// tables), so an empty `image_rels` is used for paragraph parsing.
 fn parse_table_cell(reader: &mut Reader<&[u8]>, rels: &Rels) -> Cell {
+    let empty_image_rels = xml_util::Rels::new();
     let mut blocks = Vec::new();
 
     loop {
@@ -403,7 +580,10 @@ fn parse_table_cell(reader: &mut Reader<&[u8]>, rels: &Rels) -> Cell {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
-                    b"p" => blocks.push(parse_paragraph(reader, rels)),
+                    b"p" => {
+                        let mut para_blocks = parse_paragraph(reader, rels, &empty_image_rels);
+                        blocks.append(&mut para_blocks);
+                    }
                     b"tbl" => blocks.push(parse_table(reader, rels)), // nested table
                     _ => {}
                 }
@@ -443,7 +623,7 @@ fn cell_to_text(cell: &[Block], use_markdown: bool) -> String {
                     Some(t)
                 }
             }
-            Block::Table { .. } => None,
+            Block::Table { .. } | Block::Image { .. } => None,
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -492,6 +672,9 @@ fn render_block_plain(block: &Block, out: &mut String, first: &mut bool) {
                 }
             }
         }
+        Block::Image { .. } => {
+            // Images are not rendered in plain text mode
+        }
     }
 }
 
@@ -533,6 +716,10 @@ fn render_block_markdown(block: &Block, out: &mut String) {
                 out.push_str(text);
                 out.push_str("\n\n");
             }
+        }
+        Block::Image { markdown } => {
+            out.push_str(markdown);
+            out.push_str("\n\n");
         }
         Block::Table { rows } => {
             if rows.is_empty() {
