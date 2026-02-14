@@ -65,10 +65,10 @@ COPY . src/
 RUN mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} \
     && tar czf rpmbuild/SOURCES/batdoc-${VERSION}.tar.gz \
        --transform="s,^src,batdoc-${VERSION}," src/ \
-    && cp src/pkg/rpm/batdoc.spec rpmbuild/SPECS/
+    && cp src/pkg/rpm/batdoc.spec rpmbuild/SPECS/ \
+    && sed -i "s|^Version:.*|Version:        ${VERSION}|" rpmbuild/SPECS/batdoc.spec
 
 RUN rpmbuild --define "_topdir /build/rpmbuild" \
-    --define "version ${VERSION}" \
     --nodeps -bb rpmbuild/SPECS/batdoc.spec
 
 RUN mkdir -p /out && cp rpmbuild/RPMS/x86_64/*.rpm /out/
