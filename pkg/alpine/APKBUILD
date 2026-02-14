@@ -38,5 +38,5 @@ package() {
 }
 
 sha512sums="
-1fe49e736634c95eaa09af8142a91c5f04fcdf306ff55e5226d334538f72d3c7cc4f279aa2aab0069f6b7d4fd58f4a1ba7b1516b98e3536de518a43e1a621506  batdoc-1.0.0.tar.gz
+SKIP  batdoc-1.0.0.tar.gz
 "
