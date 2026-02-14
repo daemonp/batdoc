@@ -19,17 +19,17 @@ jobs:
             os: ubuntu-latest
             arch: x86_64
             platform: linux
-            cross: false
+            use_cross: false
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             arch: aarch64
             platform: linux
-            cross: true
+            use_cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             arch: aarch64
             platform: darwin
-            cross: false
+            use_cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -44,24 +44,24 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install musl tools (x86_64)
+      - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install cross-compilation tools (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Set version from tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+      - name: Build (native)
+        if: "!matrix.use_cross"
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Compress binary (zstd)
         run: zstd -19 target/${{ matrix.target }}/release/batdoc -o batdoc-${{ matrix.platform }}-${{ matrix.arch }}.zst
