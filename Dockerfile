@@ -162,10 +162,11 @@ COPY --chown=builder:builder . src/
 RUN tar czf batdoc-${VERSION}.tar.gz \
     --transform="s,^src,batdoc-${VERSION}," src/
 
-# Write PKGBUILD that uses local tarball
+# Write PKGBUILD that uses local tarball with correct version
 COPY --chown=builder:builder pkg/arch/PKGBUILD .
 RUN sed -i \
-    "s|source=.*|source=(\"batdoc-${VERSION}.tar.gz\")|" \
+    -e "s|^pkgver=.*|pkgver=${VERSION}|" \
+    -e "s|source=.*|source=(\"batdoc-${VERSION}.tar.gz\")|" \
     PKGBUILD
 
 RUN makepkg -sf --noconfirm --skipchecksums
