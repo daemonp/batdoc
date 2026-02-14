@@ -1,0 +1,23 @@
+Source: batdoc
+Section: utils
+Priority: optional
+Maintainer: Damon Petta <d@disassemble.net>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc
+Standards-Version: 4.6.2
+Homepage: https://github.com/daemonp/batdoc
+Vcs-Git: https://github.com/daemonp/batdoc.git
+Vcs-Browser: https://github.com/daemonp/batdoc
+Rules-Requires-Root: no
+
+Package: batdoc
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat
+ Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files
+ and dumps their text to stdout. When stdout is a terminal the output is
+ pretty-printed as syntax-highlighted markdown via bat; when piped,
+ plain text is emitted. Format is detected by file signature, not extension.
+ .
+ Spiritual successor to catdoc. Seven crates, no C, no system libs.

@@ -1,0 +1,9 @@
+target/
+catdoc/
+.git/
+*.zst
+*.deb
+*.rpm
+*.apk
+*.pkg.tar.zst
+pkg/out/

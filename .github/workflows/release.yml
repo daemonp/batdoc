@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: batdoc-linux-x86_64.zst
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: batdoc-darwin-aarch64.zst
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Compress binary
+        run: zstd -19 target/${{ matrix.target }}/release/batdoc -o ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  packages:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build distro packages
+        run: docker build --build-arg VERSION=${{ env.VERSION }} -o pkg/out .
+
+      - name: List packages
+        run: ls -lh pkg/out/
+
+      - name: Remove debug packages
+        run: rm -f pkg/out/*-debug* pkg/out/*-debuginfo* pkg/out/*-debugsource*
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: distro-packages
+          path: pkg/out/
+
+  release:
+    needs: [build, packages]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            batdoc-linux-x86_64.zst
+            batdoc-darwin-aarch64.zst
+            *.deb
+            *.rpm
+            *.apk
+            *.pkg.tar.zst

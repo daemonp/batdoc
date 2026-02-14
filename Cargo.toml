@@ -1,0 +1,42 @@
+[package]
+name = "batdoc"
+version = "1.0.0"
+edition = "2021"
+description = "cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat"
+license = "MIT"
+homepage = "https://github.com/daemonp/batdoc"
+repository = "https://github.com/daemonp/batdoc"
+readme = "README.md"
+keywords = ["doc", "docx", "xlsx", "pptx", "pdf"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "batdoc"
+path = "src/main.rs"
+
+[dependencies]
+bat = { version = "0.26.1", default-features = false, features = ["regex-fancy", "paging"] }
+cfb = "0.13"
+encoding_rs = "0.8"
+is-terminal = "0.4"
+quick-xml = "0.37"
+pdf-extract = "0.10"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[package.metadata.deb]
+maintainer = "Damon Petta <d@disassemble.net>"
+copyright = "2025, Damon Petta <d@disassemble.net>"
+license-file = ["LICENSE", "0"]
+extended-description = "Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files and dumps their text to stdout. When stdout is a terminal the output is pretty-printed as syntax-highlighted markdown via bat; when piped, plain text is emitted. Format is detected by file signature, not extension. Spiritual successor to catdoc."
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/batdoc", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/batdoc/README", "644"],
+]
