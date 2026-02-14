@@ -17,10 +17,19 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: batdoc-linux-x86_64.zst
+            arch: x86_64
+            platform: linux
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            arch: aarch64
+            platform: linux
+            cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: batdoc-darwin-aarch64.zst
+            arch: aarch64
+            platform: darwin
+            cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -35,21 +44,48 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install musl tools
+      - name: Install musl tools (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+
+      - name: Set version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Compress binary
-        run: zstd -19 target/${{ matrix.target }}/release/batdoc -o ${{ matrix.artifact }}
+      - name: Compress binary (zstd)
+        run: zstd -19 target/${{ matrix.target }}/release/batdoc -o batdoc-${{ matrix.platform }}-${{ matrix.arch }}.zst
 
-      - name: Upload artifact
+      - name: Create tar.gz archive
+        if: matrix.platform == 'linux'
+        run: |
+          mkdir -p batdoc_${{ env.VERSION }}_${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/batdoc batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
+          cp LICENSE README.md batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
+          tar czf batdoc_${{ env.VERSION }}_${{ matrix.arch }}.tar.gz batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
+
+      - name: Upload zstd artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: batdoc-${{ matrix.platform }}-${{ matrix.arch }}.zst
+          path: batdoc-${{ matrix.platform }}-${{ matrix.arch }}.zst
+
+      - name: Upload tar.gz artifact
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: batdoc_${{ env.VERSION }}_${{ matrix.arch }}.tar.gz
+          path: batdoc_${{ env.VERSION }}_${{ matrix.arch }}.tar.gz
 
   packages:
     runs-on: ubuntu-latest
@@ -93,7 +129,10 @@ jobs:
           generate_release_notes: true
           files: |
             batdoc-linux-x86_64.zst
+            batdoc-linux-aarch64.zst
             batdoc-darwin-aarch64.zst
+            batdoc_*_x86_64.tar.gz
+            batdoc_*_aarch64.tar.gz
             *.deb
             *.rpm
             *.apk
