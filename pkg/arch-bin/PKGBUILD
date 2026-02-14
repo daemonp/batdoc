@@ -9,7 +9,8 @@ url='https://github.com/daemonp/batdoc'
 license=('MIT')
 depends=()
 provides=('batdoc')
-conflicts=('batdoc')
+conflicts=('batdoc' 'batdoc-debug')
+options=('!debug')
 
 source_x86_64=("${url}/releases/download/v${pkgver}/batdoc_${pkgver}_x86_64.tar.gz")
 source_aarch64=("${url}/releases/download/v${pkgver}/batdoc_${pkgver}_aarch64.tar.gz")

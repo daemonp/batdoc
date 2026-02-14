@@ -1,6 +1,6 @@
 [package]
 name = "batdoc"
-version = "1.0.1"
+version = "1.2.0"
 edition = "2021"
 description = "cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat"
 license = "MIT"

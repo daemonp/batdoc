@@ -132,3 +132,35 @@ jobs:
             *.rpm
             *.apk
             *.pkg.tar.zst
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH + Git
+        run: |
+          mkdir -p ~/.ssh
+          if [[ -n "${AUR_SSH_KEY:-}" ]]; then
+            echo "$AUR_SSH_KEY" | base64 -d > ~/.ssh/aur
+            chmod 600 ~/.ssh/aur
+            printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n  StrictHostKeyChecking accept-new\n' >> ~/.ssh/config
+          fi
+          if [[ -n "${TAP_SSH_KEY:-}" ]]; then
+            echo "$TAP_SSH_KEY" | base64 -d > ~/.ssh/tap
+            chmod 600 ~/.ssh/tap
+            printf 'Host github-tap\n  HostName github.com\n  IdentityFile ~/.ssh/tap\n  User git\n  StrictHostKeyChecking accept-new\n' >> ~/.ssh/config
+            git config --global url."git@github-tap:daemonp/homebrew-tap".insteadOf "git@github.com:daemonp/homebrew-tap.git"
+          fi
+          git config --global user.name "Damon Petta"
+          git config --global user.email "d@disassemble.net"
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
+
+      - name: Publish to AUR + Homebrew
+        run: ./pkg/publish-aur.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
