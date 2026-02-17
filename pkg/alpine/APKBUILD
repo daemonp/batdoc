@@ -34,6 +34,7 @@ check() {
 package() {
 	install -Dm755 target/release/batdoc -t "$pkgdir"/usr/bin/
 	install -Dm644 target/man/batdoc.1 "$pkgdir"/usr/share/man/man1/batdoc.1
+	gzip -9 "$pkgdir"/usr/share/man/man1/batdoc.1
 	install -Dm644 LICENSE -t "$pkgdir"/usr/share/licenses/$pkgname/
 	install -Dm644 README.md -t "$pkgdir"/usr/share/doc/$pkgname/
 }

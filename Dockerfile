@@ -133,6 +133,7 @@ check() {\n\
 package() {\n\
 \tinstall -Dm755 target/release/batdoc -t "$pkgdir"/usr/bin/\n\
 \tinstall -Dm644 target/man/batdoc.1 "$pkgdir"/usr/share/man/man1/batdoc.1\n\
+\tgzip -9 "$pkgdir"/usr/share/man/man1/batdoc.1\n\
 \tinstall -Dm644 LICENSE -t "$pkgdir"/usr/share/licenses/$pkgname/\n\
 }\n\
 \n\
