@@ -37,8 +37,10 @@ COPY . .
 RUN cargo build --release --locked
 
 # Assemble the .deb with fpm-free dpkg-deb
-RUN mkdir -p dpkg/usr/bin dpkg/usr/share/doc/batdoc dpkg/DEBIAN /out \
+RUN mkdir -p dpkg/usr/bin dpkg/usr/share/doc/batdoc dpkg/usr/share/man/man1 dpkg/DEBIAN /out \
     && install -m755 target/release/batdoc dpkg/usr/bin/batdoc \
+    && install -m644 target/man/batdoc.1 dpkg/usr/share/man/man1/batdoc.1 \
+    && gzip -9 dpkg/usr/share/man/man1/batdoc.1 \
     && install -m644 README.md dpkg/usr/share/doc/batdoc/README \
     && install -m644 LICENSE dpkg/usr/share/doc/batdoc/copyright \
     && printf 'Package: batdoc\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: Damon Petta <d@disassemble.net>\nDescription: cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat\n Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files\n and dumps their text to stdout as syntax-highlighted markdown via bat.\n' "${VERSION}" > dpkg/DEBIAN/control \
@@ -130,6 +132,7 @@ check() {\n\
 \n\
 package() {\n\
 \tinstall -Dm755 target/release/batdoc -t "$pkgdir"/usr/bin/\n\
+\tinstall -Dm644 target/man/batdoc.1 "$pkgdir"/usr/share/man/man1/batdoc.1\n\
 \tinstall -Dm644 LICENSE -t "$pkgdir"/usr/share/licenses/$pkgname/\n\
 }\n\
 \n\

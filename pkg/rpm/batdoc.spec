@@ -27,6 +27,7 @@ cargo build --release --locked
 
 %install
 install -Dpm 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
+install -Dpm 0644 target/man/%{name}.1 %{buildroot}%{_mandir}/man1/%{name}.1
 
 %check
 cargo test --locked
@@ -35,6 +36,7 @@ cargo test --locked
 %license LICENSE
 %doc README.md
 %{_bindir}/%{name}
+%{_mandir}/man1/%{name}.1*
 
 %changelog
 * Sat Feb 14 2026 Damon Petta <d@disassemble.net> - 1.0.0-1

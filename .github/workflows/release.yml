@@ -66,6 +66,7 @@ jobs:
         run: |
           mkdir -p batdoc_${{ env.VERSION }}_${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/batdoc batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
+          cp target/man/batdoc.1 batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
           cp LICENSE README.md batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
           tar czf batdoc_${{ env.VERSION }}_${{ matrix.arch }}.tar.gz batdoc_${{ env.VERSION }}_${{ matrix.arch }}/
 

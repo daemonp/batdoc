@@ -10,6 +10,7 @@ class Batdoc < Formula
 
   def install
     system "cargo", "install", *std_cargo_args
+    man1.install "target/man/batdoc.1"
   end
 
   test do
