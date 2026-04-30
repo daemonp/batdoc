@@ -5,7 +5,7 @@
 
 /// All errors that can occur during document parsing and rendering.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BatdocError {
+pub enum BatdocError {
     /// I/O error (file read, stream read, OLE2 compound file).
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -24,4 +24,4 @@ pub(crate) enum BatdocError {
 }
 
 /// Convenience alias used throughout the crate.
-pub(crate) type Result<T> = std::result::Result<T, BatdocError>;
+pub type Result<T> = std::result::Result<T, BatdocError>;

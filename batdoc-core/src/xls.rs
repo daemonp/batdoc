@@ -204,23 +204,21 @@ fn parse_globals(
             REC_FILEPASS => {
                 return Err(BatdocError::Document("document is encrypted".into()));
             }
-            REC_CODEPAGE => {
-                if rec.data.len() >= 2 {
+            REC_CODEPAGE
+                if rec.data.len() >= 2 => {
                     cp = u16::from_le_bytes([rec.data[0], rec.data[1]]);
                 }
-            }
             REC_FORMAT => {
                 if let Some((id, code)) = parse_format_record(rec.data, cp) {
                     custom_formats.push((id, code));
                 }
             }
-            REC_XF => {
+            REC_XF
                 // XF record: bytes 2-3 are numFmtId
-                if rec.data.len() >= 4 {
+                if rec.data.len() >= 4 => {
                     let fmt_id = u16::from_le_bytes([rec.data[2], rec.data[3]]);
                     xf_fmt_ids.push(fmt_id);
                 }
-            }
             REC_SST => {
                 // Collect SST + following CONTINUE records
                 let mut combined = rec.data.to_vec();

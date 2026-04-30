@@ -1,6 +1,9 @@
+[workspace]
+members = [".", "batdoc-core"]
+
 [package]
 name = "batdoc"
-version = "1.3.1"
+version = "1.4.0"
 edition = "2021"
 description = "cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat"
 license = "MIT"
@@ -15,15 +18,9 @@ name = "batdoc"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22"
+batdoc-core = { path = "batdoc-core" }
 bat = { version = "0.26.1", default-features = false, features = ["regex-fancy", "paging"] }
-cfb = "0.13"
-encoding_rs = "0.8"
 is-terminal = "0.4"
-quick-xml = "0.37"
-pdf-extract = "0.10"
-thiserror = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 man = "0.3"

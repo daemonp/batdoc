@@ -349,11 +349,9 @@ fn parse_drawing_blip_rids(xml: &str) -> Vec<String> {
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
-                if e.local_name().as_ref() == b"blip" {
-                    if let Some(rid) = get_attr(e, b"r:embed") {
-                        rids.push(rid);
-                    }
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) if e.local_name().as_ref() == b"blip" => {
+                if let Some(rid) = get_attr(e, b"r:embed") {
+                    rids.push(rid);
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -423,17 +421,13 @@ fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
                     current.clear();
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"si" {
-                    strings.push(std::mem::take(&mut current));
-                    in_si = false;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"si" => {
+                strings.push(std::mem::take(&mut current));
+                in_si = false;
             }
-            Ok(Event::Text(ref t)) => {
-                if in_si {
-                    if let Ok(s) = t.unescape() {
-                        current.push_str(&s);
-                    }
+            Ok(Event::Text(ref t)) if in_si => {
+                if let Ok(s) = t.unescape() {
+                    current.push_str(&s);
                 }
             }
             Ok(Event::Eof) | Err(_) => break,

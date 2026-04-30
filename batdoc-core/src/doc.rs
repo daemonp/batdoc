@@ -337,10 +337,9 @@ fn extract_hyperlink_url(instruction: &str) -> Option<String> {
         r
     } else {
         let lower = trimmed.to_lowercase();
-        if let Some(idx) = lower.find("hyperlink") {
+        {
+            let idx = lower.find("hyperlink")?;
             &trimmed[idx + 9..]
-        } else {
-            return None;
         }
     };
 

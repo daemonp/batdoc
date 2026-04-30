@@ -114,8 +114,28 @@ and for formats without OOXML image support (`.doc`, `.xls`, `.pdf`).
 
 ## Dependencies
 
-Eight crates, no C, no system libs: `base64`, `bat`, `cfb`, `encoding_rs`,
-`pdf-extract`, `quick-xml`, `zip`, `is-terminal`.
+The CLI binary depends on `batdoc-core` (document extraction library),
+`bat` (syntax highlighting), and `is-terminal` (tty detection).
+
+The `batdoc-core` library depends on `cfb`, `encoding_rs`, `quick-xml`,
+`zip`, `pdf-extract`, `base64`, and `thiserror`. No C, no system libs.
+
+## Library
+
+The extraction engine is available as a standalone Rust library for
+programmatic use — no CLI or terminal dependencies:
+
+```toml
+[dependencies]
+batdoc-core = { git = "https://github.com/daemonp/batdoc" }
+```
+
+```rust
+let data = std::fs::read("report.docx")?;
+let markdown = batdoc_core::to_markdown(&data, false)?;
+```
+
+See [batdoc-core/README.md](batdoc-core/README.md) for the full API.
 
 ## History
 

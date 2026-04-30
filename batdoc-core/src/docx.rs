@@ -140,10 +140,8 @@ fn parse_body(
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"body" {
-                    *in_body = false;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"body" => {
+                *in_body = false;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -191,10 +189,8 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"p" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
+                break;
             }
             Ok(Event::Empty(ref e)) => {
                 let name = e.local_name();
@@ -332,10 +328,8 @@ fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Opt
                     italic = true;
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"r" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"r" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -401,22 +395,18 @@ fn parse_hyperlink_runs(
 ) {
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"r" {
-                    let (run_opt, img_opt) = parse_run(reader, image_rels);
-                    if let Some(mut run) = run_opt {
-                        run.link_url = url.map(String::from);
-                        runs.push(run);
-                    }
-                    if let Some(blk) = img_opt {
-                        image_blocks.push(blk);
-                    }
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"r" => {
+                let (run_opt, img_opt) = parse_run(reader, image_rels);
+                if let Some(mut run) = run_opt {
+                    run.link_url = url.map(String::from);
+                    runs.push(run);
+                }
+                if let Some(blk) = img_opt {
+                    image_blocks.push(blk);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"hyperlink" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"hyperlink" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -444,11 +434,9 @@ fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block>
                     }
                 }
             }
-            Ok(Event::Empty(ref e)) => {
-                if e.local_name().as_ref() == b"blip" {
-                    if let Some(rid) = get_attr(e, b"r:embed") {
-                        embed_rid = Some(rid);
-                    }
+            Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"blip" => {
+                if let Some(rid) = get_attr(e, b"r:embed") {
+                    embed_rid = Some(rid);
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -528,10 +516,8 @@ fn parse_table(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
                     rows.push(row);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"tbl" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tbl" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -554,10 +540,8 @@ fn parse_table_row(reader: &mut Reader<&[u8]>, rels: &Rels) -> Row {
                     cells.push(cell);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"tr" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tr" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -588,10 +572,8 @@ fn parse_table_cell(reader: &mut Reader<&[u8]>, rels: &Rels) -> Cell {
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"tc" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tc" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}

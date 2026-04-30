@@ -1,0 +1,21 @@
+[package]
+name = "batdoc-core"
+version = "1.4.0"
+edition = "2021"
+description = "Document text extraction library — DOCX, XLSX, PPTX, DOC, XLS, PDF to plain text or Markdown"
+license = "MIT"
+repository = "https://github.com/daemonp/batdoc"
+readme = "README.md"
+
+[lib]
+name = "batdoc_core"
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "0.22"
+cfb = "0.13"
+encoding_rs = "0.8"
+pdf-extract = "0.10"
+quick-xml = "0.37"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }

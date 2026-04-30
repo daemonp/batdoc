@@ -5,23 +5,7 @@
 //! terminal the output is pretty-printed as syntax-highlighted markdown via
 //! `bat`; when piped, plain text is emitted.
 
-#![allow(clippy::redundant_pub_crate)]
-
-mod codepage;
-mod dateconv;
-mod doc;
-mod docx;
-mod error;
-mod heuristic;
-mod markup;
-mod pdf;
-mod pptx;
-mod sheet;
-mod xls;
-mod xlsx;
-mod xml_util;
-
-use error::BatdocError;
+use batdoc_core::BatdocError;
 
 use bat::{Input, PrettyPrinter};
 use is_terminal::IsTerminal;
@@ -59,11 +43,6 @@ Format is detected by magic bytes, not file extension.";
 /// huge files or zip bombs.
 const MAX_INPUT_SIZE: usize = 256 * 1024 * 1024;
 
-// Magic signatures
-const OLE2_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
-const ZIP_MAGIC: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
-const PDF_MAGIC: [u8; 5] = [0x25, 0x50, 0x44, 0x46, 0x2D]; // %PDF-
-
 /// Output mode selection.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
@@ -73,23 +52,6 @@ enum Mode {
     Plain,
     /// Force markdown output.
     Markdown,
-}
-
-/// Detected document format based on magic bytes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Format {
-    /// Legacy OLE2 Word 97+ binary format.
-    Doc,
-    /// Legacy OLE2 Excel 97+ binary format (BIFF8).
-    Xls,
-    /// Modern OOXML Word (ZIP-based) format.
-    Docx,
-    /// Modern OOXML Excel (ZIP-based) format.
-    Xlsx,
-    /// Modern OOXML `PowerPoint` (ZIP-based) format.
-    Pptx,
-    /// PDF document.
-    Pdf,
 }
 
 fn main() {
@@ -167,56 +129,14 @@ fn main() {
     }
 }
 
-/// Detect the document format from magic bytes.
-///
-/// For OLE2 formats, peeks inside the compound file to distinguish
-/// `.doc` (has `WordDocument` stream) from `.xls` (has `Workbook` stream).
-/// For ZIP-based formats, peeks inside the archive to distinguish
-/// `.docx` (has `word/document.xml`) from `.xlsx` (has `xl/workbook.xml`).
-fn detect_format(data: &[u8]) -> error::Result<Format> {
-    if data.len() >= 8 && data[..8] == OLE2_MAGIC {
-        let cursor = std::io::Cursor::new(data);
-        let cfb = cfb::CompoundFile::open(cursor)?;
-        if cfb.exists("/WordDocument") {
-            Ok(Format::Doc)
-        } else if cfb.exists("/Workbook") || cfb.exists("/Book") {
-            Ok(Format::Xls)
-        } else {
-            Err(BatdocError::Document(
-                "OLE2 file is not a .doc or .xls document".into(),
-            ))
-        }
-    } else if data.len() >= 5 && data[..5] == PDF_MAGIC {
-        Ok(Format::Pdf)
-    } else if data.len() >= 4 && data[..4] == ZIP_MAGIC {
-        let cursor = std::io::Cursor::new(data);
-        let archive = zip::ZipArchive::new(cursor)?;
-        if archive.index_for_name("word/document.xml").is_some() {
-            Ok(Format::Docx)
-        } else if archive.index_for_name("xl/workbook.xml").is_some() {
-            Ok(Format::Xlsx)
-        } else if archive.index_for_name("ppt/presentation.xml").is_some() {
-            Ok(Format::Pptx)
-        } else {
-            Err(BatdocError::Document(
-                "ZIP archive is not a .docx, .xlsx, or .pptx file".into(),
-            ))
-        }
-    } else {
-        Err(BatdocError::Document(
-            "not a supported document (unrecognized format)".into(),
-        ))
-    }
-}
-
 fn run(
     data: &[u8],
     filename: &str,
     mode: Mode,
     images: bool,
     needs_separator: bool,
-) -> error::Result<()> {
-    let format = detect_format(data)?;
+) -> batdoc_core::Result<()> {
+    let format = batdoc_core::detect_format(data)?;
     let is_tty = io::stdout().is_terminal();
 
     if needs_separator && !is_tty {
@@ -225,11 +145,11 @@ fn run(
 
     match mode {
         Mode::Plain => {
-            let text = extract_plain(data, format)?;
+            let text = batdoc_core::extract_plain(data, format)?;
             io::stdout().write_all(text.as_bytes())?;
         }
         Mode::Markdown => {
-            let md = extract_markdown(data, format, images)?;
+            let md = batdoc_core::extract_markdown(data, format, images)?;
             if is_tty {
                 pretty_print(&md, filename)?;
             } else {
@@ -238,10 +158,10 @@ fn run(
         }
         Mode::Auto => {
             if is_tty {
-                let md = extract_markdown(data, format, images)?;
+                let md = batdoc_core::extract_markdown(data, format, images)?;
                 pretty_print(&md, filename)?;
             } else {
-                let text = extract_plain(data, format)?;
+                let text = batdoc_core::extract_plain(data, format)?;
                 io::stdout().write_all(text.as_bytes())?;
             }
         }
@@ -250,29 +170,7 @@ fn run(
     Ok(())
 }
 
-fn extract_plain(data: &[u8], format: Format) -> error::Result<String> {
-    match format {
-        Format::Doc => doc::extract_plain(data),
-        Format::Xls => xls::extract_plain(data),
-        Format::Docx => docx::extract_plain(data),
-        Format::Xlsx => xlsx::extract_plain(data),
-        Format::Pptx => pptx::extract_plain(data),
-        Format::Pdf => pdf::extract_plain(data),
-    }
-}
-
-fn extract_markdown(data: &[u8], format: Format, images: bool) -> error::Result<String> {
-    match format {
-        Format::Doc => doc::extract_markdown(data),
-        Format::Xls => xls::extract_markdown(data),
-        Format::Docx => docx::extract_markdown(data, images),
-        Format::Xlsx => xlsx::extract_markdown(data, images),
-        Format::Pptx => pptx::extract_markdown(data, images),
-        Format::Pdf => pdf::extract_markdown(data),
-    }
-}
-
-fn pretty_print(content: &str, filename: &str) -> error::Result<()> {
+fn pretty_print(content: &str, filename: &str) -> batdoc_core::Result<()> {
     let input = Input::from_bytes(content.as_bytes())
         .name(filename)
         .title(filename);

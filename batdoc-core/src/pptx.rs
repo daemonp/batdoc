@@ -187,22 +187,18 @@ fn parse_slide_pic_rids(xml: &str) -> Vec<String> {
                     }
                 }
             }
-            Ok(Event::Empty(ref e)) if in_pic => {
-                if e.local_name().as_ref() == b"blip" {
-                    if let Some(rid) = get_attr(e, b"r:embed") {
-                        rids.push(rid);
-                    }
+            Ok(Event::Empty(ref e)) if in_pic && e.local_name().as_ref() == b"blip" => {
+                if let Some(rid) = get_attr(e, b"r:embed") {
+                    rids.push(rid);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if in_pic {
-                    if e.local_name().as_ref() == b"pic" {
+            Ok(Event::End(ref e)) if in_pic => {
+                if e.local_name().as_ref() == b"pic" {
+                    in_pic = false;
+                } else {
+                    depth -= 1;
+                    if depth == 0 {
                         in_pic = false;
-                    } else {
-                        depth -= 1;
-                        if depth == 0 {
-                            in_pic = false;
-                        }
                     }
                 }
             }
@@ -320,15 +316,11 @@ fn parse_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Optio
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"txBody" {
-                    parse_text_body(reader, rels, &mut paragraphs);
-                }
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"txBody" => {
+                parse_text_body(reader, rels, &mut paragraphs);
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == end_tag {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == end_tag => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -346,18 +338,14 @@ fn parse_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Optio
 fn parse_text_body(reader: &mut Reader<&[u8]>, rels: &Rels, paragraphs: &mut Vec<Paragraph>) {
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"p" {
-                    let para = parse_para(reader, rels);
-                    if !para.runs.is_empty() {
-                        paragraphs.push(para);
-                    }
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"p" => {
+                let para = parse_para(reader, rels);
+                if !para.runs.is_empty() {
+                    paragraphs.push(para);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"txBody" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"txBody" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -427,10 +415,8 @@ fn parse_para(reader: &mut Reader<&[u8]>, rels: &Rels) -> Paragraph {
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == b"p" {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -565,10 +551,8 @@ fn parse_text_run(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: Option<&[u8]
                     read_rpr_attrs(e, &mut bold, &mut italic, &mut font_size);
                 }
             }
-            Ok(Event::End(ref e)) => {
-                if e.local_name().as_ref() == end_name {
-                    break;
-                }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == end_name => {
+                break;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -625,12 +609,10 @@ fn parse_run_props_children(
                 }
                 depth += 1;
             }
-            Ok(Event::Empty(ref e)) => {
-                if e.local_name().as_ref() == b"hlinkClick" {
-                    if let Some(rid) = get_attr(e, b"r:id") {
-                        if let Some(url) = rels.get(&rid) {
-                            *link_url = Some(url.clone());
-                        }
+            Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"hlinkClick" => {
+                if let Some(rid) = get_attr(e, b"r:id") {
+                    if let Some(url) = rels.get(&rid) {
+                        *link_url = Some(url.clone());
                     }
                 }
             }
