@@ -23,6 +23,8 @@ struct Slide {
     shapes: Vec<ShapeText>,
     /// Inline image references for this slide (e.g., `![][image1]`).
     images: Vec<String>,
+    /// Speaker notes shapes. Empty means no speaker notes for this slide.
+    notes: Vec<ShapeText>,
 }
 
 /// Text extracted from a single shape, preserving paragraph structure.
@@ -157,6 +159,8 @@ fn parse_pptx(
             number: num,
             shapes,
             images,
+            // Notes discovery is a later task; parse keeps slides notes-free.
+            notes: Vec::new(),
         });
     }
 
@@ -651,33 +655,11 @@ fn render_plain(slides: &[Slide]) -> String {
         }
 
         for shape in &slide.shapes {
-            for para in &shape.paragraphs {
-                let text: String = para.runs.iter().map(|r| r.text.as_str()).collect();
-                let text = text.trim();
-                if !text.is_empty() {
-                    match &para.bullet {
-                        BulletKind::None => {
-                            out.push_str(text);
-                            out.push('\n');
-                        }
-                        BulletKind::Bullet(lvl) | BulletKind::Numbered(lvl) => {
-                            let indent = "  ".repeat(usize::from(*lvl));
-                            let marker = if matches!(&para.bullet, BulletKind::Numbered(_)) {
-                                "1."
-                            } else {
-                                "-"
-                            };
-                            out.push_str(&indent);
-                            out.push_str(marker);
-                            out.push(' ');
-                            out.push_str(text);
-                            out.push('\n');
-                        }
-                    }
-                }
-            }
+            render_shape_plain(shape, &mut out);
         }
     }
+
+    append_notes_plain(slides, &mut out);
 
     out
 }
@@ -696,45 +678,102 @@ fn render_markdown(slides: &[Slide]) -> String {
             let _ = write!(out, "## Slide {}\n\n", slide.number);
         }
 
+        let heading_offset = if multiple { 2 } else { 0 };
         let mut first_shape = true;
         for shape in &slide.shapes {
             if !first_shape {
                 out.push('\n');
             }
             first_shape = false;
+            render_shape_markdown(shape, &mut out, heading_offset);
+        }
 
-            let mut prev_was_list = false;
-            for para in &shape.paragraphs {
-                let text = render_para_markdown(para);
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
-                }
+        // Render embedded images after text content
+        for img_md in &slide.images {
+            out.push_str(img_md);
+            out.push_str("\n\n");
+        }
+    }
 
-                let is_list = !matches!(&para.bullet, BulletKind::None);
+    append_notes_markdown(slides, &mut out);
 
-                if para.heading_level > 0 && para.heading_level <= 6 {
-                    // Blank line after a list block before a heading
-                    if prev_was_list {
-                        out.push('\n');
-                    }
-                    let level = if multiple {
-                        (para.heading_level + 2).min(6)
-                    } else {
-                        para.heading_level
-                    };
-                    for _ in 0..level {
-                        out.push('#');
-                    }
-                    out.push(' ');
+    out
+}
+
+/// Render a shape's paragraphs as markdown into `out`.
+///
+/// `heading_offset` is added to a paragraph's inferred heading level (capped
+/// at 6) so headings nest under the `## Slide N` body headings / `### Slide N`
+/// notes sub-headings. Shared by the body and notes loops.
+fn render_shape_markdown(shape: &ShapeText, out: &mut String, heading_offset: u8) {
+    let mut prev_was_list = false;
+    for para in &shape.paragraphs {
+        let text = render_para_markdown(para);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let is_list = !matches!(&para.bullet, BulletKind::None);
+
+        if para.heading_level > 0 && para.heading_level <= 6 {
+            // Blank line after a list block before a heading
+            if prev_was_list {
+                out.push('\n');
+            }
+            let level = (para.heading_level + heading_offset).min(6);
+            for _ in 0..level {
+                out.push('#');
+            }
+            out.push(' ');
+            out.push_str(text);
+            out.push_str("\n\n");
+        } else if is_list {
+            let lvl = match &para.bullet {
+                BulletKind::Bullet(l) | BulletKind::Numbered(l) => *l,
+                BulletKind::None => 0,
+            };
+            let indent = "  ".repeat(usize::from(lvl));
+            let marker = if matches!(&para.bullet, BulletKind::Numbered(_)) {
+                "1."
+            } else {
+                "-"
+            };
+            out.push_str(&indent);
+            out.push_str(marker);
+            out.push(' ');
+            out.push_str(text);
+            out.push('\n');
+        } else {
+            // Blank line after a list block before regular text
+            if prev_was_list {
+                out.push('\n');
+            }
+            out.push_str(text);
+            out.push_str("\n\n");
+        }
+
+        prev_was_list = is_list;
+    }
+    // If the shape ended with a list, add trailing blank line
+    if prev_was_list {
+        out.push('\n');
+    }
+}
+
+/// Render a shape's paragraphs as plain text into `out`.
+fn render_shape_plain(shape: &ShapeText, out: &mut String) {
+    for para in &shape.paragraphs {
+        let text: String = para.runs.iter().map(|r| r.text.as_str()).collect();
+        let text = text.trim();
+        if !text.is_empty() {
+            match &para.bullet {
+                BulletKind::None => {
                     out.push_str(text);
-                    out.push_str("\n\n");
-                } else if is_list {
-                    let lvl = match &para.bullet {
-                        BulletKind::Bullet(l) | BulletKind::Numbered(l) => *l,
-                        BulletKind::None => 0,
-                    };
-                    let indent = "  ".repeat(usize::from(lvl));
+                    out.push('\n');
+                }
+                BulletKind::Bullet(lvl) | BulletKind::Numbered(lvl) => {
+                    let indent = "  ".repeat(usize::from(*lvl));
                     let marker = if matches!(&para.bullet, BulletKind::Numbered(_)) {
                         "1."
                     } else {
@@ -745,31 +784,71 @@ fn render_markdown(slides: &[Slide]) -> String {
                     out.push(' ');
                     out.push_str(text);
                     out.push('\n');
-                } else {
-                    // Blank line after a list block before regular text
-                    if prev_was_list {
-                        out.push('\n');
-                    }
-                    out.push_str(text);
-                    out.push_str("\n\n");
                 }
-
-                prev_was_list = is_list;
-            }
-            // If the shape ended with a list, add trailing blank line
-            if prev_was_list {
-                out.push('\n');
             }
         }
+    }
+}
 
-        // Render embedded images after text content
-        for img_md in &slide.images {
-            out.push_str(img_md);
+/// Whether any note shape contains non-whitespace run text.
+fn notes_nonempty(notes: &[ShapeText]) -> bool {
+    notes.iter().any(|shape| {
+        shape
+            .paragraphs
+            .iter()
+            .any(|para| para.runs.iter().any(|r| !r.text.trim().is_empty()))
+    })
+}
+
+/// Ensure a blank line separates the body from a trailer section: adds the
+/// missing newline(s) unless the output already ends with two newlines.
+fn ensure_trailer_blank_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        if out.ends_with('\n') {
+            out.push('\n');
+        } else {
             out.push_str("\n\n");
         }
     }
+}
 
-    out
+/// Append a `## Notes` trailer listing slides with speaker notes. Only slides
+/// with non-empty notes appear, under `### Slide N` sub-headings.
+fn append_notes_markdown(slides: &[Slide], out: &mut String) {
+    let mut any = false;
+    for slide in slides {
+        if !notes_nonempty(&slide.notes) {
+            continue;
+        }
+        if !any {
+            ensure_trailer_blank_line(out);
+            out.push_str("## Notes\n\n");
+            any = true;
+        }
+        let _ = write!(out, "### Slide {}\n\n", slide.number);
+        for shape in &slide.notes {
+            render_shape_markdown(shape, out, 3);
+        }
+    }
+}
+
+/// Append a `--- Notes ---` trailer listing slides with speaker notes.
+fn append_notes_plain(slides: &[Slide], out: &mut String) {
+    let mut any = false;
+    for slide in slides {
+        if !notes_nonempty(&slide.notes) {
+            continue;
+        }
+        if !any {
+            ensure_trailer_blank_line(out);
+            out.push_str("--- Notes ---\n");
+            any = true;
+        }
+        let _ = writeln!(out, "[Slide {}]", slide.number);
+        for shape in &slide.notes {
+            render_shape_plain(shape, out);
+        }
+    }
 }
 
 /// Render a paragraph's runs as markdown, handling bold/italic/hyperlinks.
@@ -903,6 +982,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            notes: vec![],
         }];
 
         let md = render_markdown(&slides);
@@ -930,6 +1010,7 @@ mod tests {
                 }],
             }],
             images: Vec::new(),
+            notes: vec![],
         }];
 
         let text = render_plain(&slides);
@@ -955,6 +1036,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                notes: vec![],
             },
             Slide {
                 number: 2,
@@ -972,6 +1054,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                notes: vec![],
             },
         ];
 
@@ -1003,6 +1086,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                notes: vec![],
             },
             Slide {
                 number: 2,
@@ -1020,6 +1104,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                notes: vec![],
             },
         ];
 
@@ -1193,6 +1278,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            notes: vec![],
         }];
 
         let md = render_markdown(&slides);
@@ -1232,6 +1318,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            notes: vec![],
         }];
 
         let md = render_markdown(&slides);
@@ -1270,10 +1357,108 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            notes: vec![],
         }];
 
         let text = render_plain(&slides);
         assert!(text.contains("- Top\n"));
         assert!(text.contains("  - Sub\n"));
+    }
+
+    // ── notes trailer rendering ─────────────────────────────────
+
+    fn shape_with_text(text: &str) -> ShapeText {
+        ShapeText {
+            paragraphs: vec![Paragraph {
+                runs: vec![TextRun {
+                    text: text.into(),
+                    bold: false,
+                    italic: false,
+                    link_url: None,
+                    font_size: None,
+                }],
+                heading_level: 0,
+                bullet: BulletKind::None,
+            }],
+        }
+    }
+
+    #[test]
+    fn render_markdown_notes_after_deck() {
+        let slides = vec![
+            Slide {
+                number: 1,
+                shapes: vec![shape_with_text("Title")],
+                images: vec![],
+                notes: vec![],
+            },
+            Slide {
+                number: 2,
+                shapes: vec![shape_with_text("Body")],
+                images: vec![],
+                notes: vec![shape_with_text("Remember the demo")],
+            },
+        ];
+        let md = render_markdown(&slides);
+        assert!(md.contains("## Slide 2"));
+        assert!(md.contains("Body"));
+        let notes_at = md.find("## Notes").expect("notes section");
+        let body_at = md.find("Body").unwrap();
+        assert!(notes_at > body_at);
+        assert!(md[notes_at..].contains("### Slide 2"));
+        assert!(md[notes_at..].contains("Remember the demo"));
+        assert!(!md[notes_at..].contains("### Slide 1"));
+    }
+
+    #[test]
+    fn render_plain_notes_after_deck() {
+        let slides = vec![Slide {
+            number: 3,
+            shapes: vec![shape_with_text("Hi")],
+            images: vec![],
+            notes: vec![shape_with_text("aside")],
+        }];
+        let plain = render_plain(&slides);
+        assert!(plain.contains("Hi"));
+        assert!(plain.contains("--- Notes ---"));
+        assert!(plain.contains("[Slide 3]"));
+        assert!(plain.contains("aside"));
+    }
+
+    #[test]
+    fn render_notes_only_slide_no_body_heading() {
+        let slides = vec![
+            Slide {
+                number: 1,
+                shapes: vec![shape_with_text("Only body")],
+                images: vec![],
+                notes: vec![],
+            },
+            Slide {
+                number: 2,
+                shapes: vec![],
+                images: vec![],
+                notes: vec![shape_with_text("orphaned notes")],
+            },
+        ];
+        let md = render_markdown(&slides);
+        let notes_at = md.find("## Notes").expect("notes section");
+        // No body heading for the notes-only slide (### Slide 2 sub-heading
+        // would match a naive `contains("## Slide 2")`, hence the region cut).
+        assert!(!md[..notes_at].contains("## Slide 2"));
+        assert!(md[notes_at..].contains("### Slide 2"));
+        assert!(md[notes_at..].contains("orphaned notes"));
+    }
+
+    #[test]
+    fn render_no_notes_omits_section() {
+        let slides = vec![Slide {
+            number: 1,
+            shapes: vec![shape_with_text("Hi")],
+            images: vec![],
+            notes: vec![],
+        }];
+        assert!(!render_markdown(&slides).contains("## Notes"));
+        assert!(!render_plain(&slides).contains("--- Notes ---"));
     }
 }
