@@ -72,7 +72,7 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
         if !cleaned.is_empty() {
             out.push(cleaned);
         } else if let Some(ocr_text) = ocr_page(data, i)? {
-            out.push(ocr_text);
+            out.push(clean_page(&ocr_text));
         } else {
             out.push(String::new());
         }
@@ -142,13 +142,22 @@ fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
     } else {
         img.content.to_vec()
     };
-    match (img.color_space.as_deref(), img.bits_per_component.unwrap_or(8)) {
-        (Some("DeviceRGB"), 8) => image::RgbImage::from_raw(width, height, content),
-        (Some("DeviceGray"), 8) => {
-            let gray = image::GrayImage::from_raw(width, height, content)?;
-            Some(image::DynamicImage::ImageLuma8(gray).into_rgb8())
-        }
-        _ => None,
+    // Validate the exact buffer length so `ImageSource::from_bytes` never
+    // receives a mis-sized buffer (it errors on non-exact lengths).
+    let channels: u64 = match (img.color_space.as_deref(), img.bits_per_component.unwrap_or(8)) {
+        (Some("DeviceRGB"), 8) => 3,
+        (Some("DeviceGray"), 8) => 1,
+        _ => return None,
+    };
+    let expected = u64::from(width) * u64::from(height) * channels;
+    if u64::try_from(content.len()).ok() != Some(expected) {
+        return None;
+    }
+    if channels == 3 {
+        image::RgbImage::from_raw(width, height, content)
+    } else {
+        let gray = image::GrayImage::from_raw(width, height, content)?;
+        Some(image::DynamicImage::ImageLuma8(gray).into_rgb8())
     }
 }
 
@@ -340,6 +349,23 @@ startxref\n\
         assert_eq!(rgb.dimensions(), (2, 2));
         assert_eq!(rgb.get_pixel(1, 0), &image::Rgb([255, 255, 255])); // Luma 255
         assert_eq!(rgb.get_pixel(0, 1), &image::Rgb([128, 128, 128])); // Luma 128
+    }
+
+    #[test]
+    fn decode_pdf_image_overlong_buffer_skipped() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Subtype", lopdf::Object::Name(b"Image".to_vec()));
+        let img = PdfImage {
+            id: (1, 0),
+            width: 2,
+            height: 2,
+            color_space: Some("DeviceRGB".to_string()),
+            filters: Some(Vec::new()),
+            bits_per_component: Some(8),
+            content: &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], // 15 bytes ≠ 12
+            origin_dict: &dict,
+        };
+        assert!(decode_pdf_image(&img).is_none());
     }
 
     #[test]
