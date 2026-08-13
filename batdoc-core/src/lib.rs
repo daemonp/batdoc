@@ -1,7 +1,9 @@
 //! batdoc-core — document text extraction library.
 //!
-//! Converts DOCX, XLSX, PPTX, DOC, XLS, and PDF files to plain text
-//! or Markdown. Format detection is by magic bytes, not file extension.
+//! Converts DOCX, XLSX, PPTX, DOC, XLS, PDF, and raster images to
+//! plain text or Markdown. Format detection is by magic bytes, not
+//! file extension. Images (and optionally embedded images and textless
+//! PDF pages) are read via OCR.
 
 #![allow(clippy::redundant_pub_crate)]
 
@@ -39,6 +41,8 @@ pub enum Format {
     Pptx,
     /// PDF document.
     Pdf,
+    /// Raster image (PNG/JPEG/GIF/WebP/BMP) — always OCR'd.
+    Image,
 }
 
 impl std::fmt::Display for Format {
@@ -50,6 +54,7 @@ impl std::fmt::Display for Format {
             Self::Xlsx => f.write_str("XLSX"),
             Self::Pptx => f.write_str("PPTX"),
             Self::Pdf => f.write_str("PDF"),
+            Self::Image => f.write_str("IMAGE"),
         }
     }
 }
@@ -107,9 +112,35 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
         ));
     }
 
+    // Raster images (OCR input): PNG, JPEG, GIF, WebP, BMP
+    if data.len() >= 4 && data[..4] == [0x89, 0x50, 0x4E, 0x47] {
+        return Ok(Format::Image); // PNG
+    }
+    if data.len() >= 3 && data[..3] == [0xFF, 0xD8, 0xFF] {
+        return Ok(Format::Image); // JPEG
+    }
+    if data.len() >= 6 && &data[..3] == b"GIF" {
+        return Ok(Format::Image); // GIF
+    }
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        return Ok(Format::Image); // WebP
+    }
+    if data.len() >= 2 && &data[..2] == b"BM" {
+        return Ok(Format::Image); // BMP
+    }
+
     Err(BatdocError::Document(
         "not a supported document (unrecognized format)".into(),
     ))
+}
+
+/// Extraction options.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractOptions {
+    /// Include embedded images as base64 markdown (markdown mode only).
+    pub images: bool,
+    /// OCR embedded images and textless PDF pages.
+    pub ocr: bool,
 }
 
 /// Extract plain text from a document.
@@ -119,13 +150,24 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
 /// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
 /// document is malformed, encrypted, or cannot be parsed.
 pub fn extract_plain(data: &[u8], format: Format) -> Result<String> {
+    extract_plain_with(data, format, ExtractOptions::default())
+}
+
+/// Extract plain text with explicit options (`--ocr` on the CLI).
+///
+/// # Errors
+///
+/// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
+/// document is malformed, encrypted, or cannot be parsed.
+pub fn extract_plain_with(data: &[u8], format: Format, opts: ExtractOptions) -> Result<String> {
     match format {
         Format::Doc => doc::extract_plain(data),
         Format::Xls => xls::extract_plain(data),
-        Format::Docx => docx::extract_plain(data, false),
+        Format::Docx => docx::extract_plain(data, opts.ocr),
         Format::Xlsx => xlsx::extract_plain(data),
-        Format::Pptx => pptx::extract_plain(data, false),
-        Format::Pdf => pdf::extract_plain(data, false),
+        Format::Pptx => pptx::extract_plain(data, opts.ocr),
+        Format::Pdf => pdf::extract_plain(data, opts.ocr),
+        Format::Image => ocr::extract_image_plain(data),
     }
 }
 
@@ -133,20 +175,35 @@ pub fn extract_plain(data: &[u8], format: Format) -> Result<String> {
 ///
 /// When `images` is `true`, embedded images in DOCX/XLSX/PPTX are
 /// included as reference-style base64 data URIs. Has no effect on
-/// DOC, XLS, or PDF (which have no extractable embedded images).
+/// DOC, XLS, PDF, or Image.
 ///
 /// # Errors
 ///
 /// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
 /// document is malformed, encrypted, or cannot be parsed.
 pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<String> {
+    extract_markdown_with(data, format, ExtractOptions { images, ocr: false })
+}
+
+/// Extract Markdown with explicit options (`--ocr` on the CLI).
+///
+/// When `images` is `true`, embedded images in DOCX/XLSX/PPTX are
+/// included as reference-style base64 data URIs. Has no effect on
+/// DOC, XLS, PDF, or Image.
+///
+/// # Errors
+///
+/// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
+/// document is malformed, encrypted, or cannot be parsed.
+pub fn extract_markdown_with(data: &[u8], format: Format, opts: ExtractOptions) -> Result<String> {
     match format {
         Format::Doc => doc::extract_markdown(data),
         Format::Xls => xls::extract_markdown(data),
-        Format::Docx => docx::extract_markdown(data, images, false),
-        Format::Xlsx => xlsx::extract_markdown(data, images),
-        Format::Pptx => pptx::extract_markdown(data, images, false),
-        Format::Pdf => pdf::extract_markdown(data, false),
+        Format::Docx => docx::extract_markdown(data, opts.images, opts.ocr),
+        Format::Xlsx => xlsx::extract_markdown(data, opts.images),
+        Format::Pptx => pptx::extract_markdown(data, opts.images, opts.ocr),
+        Format::Pdf => pdf::extract_markdown(data, opts.ocr),
+        Format::Image => ocr::extract_image_plain(data),
     }
 }
 
@@ -168,4 +225,48 @@ pub fn to_plain(data: &[u8]) -> Result<String> {
 pub fn to_markdown(data: &[u8], images: bool) -> Result<String> {
     let format = detect_format(data)?;
     extract_markdown(data, format, images)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_format_image_magic_bytes() {
+        // PNG
+        assert_eq!(
+            detect_format(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A]).unwrap(),
+            Format::Image
+        );
+        // JPEG
+        assert_eq!(detect_format(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap(), Format::Image);
+        // GIF
+        assert_eq!(detect_format(b"GIF89a....").unwrap(), Format::Image);
+        // WebP (RIFF....WEBP)
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(detect_format(&webp).unwrap(), Format::Image);
+        // BMP
+        assert_eq!(detect_format(b"BM....").unwrap(), Format::Image);
+    }
+
+    #[test]
+    fn detect_format_still_rejects_text() {
+        assert!(detect_format(b"hello world, definitely not a document").is_err());
+    }
+
+    #[test]
+    fn format_image_displays_as_image() {
+        assert_eq!(Format::Image.to_string(), "IMAGE");
+    }
+
+    #[test]
+    fn extract_image_plain_path_errors_without_text() {
+        // Real OCR needs models; the garbage path must not.
+        let err = extract_plain_with(b"garbage", Format::Image, ExtractOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no text found in image"));
+    }
 }

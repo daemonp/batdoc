@@ -150,7 +150,6 @@ pub(crate) fn ocr_image_bytes(data: &[u8]) -> Result<Option<String>> {
 }
 
 /// Extract text from an image file (top-level `Format::Image` entry point).
-#[allow(dead_code)] // used from Task 6 (Format::Image)
 pub(crate) fn extract_image_plain(data: &[u8]) -> Result<String> {
     ocr_image_bytes(data)?.map_or_else(
         || Err(BatdocError::Document("no text found in image".into())),
