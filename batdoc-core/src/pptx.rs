@@ -81,7 +81,11 @@ pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> crate::error::Result<Stri
 /// reference-style base64 images with definitions appended at the end.
 /// When `ocr` is true, embedded images are OCR'd and rendered as a
 /// blockquote after each slide's images.
-pub(crate) fn extract_markdown(data: &[u8], images: bool, ocr: bool) -> crate::error::Result<String> {
+pub(crate) fn extract_markdown(
+    data: &[u8],
+    images: bool,
+    ocr: bool,
+) -> crate::error::Result<String> {
     let (slides, image_defs) = parse_pptx(data, images, ocr)?;
     let mut md = render_markdown(&slides);
     if !image_defs.is_empty() {

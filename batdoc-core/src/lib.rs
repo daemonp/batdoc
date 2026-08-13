@@ -245,7 +245,10 @@ mod tests {
             Format::Image
         );
         // JPEG
-        assert_eq!(detect_format(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap(), Format::Image);
+        assert_eq!(
+            detect_format(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap(),
+            Format::Image
+        );
         // GIF
         assert_eq!(detect_format(b"GIF89a....").unwrap(), Format::Image);
         // WebP (RIFF....WEBP)

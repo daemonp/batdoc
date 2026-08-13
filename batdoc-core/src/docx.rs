@@ -995,7 +995,12 @@ fn resolve_images(
     let mut counter = 0usize;
 
     for block in blocks.iter_mut() {
-        if let Block::Image { path, markdown, ocr_text } = block {
+        if let Block::Image {
+            path,
+            markdown,
+            ocr_text,
+        } = block
+        {
             if let Some(data) = xml_util::read_image_from_zip(archive, path, "") {
                 if images {
                     counter += 1;
@@ -1013,7 +1018,14 @@ fn resolve_images(
     }
     // Remove image blocks with nothing to render (unsupported or unreadable)
     blocks.retain(|b| {
-        !matches!(b, Block::Image { markdown: None, ocr_text: None, .. })
+        !matches!(
+            b,
+            Block::Image {
+                markdown: None,
+                ocr_text: None,
+                ..
+            }
+        )
     });
 
     Ok(definitions)
@@ -1199,7 +1211,10 @@ fn render_block_plain(block: &Block, out: &mut String, first: &mut bool) {
                 }
             }
         }
-        Block::Image { ocr_text: Some(text), .. } => {
+        Block::Image {
+            ocr_text: Some(text),
+            ..
+        } => {
             for para in text.split('\n') {
                 let para = para.trim();
                 if para.is_empty() {
@@ -1258,7 +1273,9 @@ fn render_block_markdown(block: &Block, out: &mut String) {
                 out.push_str("\n\n");
             }
         }
-        Block::Image { markdown, ocr_text, .. } => {
+        Block::Image {
+            markdown, ocr_text, ..
+        } => {
             if let Some(md) = markdown {
                 out.push_str(md);
                 out.push_str("\n\n");

@@ -144,7 +144,10 @@ fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
     };
     // Validate the exact buffer length so `ImageSource::from_bytes` never
     // receives a mis-sized buffer (it errors on non-exact lengths).
-    let channels: u64 = match (img.color_space.as_deref(), img.bits_per_component.unwrap_or(8)) {
+    let channels: u64 = match (
+        img.color_space.as_deref(),
+        img.bits_per_component.unwrap_or(8),
+    ) {
         (Some("DeviceRGB"), 8) => 3,
         (Some("DeviceGray"), 8) => 1,
         _ => return None,
@@ -173,7 +176,11 @@ fn no_text_error(ocr: bool) -> BatdocError {
 /// Extract plain text from a PDF.
 pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> Result<String> {
     let pages = extract_pages_with_ocr(data, ocr)?;
-    let nonempty: Vec<&str> = pages.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
+    let nonempty: Vec<&str> = pages
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .collect();
 
     if nonempty.is_empty() {
         return Err(no_text_error(ocr));
@@ -191,7 +198,13 @@ pub(crate) fn extract_markdown(data: &[u8], ocr: bool) -> Result<String> {
     let nonempty: Vec<(usize, &str)> = pages
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| if s.is_empty() { None } else { Some((i + 1, s.as_str())) })
+        .filter_map(|(i, s)| {
+            if s.is_empty() {
+                None
+            } else {
+                Some((i + 1, s.as_str()))
+            }
+        })
         .collect();
 
     if nonempty.is_empty() {
@@ -327,7 +340,8 @@ startxref\n\
         // zlib-compressed `[0, 255, 128, 64]` (stored deflate block + adler-32).
         // Inlined because `Stream::compress()` will not compress a 4-byte payload.
         let compressed = [
-            0x78, 0x9C, 0x01, 0x04, 0x00, 0xFB, 0xFF, 0x00, 0xFF, 0x80, 0x40, 0x04, 0x41, 0x01, 0xC0,
+            0x78, 0x9C, 0x01, 0x04, 0x00, 0xFB, 0xFF, 0x00, 0xFF, 0x80, 0x40, 0x04, 0x41, 0x01,
+            0xC0,
         ];
         let mut origin = lopdf::Dictionary::new();
         origin.set("Width", 2);

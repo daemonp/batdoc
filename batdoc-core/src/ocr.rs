@@ -29,7 +29,12 @@ fn cache_dir_from(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
     }
     get_env("HOME").map_or_else(
         || PathBuf::from(".cache").join("batdoc").join("models"),
-        |home| PathBuf::from(home).join(".cache").join("batdoc").join("models"),
+        |home| {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("batdoc")
+                .join("models")
+        },
     )
 }
 
@@ -66,8 +71,12 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
         .into_reader()
         .read_to_end(&mut buf)
         .map_err(|e| BatdocError::Document(format!("failed to read OCR model download: {e}")))?;
-    std::fs::write(&tmp, &buf)
-        .map_err(|e| BatdocError::Document(format!("failed to write OCR model to {}: {e}", tmp.display())))?;
+    std::fs::write(&tmp, &buf).map_err(|e| {
+        BatdocError::Document(format!(
+            "failed to write OCR model to {}: {e}",
+            tmp.display()
+        ))
+    })?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(BatdocError::Document(format!(
@@ -91,7 +100,10 @@ fn ensure_models() -> Result<ModelPaths> {
     let recognition = dir.join(RECOGNITION_MODEL_FILE);
     ensure_file(&detection, DETECTION_MODEL_URL)?;
     ensure_file(&recognition, RECOGNITION_MODEL_URL)?;
-    Ok(ModelPaths { detection, recognition })
+    Ok(ModelPaths {
+        detection,
+        recognition,
+    })
 }
 
 type EngineResult = std::result::Result<OcrEngine, String>;

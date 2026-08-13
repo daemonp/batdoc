@@ -16,20 +16,70 @@
 
 use std::io::Write;
 
-use batdoc_core::{Format, ExtractOptions};
+use batdoc_core::{ExtractOptions, Format};
 
 /// 5x7 bitmap glyphs, MSB of each byte is the leftmost column.
 const GLYPHS: &[(u8, [u8; 7])] = &[
-    (b'B', [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110]),
-    (b'A', [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
-    (b'T', [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
-    (b'D', [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110]),
-    (b'O', [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
-    (b'C', [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111]),
-    (b'R', [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
-    (b'1', [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
-    (b'2', [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]),
-    (b'3', [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110]),
+    (
+        b'B',
+        [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+    ),
+    (
+        b'A',
+        [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+    ),
+    (
+        b'T',
+        [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+    ),
+    (
+        b'D',
+        [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+    ),
+    (
+        b'O',
+        [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+    ),
+    (
+        b'C',
+        [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+    ),
+    (
+        b'R',
+        [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+    ),
+    (
+        b'1',
+        [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+    ),
+    (
+        b'2',
+        [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+    ),
+    (
+        b'3',
+        [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+    ),
     (b' ', [0, 0, 0, 0, 0, 0, 0]),
 ];
 
@@ -184,10 +234,13 @@ fn build_pdf_with_image(rgb: &image::RgbImage) -> Vec<u8> {
 #[ignore = "requires OCR models (downloaded on first use)"]
 fn ocr_direct_image_input() {
     let png = test_image_png();
-    let text = batdoc_core::extract_plain_with(&png, Format::Image, ExtractOptions::default())
-        .unwrap();
+    let text =
+        batdoc_core::extract_plain_with(&png, Format::Image, ExtractOptions::default()).unwrap();
     assert!(text.contains("123"), "OCR text missing digits: {text:?}");
-    assert!(text.contains("BATDOC"), "OCR text missing letters: {text:?}");
+    assert!(
+        text.contains("BATDOC"),
+        "OCR text missing letters: {text:?}"
+    );
 }
 
 #[test]
@@ -197,7 +250,10 @@ fn ocr_docx_embedded_image_markdown() {
     let md = batdoc_core::extract_markdown_with(
         &docx,
         Format::Docx,
-        ExtractOptions { images: true, ocr: true },
+        ExtractOptions {
+            images: true,
+            ocr: true,
+        },
     )
     .unwrap();
     assert!(md.contains("Hello"), "got: {md}");
@@ -208,7 +264,10 @@ fn ocr_docx_embedded_image_markdown() {
     let no_ocr = batdoc_core::extract_markdown_with(
         &docx,
         Format::Docx,
-        ExtractOptions { images: true, ocr: false },
+        ExtractOptions {
+            images: true,
+            ocr: false,
+        },
     )
     .unwrap();
     assert!(!no_ocr.contains("> "));
@@ -228,7 +287,10 @@ fn ocr_pdf_embedded_image_page() {
     let text = batdoc_core::extract_plain_with(
         &pdf,
         Format::Pdf,
-        ExtractOptions { ocr: true, images: false },
+        ExtractOptions {
+            ocr: true,
+            images: false,
+        },
     )
     .unwrap();
     assert!(text.contains("123"), "OCR text missing: {text:?}");
