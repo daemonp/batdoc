@@ -54,6 +54,8 @@ cp target/release/batdoc ~/.local/bin/
 bold/italic, lists, tables, and hyperlinks come through properly.
 Spreadsheets render as markdown tables, one `##` section per sheet.
 Hyperlinks in all formats are rendered as `[text](url)` in markdown.
+Comments, footnotes, and endnotes are appended after the body when
+present, with `[^1]` / `[^e1]` markers at each reference site.
 
 `.doc` is trickier. The binary format buries style info in structures we
 don't fully parse, so markdown structure is inferred heuristically from the
@@ -67,7 +69,8 @@ as `.xlsx`.
 
 `.pptx` extracts text from all shapes on each slide. Font size is used to
 infer heading levels. Hyperlinks on text runs are resolved and rendered as
-markdown links. Multi-slide decks get `## Slide N` headings.
+markdown links. Multi-slide decks get `## Slide N` headings. Speaker
+notes are appended after the deck under `## Notes` when present.
 
 `.pdf` extracts text from text-based PDFs using `pdf-extract`. Multi-page
 documents get `## Page N` headings in markdown mode. Scanned/image-only
