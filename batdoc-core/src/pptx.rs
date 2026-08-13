@@ -427,18 +427,13 @@ fn parse_notes_shape(
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let name = e.local_name();
-                if name.as_ref() == b"ph" && ph_type.is_none() {
-                    ph_type = get_attr(e, b"type");
-                } else if name.as_ref() == b"txBody" {
-                    parse_text_body(reader, rels, &mut paragraphs);
-                }
+            Ok(Event::Empty(ref e) | Event::Start(ref e))
+                if e.local_name().as_ref() == b"ph" && ph_type.is_none() =>
+            {
+                ph_type = get_attr(e, b"type");
             }
-            Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"ph" => {
-                if ph_type.is_none() {
-                    ph_type = get_attr(e, b"type");
-                }
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"txBody" => {
+                parse_text_body(reader, rels, &mut paragraphs);
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == end_tag => {
                 break;
