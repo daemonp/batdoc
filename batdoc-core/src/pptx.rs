@@ -1420,7 +1420,9 @@ mod tests {
         }];
         let plain = render_plain(&slides);
         assert!(plain.contains("Hi"));
-        assert!(plain.contains("--- Notes ---"));
+        let notes_at = plain.find("--- Notes ---").expect("notes section");
+        let body_at = plain.find("Hi").unwrap();
+        assert!(notes_at > body_at);
         assert!(plain.contains("[Slide 3]"));
         assert!(plain.contains("aside"));
     }
@@ -1448,6 +1450,51 @@ mod tests {
         assert!(!md[..notes_at].contains("## Slide 2"));
         assert!(md[notes_at..].contains("### Slide 2"));
         assert!(md[notes_at..].contains("orphaned notes"));
+    }
+
+    #[test]
+    fn render_markdown_blank_line_before_notes_after_list() {
+        // Body's last shape ends in a bullet list, which leaves the body
+        // ending with a single '\n' before ensure_trailer_blank_line runs.
+        // The trailer must be separated by exactly one blank line.
+        let slides = vec![Slide {
+            number: 1,
+            shapes: vec![ShapeText {
+                paragraphs: vec![Paragraph {
+                    runs: vec![TextRun {
+                        text: "list item".into(),
+                        bold: false,
+                        italic: false,
+                        link_url: None,
+                        font_size: None,
+                    }],
+                    heading_level: 0,
+                    bullet: BulletKind::Bullet(0),
+                }],
+            }],
+            images: vec![],
+            notes: vec![shape_with_text("speaker notes")],
+        }];
+        let md = render_markdown(&slides);
+        assert!(md.contains("list item\n\n## Notes"), "md: {md:?}");
+    }
+
+    #[test]
+    fn render_whitespace_only_notes_omit_section() {
+        // Notes whose run text is all whitespace count as empty: no Notes
+        // trailer in either renderer, but the body still renders.
+        let slides = vec![Slide {
+            number: 1,
+            shapes: vec![shape_with_text("Body")],
+            images: vec![],
+            notes: vec![shape_with_text("   ")],
+        }];
+        let md = render_markdown(&slides);
+        let plain = render_plain(&slides);
+        assert!(!md.contains("## Notes"), "md: {md:?}");
+        assert!(!plain.contains("--- Notes ---"), "plain: {plain:?}");
+        assert!(md.contains("Body"));
+        assert!(plain.contains("Body"));
     }
 
     #[test]
