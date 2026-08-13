@@ -23,6 +23,8 @@ struct Slide {
     shapes: Vec<ShapeText>,
     /// Inline image references for this slide (e.g., `![][image1]`).
     images: Vec<String>,
+    /// OCR'd text of embedded images — `--ocr` only.
+    image_ocr: Vec<String>,
     /// Speaker notes shapes. Empty means no speaker notes for this slide.
     notes: Vec<ShapeText>,
 }
@@ -68,8 +70,8 @@ struct TextRun {
 }
 
 /// Extract plain text from a .pptx file.
-pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let (slides, _) = parse_pptx(data, false)?;
+pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> crate::error::Result<String> {
+    let (slides, _) = parse_pptx(data, false, ocr)?;
     Ok(render_plain(&slides))
 }
 
@@ -77,8 +79,10 @@ pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
 ///
 /// When `images` is true, embedded images are extracted and included as
 /// reference-style base64 images with definitions appended at the end.
-pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
-    let (slides, image_defs) = parse_pptx(data, images)?;
+/// When `ocr` is true, embedded images are OCR'd and rendered as a
+/// blockquote after each slide's images.
+pub(crate) fn extract_markdown(data: &[u8], images: bool, ocr: bool) -> crate::error::Result<String> {
+    let (slides, image_defs) = parse_pptx(data, images, ocr)?;
     let mut md = render_markdown(&slides);
     if !image_defs.is_empty() {
         for def in &image_defs {
@@ -94,10 +98,12 @@ pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Resul
 /// Parse the pptx archive into slides and image reference definitions.
 ///
 /// When `extract_images` is true, image relationships are loaded and
-/// `<p:pic>` elements are extracted as reference-style images.
+/// `<p:pic>` elements are extracted as reference-style images. When `ocr`
+/// is true, the same images are additionally OCR'd.
 fn parse_pptx(
     data: &[u8],
     extract_images: bool,
+    ocr: bool,
 ) -> crate::error::Result<(Vec<Slide>, Vec<String>)> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
@@ -123,7 +129,7 @@ fn parse_pptx(
         let rels = xml_util::load_rels(&mut archive, &slide_rels_path);
 
         // Optionally load image rels for this slide
-        let image_rels = if extract_images {
+        let image_rels = if extract_images || ocr {
             xml_util::load_image_rels(&mut archive, &slide_rels_path)
         } else {
             xml_util::Rels::new()
@@ -131,28 +137,36 @@ fn parse_pptx(
 
         let shapes = parse_slide_xml(&xml, &rels);
 
-        // Extract images from <p:pic> elements
-        let images = if extract_images && !image_rels.is_empty() {
+        // Extract images from <p:pic> elements (for --images refs and/or OCR)
+        let (images, image_ocr) = if (extract_images || ocr) && !image_rels.is_empty() {
             let pic_rids = parse_slide_pic_rids(&xml);
             let base_dir = path.rsplit_once('/').map_or("ppt", |(dir, _)| dir);
             let mut inline_refs = Vec::new();
+            let mut ocr_texts = Vec::new();
             for rid in pic_rids {
                 if let Some(target) = image_rels.get(&rid) {
                     if let Some(data) =
                         xml_util::read_image_from_zip(&mut archive, target, base_dir)
                     {
-                        image_counter += 1;
-                        let id = format!("image{image_counter}");
-                        if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
-                            inline_refs.push(img_ref.inline);
-                            all_image_defs.push(img_ref.definition);
+                        if extract_images {
+                            image_counter += 1;
+                            let id = format!("image{image_counter}");
+                            if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
+                                inline_refs.push(img_ref.inline);
+                                all_image_defs.push(img_ref.definition);
+                            }
+                        }
+                        if ocr {
+                            if let Some(text) = crate::ocr::ocr_image_bytes(&data)? {
+                                ocr_texts.push(text);
+                            }
                         }
                     }
                 }
             }
-            inline_refs
+            (inline_refs, ocr_texts)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         // Discover speaker notes from the notesSlide relationship. Missing
@@ -163,6 +177,7 @@ fn parse_pptx(
             number: num,
             shapes,
             images,
+            image_ocr,
             notes,
         });
     }
@@ -751,7 +766,7 @@ fn render_plain(slides: &[Slide]) -> String {
     let multiple = slides.len() > 1;
 
     for (i, slide) in slides.iter().enumerate() {
-        if slide.shapes.is_empty() {
+        if slide.shapes.is_empty() && slide.image_ocr.is_empty() {
             continue;
         }
 
@@ -764,6 +779,16 @@ fn render_plain(slides: &[Slide]) -> String {
 
         for shape in &slide.shapes {
             render_shape_plain(shape, &mut out);
+        }
+
+        for ocr in &slide.image_ocr {
+            for para in ocr.split('\n') {
+                let para = para.trim();
+                if !para.is_empty() {
+                    out.push_str(para);
+                    out.push('\n');
+                }
+            }
         }
     }
 
@@ -778,7 +803,7 @@ fn render_markdown(slides: &[Slide]) -> String {
     let multiple = slides.len() > 1;
 
     for slide in slides {
-        if slide.shapes.is_empty() && slide.images.is_empty() {
+        if slide.shapes.is_empty() && slide.images.is_empty() && slide.image_ocr.is_empty() {
             continue;
         }
 
@@ -800,6 +825,18 @@ fn render_markdown(slides: &[Slide]) -> String {
         for img_md in &slide.images {
             out.push_str(img_md);
             out.push_str("\n\n");
+        }
+
+        for ocr in &slide.image_ocr {
+            for line in ocr.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                out.push_str("> ");
+                out.push_str(line.trim_end());
+                out.push('\n');
+            }
+            out.push('\n');
         }
     }
 
@@ -1090,6 +1127,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            image_ocr: Vec::new(),
             notes: vec![],
         }];
 
@@ -1118,6 +1156,7 @@ mod tests {
                 }],
             }],
             images: Vec::new(),
+            image_ocr: Vec::new(),
             notes: vec![],
         }];
 
@@ -1144,6 +1183,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                image_ocr: Vec::new(),
                 notes: vec![],
             },
             Slide {
@@ -1162,6 +1202,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                image_ocr: Vec::new(),
                 notes: vec![],
             },
         ];
@@ -1194,6 +1235,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                image_ocr: Vec::new(),
                 notes: vec![],
             },
             Slide {
@@ -1212,6 +1254,7 @@ mod tests {
                     }],
                 }],
                 images: Vec::new(),
+                image_ocr: Vec::new(),
                 notes: vec![],
             },
         ];
@@ -1386,6 +1429,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            image_ocr: Vec::new(),
             notes: vec![],
         }];
 
@@ -1426,6 +1470,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            image_ocr: Vec::new(),
             notes: vec![],
         }];
 
@@ -1465,6 +1510,7 @@ mod tests {
                 ],
             }],
             images: Vec::new(),
+            image_ocr: Vec::new(),
             notes: vec![],
         }];
 
@@ -1498,12 +1544,14 @@ mod tests {
                 number: 1,
                 shapes: vec![shape_with_text("Title")],
                 images: vec![],
+                image_ocr: Vec::new(),
                 notes: vec![],
             },
             Slide {
                 number: 2,
                 shapes: vec![shape_with_text("Body")],
                 images: vec![],
+                image_ocr: Vec::new(),
                 notes: vec![shape_with_text("Remember the demo")],
             },
         ];
@@ -1524,6 +1572,7 @@ mod tests {
             number: 3,
             shapes: vec![shape_with_text("Hi")],
             images: vec![],
+            image_ocr: Vec::new(),
             notes: vec![shape_with_text("aside")],
         }];
         let plain = render_plain(&slides);
@@ -1542,12 +1591,14 @@ mod tests {
                 number: 1,
                 shapes: vec![shape_with_text("Only body")],
                 images: vec![],
+                image_ocr: Vec::new(),
                 notes: vec![],
             },
             Slide {
                 number: 2,
                 shapes: vec![],
                 images: vec![],
+                image_ocr: Vec::new(),
                 notes: vec![shape_with_text("orphaned notes")],
             },
         ];
@@ -1581,6 +1632,7 @@ mod tests {
                 }],
             }],
             images: vec![],
+            image_ocr: Vec::new(),
             notes: vec![shape_with_text("speaker notes")],
         }];
         let md = render_markdown(&slides);
@@ -1595,6 +1647,7 @@ mod tests {
             number: 1,
             shapes: vec![shape_with_text("Body")],
             images: vec![],
+            image_ocr: Vec::new(),
             notes: vec![shape_with_text("   ")],
         }];
         let md = render_markdown(&slides);
@@ -1611,10 +1664,39 @@ mod tests {
             number: 1,
             shapes: vec![shape_with_text("Hi")],
             images: vec![],
+            image_ocr: Vec::new(),
             notes: vec![],
         }];
         assert!(!render_markdown(&slides).contains("## Notes"));
         assert!(!render_plain(&slides).contains("--- Notes ---"));
+    }
+
+    #[test]
+    fn render_markdown_slide_with_ocr_text() {
+        let slides = vec![Slide {
+            number: 1,
+            shapes: Vec::new(),
+            images: Vec::new(),
+            notes: Vec::new(),
+            image_ocr: vec!["BATDOC\nOCR 123".into()],
+        }];
+        let md = render_markdown(&slides);
+        assert!(md.contains("> BATDOC"), "got: {md}");
+        assert!(md.contains("> OCR 123"), "got: {md}");
+    }
+
+    #[test]
+    fn render_plain_slide_with_ocr_text() {
+        let slides = vec![Slide {
+            number: 1,
+            shapes: Vec::new(),
+            images: Vec::new(),
+            notes: Vec::new(),
+            image_ocr: vec!["line one\nline two".into()],
+        }];
+        let text = render_plain(&slides);
+        assert!(text.contains("line one"), "got: {text}");
+        assert!(text.contains("line two"), "got: {text}");
     }
 
     // ── ZIP integration: speaker notes discovery ──────────────────
@@ -1720,7 +1802,7 @@ mod tests {
     #[test]
     fn extract_markdown_includes_speaker_notes() {
         let data = minimal_pptx_with_notes();
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
         assert!(md.contains("Deck title"), "md: {md:?}");
         assert!(md.contains("## Notes"), "md: {md:?}");
         assert!(md.contains("Speak slowly"), "md: {md:?}");
@@ -1731,8 +1813,8 @@ mod tests {
     #[test]
     fn extract_whitespace_notes_body_omits_section() {
         let data = minimal_pptx_with_notes_body("   ");
-        let md = extract_markdown(&data, false).unwrap();
-        let plain = extract_plain(&data).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
+        let plain = extract_plain(&data, false).unwrap();
         assert!(!md.contains("## Notes"), "md: {md:?}");
         assert!(!plain.contains("--- Notes ---"), "plain: {plain:?}");
     }
@@ -1740,7 +1822,7 @@ mod tests {
     #[test]
     fn extract_missing_notes_target_ok() {
         let data = minimal_pptx("Speak slowly", "../notesSlides/missing.xml");
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
         assert!(md.contains("Deck title"), "md: {md:?}");
         assert!(!md.contains("## Notes"), "md: {md:?}");
     }
@@ -1748,7 +1830,7 @@ mod tests {
     #[test]
     fn extract_plain_includes_speaker_notes() {
         let data = minimal_pptx_with_notes();
-        let plain = extract_plain(&data).unwrap();
+        let plain = extract_plain(&data, false).unwrap();
         assert!(plain.contains("--- Notes ---"), "plain: {plain:?}");
         assert!(plain.contains("[Slide 1]"), "plain: {plain:?}");
         assert!(plain.contains("Speak slowly"), "plain: {plain:?}");
