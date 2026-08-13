@@ -90,9 +90,7 @@ pub(crate) fn find_rel_target_by_type_suffix(xml: &str, type_suffix: &str) -> Op
 
     loop {
         match &reader.read_event() {
-            Ok(Event::Empty(e) | Event::Start(e))
-                if e.local_name().as_ref() == b"Relationship" =>
-            {
+            Ok(Event::Empty(e) | Event::Start(e)) if e.local_name().as_ref() == b"Relationship" => {
                 let target = get_attr(e, b"Target").unwrap_or_default();
                 let rel_type = get_attr(e, b"Type").unwrap_or_default();
                 if !target.is_empty() && rel_type.ends_with(type_suffix) {

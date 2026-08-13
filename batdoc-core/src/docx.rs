@@ -253,7 +253,7 @@ fn read_optional_part(
             Ok(Some(xml))
         }
         Err(zip::result::ZipError::FileNotFound) => Ok(None), // genuinely missing → omit
-        Err(e) => Err(e.into()), // other zip errors fail the extract
+        Err(e) => Err(e.into()),                              // other zip errors fail the extract
     }
 }
 
@@ -582,7 +582,8 @@ fn parse_paragraph(
                 match name.as_ref() {
                     b"pPr" => parse_para_props(reader, &mut style),
                     b"r" => {
-                        let (run_runs, img_opt) = parse_run(reader, image_rels, footnotes, endnotes);
+                        let (run_runs, img_opt) =
+                            parse_run(reader, image_rels, footnotes, endnotes);
                         runs.extend(run_runs);
                         if let Some(blk) = img_opt {
                             image_blocks.push(blk);
@@ -1085,7 +1086,8 @@ fn parse_table_cell(
                         blocks.append(&mut para_blocks);
                     }
                     b"tbl" => {
-                        blocks.push(parse_table(reader, rels, footnotes, endnotes)); // nested table
+                        blocks.push(parse_table(reader, rels, footnotes, endnotes));
+                        // nested table
                     }
                     _ => {}
                 }
@@ -1782,11 +1784,7 @@ mod tests {
         };
         let blocks = vec![Block::Paragraph {
             style: ParaStyle::default(),
-            runs: vec![
-                make_link("x"),
-                Run::footnote_ref(3),
-                make_link("y"),
-            ],
+            runs: vec![make_link("x"), Run::footnote_ref(3), make_link("y")],
         }];
         assert_eq!(
             render_markdown(&blocks).trim_end(),
@@ -1922,7 +1920,8 @@ mod tests {
         assert!(img.is_none());
         assert_eq!(runs.len(), 2);
         assert!(
-            runs.iter().any(|r| r.marker == Some(NoteMarker::Footnote(1))),
+            runs.iter()
+                .any(|r| r.marker == Some(NoteMarker::Footnote(1))),
             "missing footnote marker run: {runs:?}"
         );
         assert!(
@@ -1953,7 +1952,9 @@ mod tests {
             &mut endnotes,
         );
         assert_eq!(runs.len(), 2);
-        assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Endnote(1))));
+        assert!(runs
+            .iter()
+            .any(|r| r.marker == Some(NoteMarker::Endnote(1))));
         assert!(runs.iter().any(|r| r.text == "tail" && r.marker.is_none()));
     }
 
@@ -2020,7 +2021,9 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph { runs, .. } => {
-                assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Footnote(1))));
+                assert!(runs
+                    .iter()
+                    .any(|r| r.marker == Some(NoteMarker::Footnote(1))));
                 assert!(runs.iter().any(|r| r.text == "X"));
             }
             _ => panic!("expected a paragraph block"),
@@ -2052,7 +2055,9 @@ mod tests {
 
         match &blocks[0] {
             Block::Paragraph { runs, .. } => {
-                assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Footnote(1))));
+                assert!(runs
+                    .iter()
+                    .any(|r| r.marker == Some(NoteMarker::Footnote(1))));
                 assert!(runs.iter().any(
                     |r| r.text == "see" && r.link_url.as_deref() == Some("https://example.com")
                 ));
@@ -2405,8 +2410,14 @@ mod tests {
         // referenced note to a `## Footnotes` section with its text as a
         // definition; unreferenced notes stay out.
         let full = extract_markdown(&data, false).unwrap();
-        assert!(full.contains("## Footnotes"), "missing footnotes trailer: {full}");
-        assert!(full.contains("[^1]: Source A"), "missing footnote definition: {full}");
+        assert!(
+            full.contains("## Footnotes"),
+            "missing footnotes trailer: {full}"
+        );
+        assert!(
+            full.contains("[^1]: Source A"),
+            "missing footnote definition: {full}"
+        );
 
         // Definitions kept in part order; the referenced note got the display
         // index assigned by the body walk, the unreferenced one stays 0.
@@ -2497,7 +2508,10 @@ mod tests {
         let footnotes_at = md.find("## Footnotes").expect("footnotes section");
         let endnotes_at = md.find("## Endnotes").expect("endnotes section");
         assert!(body_at < footnotes_at, "body must precede trailers: {md}");
-        assert!(footnotes_at < endnotes_at, "footnotes must precede endnotes: {md}");
+        assert!(
+            footnotes_at < endnotes_at,
+            "footnotes must precede endnotes: {md}"
+        );
         // Definitions carry the note text.
         assert!(md.contains("[^1]: Source A"), "footnote definition: {md}");
         assert!(md.contains("[^e1]: Endnote B"), "endnote definition: {md}");
@@ -2525,12 +2539,23 @@ mod tests {
         // Consecutive Alice comments share one heading; the later Alice
         // comment is NOT consecutive, so the heading repeats. Order of the
         // headings matches the comment order.
-        assert_eq!(md.matches("### Alice").count(), 2, "expected two Alice groups: {md}");
-        assert_eq!(md.matches("### Bob").count(), 1, "expected one Bob group: {md}");
+        assert_eq!(
+            md.matches("### Alice").count(),
+            2,
+            "expected two Alice groups: {md}"
+        );
+        assert_eq!(
+            md.matches("### Bob").count(),
+            1,
+            "expected one Bob group: {md}"
+        );
         let first_alice = md.find("### Alice").expect("first Alice heading");
         let bob = md.find("### Bob").expect("Bob heading");
         let second_alice = md.rfind("### Alice").expect("second Alice heading");
-        assert!(first_alice < bob && bob < second_alice, "heading order: {md}");
+        assert!(
+            first_alice < bob && bob < second_alice,
+            "heading order: {md}"
+        );
         for text in [
             "First thought",
             "Second thought",
@@ -2702,7 +2727,10 @@ mod tests {
             md.contains("[^1]: Referenced note"),
             "referenced note missing: {md}"
         );
-        assert!(!md.contains("Hidden note"), "unreferenced note leaked: {md}");
+        assert!(
+            !md.contains("Hidden note"),
+            "unreferenced note leaked: {md}"
+        );
         assert!(!md.contains("[^2]"), "unreferenced note got a label: {md}");
     }
 
@@ -2714,7 +2742,10 @@ mod tests {
             "word/document.xml",
             &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
         )]);
-        assert_eq!(extract_markdown(&plain_doc, false).unwrap(), "Body only\n\n");
+        assert_eq!(
+            extract_markdown(&plain_doc, false).unwrap(),
+            "Body only\n\n"
+        );
         assert_eq!(extract_plain(&plain_doc).unwrap(), "Body only\n");
 
         // With images enabled and still no extras parts: body, inline image
@@ -2745,8 +2776,13 @@ mod tests {
         assert!(md.contains("![][image1]"), "inline image ref: {md}");
         // …but the definition block is appended AFTER the extras trailers.
         let footnotes_at = md.find("## Footnotes").expect("footnotes section");
-        let defs_at = md.find("[image1]: <data:image/png;base64,").expect("image definition");
-        assert!(footnotes_at < defs_at, "extras must precede image defs: {md}");
+        let defs_at = md
+            .find("[image1]: <data:image/png;base64,")
+            .expect("image definition");
+        assert!(
+            footnotes_at < defs_at,
+            "extras must precede image defs: {md}"
+        );
         assert!(md.contains("[^1]: Source A"), "footnote definition: {md}");
     }
 
@@ -2770,16 +2806,29 @@ mod tests {
             plain.contains("\n\n--- Comments ---\n"),
             "blank line before trailer: {plain}"
         );
-        assert!(!plain.contains("--- Footnotes ---"), "no footnotes: {plain}");
+        assert!(
+            !plain.contains("--- Footnotes ---"),
+            "no footnotes: {plain}"
+        );
         // Consecutive Alice comments share one [Alice] group; the missing
         // author maps to [Anonymous] at parse; Bob's whitespace-only comment
         // is dropped entirely.
-        assert_eq!(plain.matches("[Alice]").count(), 1, "Alice must be grouped: {plain}");
+        assert_eq!(
+            plain.matches("[Alice]").count(),
+            1,
+            "Alice must be grouped: {plain}"
+        );
         assert!(plain.contains("[Anonymous]"), "anonymous group: {plain}");
         for text in ["First para", "Second para", "Last word", "No author"] {
-            assert!(plain.contains(text), "missing comment text {text:?}: {plain}");
+            assert!(
+                plain.contains(text),
+                "missing comment text {text:?}: {plain}"
+            );
         }
-        assert!(!plain.contains("[Bob]"), "empty comment must be dropped: {plain}");
+        assert!(
+            !plain.contains("[Bob]"),
+            "empty comment must be dropped: {plain}"
+        );
     }
 
     #[test]
@@ -2792,7 +2841,10 @@ mod tests {
   <w:comment w:id="0" w:author="Nobody"><w:p><w:r><w:t>   </w:t></w:r></w:p></w:comment>
 </w:comments>"#;
         let data = minimal_docx(&[
-            ("word/document.xml", &document_xml("<w:p><w:r><w:t>Body</w:t></w:r></w:p>")),
+            (
+                "word/document.xml",
+                &document_xml("<w:p><w:r><w:t>Body</w:t></w:r></w:p>"),
+            ),
             ("word/comments.xml", comments_xml),
         ]);
         assert_eq!(
@@ -2825,7 +2877,10 @@ mod tests {
         let body_at = plain.find("See").expect("body text");
         let endnotes_at = plain.find("--- Endnotes ---").expect("endnotes section");
         assert!(body_at < endnotes_at, "body must precede trailer: {plain}");
-        assert!(plain.contains("[e1] Endnote B"), "endnote definition: {plain}");
+        assert!(
+            plain.contains("[e1] Endnote B"),
+            "endnote definition: {plain}"
+        );
     }
 
     #[test]
@@ -2876,8 +2931,7 @@ mod tests {
         // A single-entry zip whose deflated data is corrupted mid-stream
         // (local header and central directory stay intact): the part exists,
         // so extraction must fail instead of silently treating it as missing.
-        let xml =
-            r#"<w:footnotes><w:footnote w:id="1"><w:p><w:r><w:t>x</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
+        let xml = r#"<w:footnotes><w:footnote w:id="1"><w:p><w:r><w:t>x</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
         let mut data = {
             let mut z = ZipWriter::new(Cursor::new(Vec::new()));
             z.start_file("word/footnotes.xml", SimpleFileOptions::default())
@@ -2890,8 +2944,7 @@ mod tests {
         // its central-directory offset lives at +16..+20.
         let eocd = data.len() - 22;
         assert_eq!(&data[eocd..eocd + 4], b"PK\x05\x06");
-        let cd_offset = u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap())
-            as usize; // u32 → usize: lossless on 32+ bit
+        let cd_offset = u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap()) as usize; // u32 → usize: lossless on 32+ bit
         assert_eq!(&data[cd_offset..cd_offset + 4], b"PK\x01\x02");
 
         // File data starts right after the 30-byte local header plus its
@@ -2903,8 +2956,8 @@ mod tests {
             data[cd_offset + 28..cd_offset + 30].try_into().unwrap(),
         ));
         assert_eq!(name_len, lh_name_len);
-        let csize = u32::from_le_bytes(data[cd_offset + 20..cd_offset + 24].try_into().unwrap())
-            as usize; // u32 → usize: lossless on 32+ bit
+        let csize =
+            u32::from_le_bytes(data[cd_offset + 20..cd_offset + 24].try_into().unwrap()) as usize; // u32 → usize: lossless on 32+ bit
         let mid = 30 + lh_name_len + lh_extra_len + csize / 2;
         data[mid] ^= 0xFF;
 

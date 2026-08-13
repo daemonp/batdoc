@@ -347,10 +347,7 @@ fn parse_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Optio
 /// target, resolves it to a ZIP path relative to the slide's directory,
 /// and parses the notes part. Missing or unreadable rels/notes parts and
 /// whitespace-only notes bodies all yield no notes.
-fn load_slide_notes(
-    archive: &mut ZipArchive<Cursor<&[u8]>>,
-    slide_path: &str,
-) -> Vec<ShapeText> {
+fn load_slide_notes(archive: &mut ZipArchive<Cursor<&[u8]>>, slide_path: &str) -> Vec<ShapeText> {
     let mut rels_xml = String::new();
     match archive.by_name(&xml_util::rels_path(slide_path)) {
         Ok(mut entry) => {
@@ -417,11 +414,7 @@ fn parse_notes_slide_xml(xml: &str) -> Vec<ShapeText> {
 /// `<p:nvSpPr>/<p:nvPr>` before the text body), then parses `txBody` with
 /// the same walker used for slides. Shapes whose placeholder type is not
 /// `body` — including freeform shapes with no `<p:ph>` at all — are dropped.
-fn parse_notes_shape(
-    reader: &mut Reader<&[u8]>,
-    rels: &Rels,
-    end_tag: &[u8],
-) -> Option<ShapeText> {
+fn parse_notes_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Option<ShapeText> {
     let mut ph_type: Option<String> = None;
     let mut paragraphs = Vec::new();
 
