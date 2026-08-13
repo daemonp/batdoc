@@ -84,6 +84,69 @@ pub(crate) fn parse_image_rels_xml(xml: &str) -> Rels {
     rels
 }
 
+/// Parse every Relationship Id → Target (no type/mode filter).
+pub(crate) fn parse_all_rels_xml(xml: &str) -> Rels {
+    let mut rels = Rels::new();
+    let mut reader = Reader::from_str(xml);
+
+    loop {
+        match &reader.read_event() {
+            Ok(Event::Empty(e) | Event::Start(e))
+                if e.local_name().as_ref() == b"Relationship" =>
+            {
+                let id = get_attr(e, b"Id").unwrap_or_default();
+                let target = get_attr(e, b"Target").unwrap_or_default();
+                if !id.is_empty() && !target.is_empty() {
+                    rels.insert(id, target);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    rels
+}
+
+/// First relationship Target whose Type ends with `type_suffix`, if any.
+pub(crate) fn find_rel_target_by_type_suffix(xml: &str, type_suffix: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+
+    loop {
+        match &reader.read_event() {
+            Ok(Event::Empty(e) | Event::Start(e))
+                if e.local_name().as_ref() == b"Relationship" =>
+            {
+                let target = get_attr(e, b"Target").unwrap_or_default();
+                let rel_type = get_attr(e, b"Type").unwrap_or_default();
+                if !target.is_empty() && rel_type.ends_with(type_suffix) {
+                    return Some(target);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Resolve a relationship Target to a ZIP entry path given the owning part's directory.
+///
+/// `base_dir` is e.g. `"ppt/slides"` for `ppt/slides/slide1.xml`.
+pub(crate) fn resolve_zip_target(target: &str, base_dir: &str) -> String {
+    if target.starts_with('/') {
+        target.trim_start_matches('/').to_string()
+    } else {
+        let raw = if base_dir.is_empty() {
+            target.to_string()
+        } else {
+            format!("{base_dir}/{target}")
+        };
+        normalize_zip_path(&raw)
+    }
+}
+
 /// Load image relationships from a `.rels` file in a ZIP archive.
 ///
 /// Returns an empty map if the file doesn't exist or can't be read.
@@ -243,6 +306,54 @@ mod tests {
 </Relationships>"#;
         let rels = parse_image_rels_xml(xml);
         assert!(rels.is_empty());
+    }
+
+    // ── parse_all_rels_xml ────────────────────────────────────────
+
+    #[test]
+    fn parse_all_rels_includes_notes_slide() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
+</Relationships>"#;
+        let rels = parse_all_rels_xml(xml);
+        assert_eq!(rels.get("rId2").map(String::as_str), Some("../notesSlides/notesSlide1.xml"));
+        assert_eq!(rels.get("rId1").map(String::as_str), Some("../slideLayouts/slideLayout1.xml"));
+        assert_eq!(rels.get("rId3").map(String::as_str), Some("https://example.com"));
+    }
+
+    // ── resolve_zip_target ────────────────────────────────────────
+
+    #[test]
+    fn resolve_zip_target_relative_to_part_dir() {
+        assert_eq!(
+            resolve_zip_target("../notesSlides/notesSlide1.xml", "ppt/slides"),
+            "ppt/notesSlides/notesSlide1.xml"
+        );
+        assert_eq!(
+            resolve_zip_target("/ppt/notesSlides/notesSlide1.xml", "ppt/slides"),
+            "ppt/notesSlides/notesSlide1.xml"
+        );
+        assert_eq!(
+            resolve_zip_target("slides/slide1.xml", "ppt"),
+            "ppt/slides/slide1.xml"
+        );
+    }
+
+    // ── find_rel_target_by_type_suffix ────────────────────────────
+
+    #[test]
+    fn find_rel_target_by_type_suffix() {
+        let xml = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/>
+</Relationships>"#;
+        // Qualified call: this test's name shadows the helper inside its own body.
+        let target = super::find_rel_target_by_type_suffix(xml, "/notesSlide");
+        assert_eq!(target.as_deref(), Some("../notesSlides/notesSlide1.xml"));
+        assert!(super::find_rel_target_by_type_suffix(xml, "/image").is_none());
     }
 
     // ── rels_path ─────────────────────────────────────────────────
