@@ -44,11 +44,16 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            BatdocError::Document(format!(
+                "failed to create OCR model cache directory {}: {e}",
+                parent.display()
+            ))
+        })?;
     }
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
     let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    let mut response = ureq::get(url).call().map_err(|e| {
+    let response = ureq::get(url).call().map_err(|e| {
         BatdocError::Document(format!(
             "failed to download OCR model from {url}: {e}\n\
              (set BATDOC_MODELS_DIR to a directory containing the model files)"
