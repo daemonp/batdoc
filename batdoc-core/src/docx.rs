@@ -7,6 +7,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
@@ -40,6 +41,9 @@ struct ParaStyle {
 /// The `usize` is the display index (1-based) to render in the output;
 /// how that index is derived from the document's footnote/endnote parts
 /// is handled by the parser (see the extraction-fidelity plan).
+// Variants are only constructed from tests until Task 5 wires
+// w:footnoteReference/w:endnoteReference parsing.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoteMarker {
     Footnote(usize), // display_index
@@ -57,6 +61,9 @@ struct Run {
     marker: Option<NoteMarker>,
 }
 
+// Constructors are only exercised from tests until Task 5 wires
+// w:footnoteReference/w:endnoteReference parsing.
+#[allow(dead_code)]
 impl Run {
     /// Create an ordinary text run.
     fn text(s: impl Into<String>) -> Self {
@@ -70,7 +77,7 @@ impl Run {
     }
 
     /// Create a footnote reference marker run (no visible text of its own).
-    fn footnote_ref(display_index: usize) -> Self {
+    const fn footnote_ref(display_index: usize) -> Self {
         Self {
             text: String::new(),
             bold: false,
@@ -81,7 +88,7 @@ impl Run {
     }
 
     /// Create an endnote reference marker run (no visible text of its own).
-    fn endnote_ref(display_index: usize) -> Self {
+    const fn endnote_ref(display_index: usize) -> Self {
         Self {
             text: String::new(),
             bold: false,
@@ -828,11 +835,11 @@ fn render_runs_markdown(runs: &[Run]) -> String {
     while i < runs.len() {
         match runs[i].marker {
             Some(NoteMarker::Footnote(n)) => {
-                out.push_str(&format!("[^{n}]"));
+                write!(out, "[^{n}]").expect("writing to a String cannot fail");
                 i += 1;
             }
             Some(NoteMarker::Endnote(n)) => {
-                out.push_str(&format!("[^e{n}]"));
+                write!(out, "[^e{n}]").expect("writing to a String cannot fail");
                 i += 1;
             }
             None => {
@@ -1060,14 +1067,62 @@ mod tests {
     }
 
     #[test]
-    fn render_markdown_marker_between_linked_runs() {
-        // Markers must be emitted inline, not swallowed or merged into
-        // hyperlink/bold/italic formatting.
+    fn render_markdown_marker_between_plain_runs() {
+        // A marker between plain (unlinked) runs is emitted inline.
         let blocks = vec![Block::Paragraph {
             style: ParaStyle::default(),
             runs: vec![Run::text("a"), Run::footnote_ref(3), Run::text("b")],
         }];
         assert_eq!(render_markdown(&blocks).trim_end(), "a[^3]b");
+    }
+
+    #[test]
+    fn render_markdown_marker_splits_hyperlink_group() {
+        // Markers act as boundaries between hyperlink groups: sibling runs
+        // sharing a URL stay grouped, but a marker between them forces each
+        // side into its own link instead of one `[xy](url)`.
+        let make_link = |text: &str| Run {
+            link_url: Some("https://e".into()),
+            ..Run::text(text)
+        };
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![
+                make_link("x"),
+                Run::footnote_ref(3),
+                make_link("y"),
+            ],
+        }];
+        assert_eq!(
+            render_markdown(&blocks).trim_end(),
+            "[x](https://e)[^3][y](https://e)"
+        );
+    }
+
+    #[test]
+    fn render_markdown_marker_only_paragraph() {
+        // A paragraph consisting solely of a marker run still emits its label.
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![Run::footnote_ref(5)],
+        }];
+        assert_eq!(render_markdown(&blocks).trim_end(), "[^5]");
+    }
+
+    #[test]
+    fn render_markdown_mixed_footnote_endnote_markers() {
+        // Footnote and endnote markers interleaved with text keep their own
+        // distinct labels: `[^n]` vs `[^eN]`.
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![
+                Run::text("a"),
+                Run::footnote_ref(2),
+                Run::endnote_ref(3),
+                Run::text("b"),
+            ],
+        }];
+        assert_eq!(render_markdown(&blocks).trim_end(), "a[^2][^e3]b");
     }
 
     #[test]
