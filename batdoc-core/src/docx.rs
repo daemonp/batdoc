@@ -303,13 +303,23 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<DocxOutput> {
 
     // Seed the note indexes with the parsed definitions so body references
     // emit markers exactly for defined ids (dangling refs stay silent).
+    // Notes whose blocks render empty are NOT seeded: their definitions
+    // would show nothing in the trailer, so a body reference would leave a
+    // dangling `[^n]` marker and an empty `## Footnotes` section. Skipped
+    // ids leave the display-index counter untouched (it starts at 1 and
+    // only advances for markers actually emitted), so later ids still
+    // number from 1.
     let mut footnotes_idx = NoteIndex::new();
     let mut endnotes_idx = NoteIndex::new();
     for note in &footnotes {
-        footnotes_idx.add_defined(&note.id);
+        if blocks_have_text(&note.blocks) {
+            footnotes_idx.add_defined(&note.id);
+        }
     }
     for note in &endnotes {
-        endnotes_idx.add_defined(&note.id);
+        if blocks_have_text(&note.blocks) {
+            endnotes_idx.add_defined(&note.id);
+        }
     }
     parse_body(
         &mut reader,
@@ -1423,19 +1433,23 @@ fn append_endnotes_markdown(out: &mut String, endnotes: &[Note]) {
 }
 
 /// Render one note's markdown definition: `[^{prefix}{n}]: text` for a
-/// single-paragraph note (`prefix` is `""` for footnotes and `"e"` for
-/// endnotes), or a definition-list form whose continuation lines are
-/// indented 4 spaces (`CommonMark`) for multi-paragraph notes. Blocks whose
-/// markdown renders empty are skipped; a note with nothing to show emits
-/// nothing.
+/// note whose sole rendered block is a single paragraph (`prefix` is `""`
+/// for footnotes and `"e"` for endnotes), or a definition-list form whose
+/// continuation lines are indented 4 spaces (`CommonMark`) for every other
+/// shape — multi-block bodies, or a single table/image (a `[^n]: | row |`
+/// line would let the table's following lines escape the definition).
+/// Blocks whose markdown renders empty are skipped; a note with nothing to
+/// show emits nothing.
 fn render_note_definition_markdown(out: &mut String, prefix: &str, note: &Note) {
     let mut body = String::new();
     let mut rendered = 0usize;
+    let mut single_is_paragraph = false;
     for block in &note.blocks {
         let mut piece = String::new();
         render_block_markdown(block, &mut piece);
         if !piece.trim_end().is_empty() {
             rendered += 1;
+            single_is_paragraph = matches!(block, Block::Paragraph { .. });
             body.push_str(&piece);
         }
     }
@@ -1446,7 +1460,7 @@ fn render_note_definition_markdown(out: &mut String, prefix: &str, note: &Note) 
     out.push_str(prefix);
     let _ = write!(out, "{}", note.display_index);
     out.push(']');
-    if rendered == 1 {
+    if rendered == 1 && single_is_paragraph {
         // Single paragraph: inline label on the definition line.
         out.push_str(": ");
         out.push_str(body.trim_end());
@@ -2559,6 +2573,75 @@ mod tests {
         assert!(
             !md.contains("[^1]: First paragraph."),
             "inline form used for multi-block note: {md}"
+        );
+    }
+
+    #[test]
+    fn extract_markdown_table_only_footnote_indented() {
+        // A table-only footnote must use the indented (multi-block)
+        // definition form: the inline single-line form would let the
+        // table's second line escape the `[^1]:` definition, which is
+        // invalid CommonMark.
+        let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Table cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:footnote>
+</w:footnotes>"#;
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Cited</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", footnotes_xml),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        // Label line, then every body line indented 4 spaces: the table
+        // header starts with 4 spaces + `| `.
+        assert!(
+            md.contains("[^1]:\n    | Table cell |"),
+            "indented table definition: {md}"
+        );
+        assert!(
+            md.contains("\n    | --- |"),
+            "indented table separator: {md}"
+        );
+        // The inline form would emit `[^1]: | …` on the label line — banned.
+        assert!(
+            !md.contains("[^1]: |"),
+            "inline form used for table-only note: {md}"
+        );
+    }
+
+    #[test]
+    fn extract_markdown_empty_defined_note_no_marker_no_section() {
+        // A defined note whose blocks render empty must not be seeded: the
+        // body emits no marker and the trailer omits the whole section (no
+        // dangling `[^1]`, no empty `## Footnotes`).
+        let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:p/><w:p/></w:footnote>
+  <w:footnote w:id="2"><w:p/></w:footnote>
+</w:footnotes>"#;
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Ref</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", footnotes_xml),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        assert!(md.contains("Ref"), "body text missing: {md}");
+        assert!(!md.contains("[^1]"), "empty note got a marker: {md}");
+        // Trailer: both notes are empty, so the section is omitted entirely
+        // (the unreferenced empty note id 2 is trivially excluded too).
+        assert!(
+            !md.contains("## Footnotes"),
+            "empty notes got a section: {md}"
         );
     }
 
