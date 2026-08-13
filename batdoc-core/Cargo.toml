@@ -2,7 +2,7 @@
 name = "batdoc-core"
 version = "1.4.0"
 edition = "2021"
-description = "Document text extraction library — DOCX, XLSX, PPTX, DOC, XLS, PDF to plain text or Markdown"
+description = "Document text extraction library — DOCX, XLSX, PPTX, DOC, XLS, PDF, and image OCR to plain text or Markdown"
 license = "MIT"
 repository = "https://github.com/daemonp/batdoc"
 readme = "README.md"

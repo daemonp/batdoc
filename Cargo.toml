@@ -5,12 +5,12 @@ members = [".", "batdoc-core"]
 name = "batdoc"
 version = "1.4.0"
 edition = "2021"
-description = "cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat"
+description = "cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat"
 license = "MIT"
 homepage = "https://github.com/daemonp/batdoc"
 repository = "https://github.com/daemonp/batdoc"
 readme = "README.md"
-keywords = ["doc", "docx", "xlsx", "pptx", "pdf"]
+keywords = ["doc", "docx", "xlsx", "pptx", "pdf", "ocr", "image"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -33,7 +33,7 @@ lto = "thin"
 maintainer = "Damon Petta <d@disassemble.net>"
 copyright = "2025, Damon Petta <d@disassemble.net>"
 license-file = ["LICENSE", "0"]
-extended-description = "Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files and dumps their text to stdout. When stdout is a terminal the output is pretty-printed as syntax-highlighted markdown via bat; when piped, plain text is emitted. Format is detected by file signature, not extension. Spiritual successor to catdoc."
+extended-description = "Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files and dumps their text to stdout. When stdout is a terminal the output is pretty-printed as syntax-highlighted markdown via bat; when piped, plain text is emitted. Format is detected by file signature, not extension. Image files are OCR'd with the ocrs engine under --ocr. Spiritual successor to catdoc."
 depends = "$auto"
 section = "utils"
 priority = "optional"

@@ -785,13 +785,19 @@ fn render_plain(slides: &[Slide]) -> String {
             render_shape_plain(shape, &mut out);
         }
 
+        let mut first_ocr = true;
         for ocr in &slide.image_ocr {
             for para in ocr.split('\n') {
                 let para = para.trim();
-                if !para.is_empty() {
-                    out.push_str(para);
+                if para.is_empty() {
+                    continue;
+                }
+                if !first_ocr {
                     out.push('\n');
                 }
+                first_ocr = false;
+                out.push_str(para);
+                out.push('\n');
             }
         }
     }

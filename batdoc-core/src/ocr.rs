@@ -50,6 +50,10 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
+    eprintln!(
+        "batdoc: downloading OCR model to {} (first use; set BATDOC_MODELS_DIR to override)",
+        path.display()
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             BatdocError::Document(format!(

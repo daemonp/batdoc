@@ -94,18 +94,26 @@ fn ocr_page(data: &[u8], page_index: usize) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    let mut decoded: Vec<image::RgbImage> = Vec::new();
-    for img in images {
-        if let Some(rgb) = decode_pdf_image(&img) {
-            decoded.push(rgb);
-        }
-    }
-    // OCR the largest images first, capped at 4 per page.
-    decoded.sort_by_key(|img| std::cmp::Reverse(u64::from(img.width()) * u64::from(img.height())));
+    // Rank by stored pixel area and decode only the largest 4 — the cap must
+    // bound peak memory too (compressed images expand when decoded).
+    let mut candidates: Vec<(&PdfImage<'_>, u64)> = images
+        .iter()
+        .map(|img| {
+            (
+                img,
+                u64::try_from(img.width.max(0)).unwrap_or(0)
+                    * u64::try_from(img.height.max(0)).unwrap_or(0),
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|(_, area)| std::cmp::Reverse(*area));
 
     let mut texts = Vec::new();
-    for img in decoded.into_iter().take(4) {
-        if let Some(text) = crate::ocr::ocr_rgb_image(&img)? {
+    for (img, _) in candidates.into_iter().take(4) {
+        let Some(rgb) = decode_pdf_image(img) else {
+            continue;
+        };
+        if let Some(text) = crate::ocr::ocr_rgb_image(&rgb)? {
             texts.push(text);
         }
     }
