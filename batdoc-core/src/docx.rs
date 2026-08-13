@@ -231,14 +231,27 @@ pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Resul
 /// and the extras from the optional comment/footnote/endnote parts.
 type DocxOutput = (Vec<Block>, Vec<String>, Vec<Comment>, Vec<Note>, Vec<Note>);
 
-/// Read an optional ZIP part's full text; `None` when the part is absent.
+/// Read an optional ZIP part's full text.
 ///
-/// The comment/footnote/endnote parts are optional in a docx: a missing part
-/// is not an error, it just yields no extras.
-fn read_optional_part(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
+/// `Ok(None)` is returned only when the part is genuinely absent from the
+/// archive — a missing comment/footnote/endnote part is not an error and is
+/// simply omitted. A part that is present but cannot be read from the ZIP
+/// (corrupt deflate data, truncated entry, archive I/O failure) fails the
+/// extract with a [`crate::error::BatdocError`]; it is NOT treated as
+/// missing.
+fn read_optional_part(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    name: &str,
+) -> crate::error::Result<Option<String>> {
     let mut xml = String::new();
-    archive.by_name(name).ok()?.read_to_string(&mut xml).ok()?;
-    Some(xml)
+    match archive.by_name(name) {
+        Ok(mut entry) => {
+            entry.read_to_string(&mut xml)?; // propagate read/decompression errors
+            Ok(Some(xml))
+        }
+        Err(zip::result::ZipError::FileNotFound) => Ok(None), // genuinely missing → omit
+        Err(e) => Err(e.into()), // other zip errors fail the extract
+    }
 }
 
 /// Parse the docx XML into structured blocks, image reference definitions,
@@ -267,13 +280,13 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<DocxOutput> {
 
     // Optional extras parts: missing parts parse to empty vectors, keeping
     // docs without comments/footnotes/endnotes identical to before.
-    let comments = read_optional_part(&mut archive, "word/comments.xml")
+    let comments = read_optional_part(&mut archive, "word/comments.xml")?
         .map(|xml| parse_comments_xml(&xml))
         .unwrap_or_default();
-    let footnotes = read_optional_part(&mut archive, "word/footnotes.xml")
+    let footnotes = read_optional_part(&mut archive, "word/footnotes.xml")?
         .map(|xml| parse_footnotes_xml(&xml))
         .unwrap_or_default();
-    let endnotes = read_optional_part(&mut archive, "word/endnotes.xml")
+    let endnotes = read_optional_part(&mut archive, "word/endnotes.xml")?
         .map(|xml| parse_endnotes_xml(&xml))
         .unwrap_or_default();
 
@@ -385,16 +398,30 @@ fn parse_block_children(
     blocks
 }
 
-/// Consume the subtree of the element whose `Start` was just read, without
-/// interpreting its contents.
+/// Consume the ENTIRE subtree of the element whose `Start` was just read,
+/// without interpreting its contents.
+///
+/// Tracks nesting depth like [`parse_run_props`] does (start 1 for the
+/// opened element, +1 per nested start, −1 per end, exit at 0): the skip
+/// ends only when the opened element itself closes, so nested elements
+/// reusing the same local name are swallowed as part of the subtree instead
+/// of ending the skip early. `name` identifies the skipped element.
 fn skip_element(reader: &mut Reader<&[u8]>, name: &[u8]) {
+    let mut depth = 1u32;
     loop {
         match &reader.read_event() {
-            Ok(Event::End(e)) if e.local_name().as_ref() == name => break,
+            Ok(Event::Start(_)) => depth += 1,
+            Ok(Event::End(_)) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
+    let _ = name;
 }
 
 /// Shared parse for the footnote/endnote parts, which share a shape
@@ -487,6 +514,12 @@ fn parse_comments_xml(xml: &str) -> Vec<Comment> {
                     skip_element(&mut reader, b"comment");
                     continue;
                 };
+                if !seen.insert(id.clone()) {
+                    // Duplicate id: first wins; consume the body unparsed so
+                    // it can never leak text or markers.
+                    skip_element(&mut reader, b"comment");
+                    continue;
+                }
                 let mut author = get_attr(e, b"w:author")
                     .or_else(|| get_attr(e, b"author"))
                     .unwrap_or_default();
@@ -501,9 +534,6 @@ fn parse_comments_xml(xml: &str) -> Vec<Comment> {
                     &mut footnotes,
                     &mut endnotes,
                 );
-                if !seen.insert(id.clone()) {
-                    continue; // duplicate id: first wins
-                }
                 if blocks_have_text(&blocks) {
                     comments.push(Comment { id, author, blocks });
                 }
@@ -2160,5 +2190,71 @@ mod tests {
         assert_eq!(md, "Hi\n\n");
         let plain = extract_plain(&data).unwrap();
         assert_eq!(plain, "Hi\n");
+    }
+
+    // ── read_optional_part: missing vs present-but-unreadable ─────────
+
+    #[test]
+    fn read_optional_part_returns_some_when_part_present() {
+        let data = minimal_docx(&[("word/footnotes.xml", "<w:footnotes/>")]);
+        let mut archive = ZipArchive::new(Cursor::new(data.as_slice())).unwrap();
+        let got = read_optional_part(&mut archive, "word/footnotes.xml").unwrap();
+        assert_eq!(got.as_deref(), Some("<w:footnotes/>"));
+    }
+
+    #[test]
+    fn read_optional_part_returns_none_when_part_missing() {
+        let data = minimal_docx(&[]);
+        let mut archive = ZipArchive::new(Cursor::new(data.as_slice())).unwrap();
+        let got = read_optional_part(&mut archive, "word/footnotes.xml").unwrap();
+        assert!(
+            got.is_none(),
+            "a genuinely missing part must be omitted, never an error"
+        );
+    }
+
+    #[test]
+    fn read_optional_part_fails_when_present_part_is_corrupt() {
+        // A single-entry zip whose deflated data is corrupted mid-stream
+        // (local header and central directory stay intact): the part exists,
+        // so extraction must fail instead of silently treating it as missing.
+        let xml =
+            r#"<w:footnotes><w:footnote w:id="1"><w:p><w:r><w:t>x</w:t></w:r></w:p></w:footnote></w:footnotes>"#;
+        let mut data = {
+            let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+            z.start_file("word/footnotes.xml", SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(xml.as_bytes()).unwrap();
+            z.finish().unwrap().into_inner()
+        };
+
+        // The end-of-central-directory record occupies the trailing 22 bytes;
+        // its central-directory offset lives at +16..+20.
+        let eocd = data.len() - 22;
+        assert_eq!(&data[eocd..eocd + 4], b"PK\x05\x06");
+        let cd_offset = u32::from_le_bytes(data[eocd + 16..eocd + 20].try_into().unwrap())
+            as usize; // u32 → usize: lossless on 32+ bit
+        assert_eq!(&data[cd_offset..cd_offset + 4], b"PK\x01\x02");
+
+        // File data starts right after the 30-byte local header plus its
+        // name and extra fields; compressed size comes from the central
+        // directory entry (+20..+24) and the entry name length from +28..+30.
+        let lh_name_len = usize::from(u16::from_le_bytes(data[26..28].try_into().unwrap()));
+        let lh_extra_len = usize::from(u16::from_le_bytes(data[28..30].try_into().unwrap()));
+        let name_len = usize::from(u16::from_le_bytes(
+            data[cd_offset + 28..cd_offset + 30].try_into().unwrap(),
+        ));
+        assert_eq!(name_len, lh_name_len);
+        let csize = u32::from_le_bytes(data[cd_offset + 20..cd_offset + 24].try_into().unwrap())
+            as usize; // u32 → usize: lossless on 32+ bit
+        let mid = 30 + lh_name_len + lh_extra_len + csize / 2;
+        data[mid] ^= 0xFF;
+
+        let mut archive = ZipArchive::new(Cursor::new(data.as_slice())).unwrap();
+        let got = read_optional_part(&mut archive, "word/footnotes.xml");
+        assert!(
+            got.is_err(),
+            "a present-but-unreadable part must fail the extract"
+        );
     }
 }
