@@ -6,7 +6,7 @@ use std::path::Path;
 #[allow(clippy::too_many_lines)]
 fn main() {
     let page = Manual::new("batdoc")
-        .about("cat(1) for doc, docx, xls, xlsx, pptx, and pdf — renders to markdown with bat")
+        .about("cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files — renders to markdown with bat, plus OCR")
         .author(Author::new("Damon Petta").email("d@disassemble.net"))
         .flag(
             Flag::new()
@@ -51,9 +51,10 @@ fn main() {
         .custom(
             Section::new("description")
                 .paragraph(
-                    "batdoc reads Office documents and PDFs and dumps their contents \
-                     to the terminal as markdown. It is a spiritual successor to \
-                     catdoc(1) — cat had catdoc, bat gets batdoc.",
+                    "batdoc reads Office documents, PDFs, and image files (via OCR) \
+                     and dumps their contents to the terminal as markdown. It is a \
+                     spiritual successor to catdoc(1) — cat had catdoc, bat gets \
+                     batdoc.",
                 )
                 .paragraph(
                     "Format is detected by magic bytes (file signature), not file \

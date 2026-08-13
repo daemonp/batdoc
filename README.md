@@ -153,8 +153,8 @@ The CLI binary depends on `batdoc-core` (document extraction library),
 
 The `batdoc-core` library depends on `cfb`, `encoding_rs`, `quick-xml`,
 `zip`, `pdf-extract`, `lopdf`, `base64`, and `thiserror`, plus `ocrs`,
-`image`, and `ureq` for OCR and `rten` for model inference. Pure Rust,
-no system libraries.
+`image`, and `ureq` for OCR and `rten` for model inference. No C, no
+system libs.
 
 ## Library
 
@@ -170,7 +170,13 @@ batdoc-core = { git = "https://github.com/daemonp/batdoc" }
 let data = std::fs::read("report.docx")?;
 let markdown = batdoc_core::to_markdown(&data, false)?;
 
-let text = batdoc_core::extract_plain_with(&data, batdoc_core::Format::Image, batdoc_core::ExtractOptions::default())?;
+// OCR an image file:
+let img = std::fs::read("photo.png")?;
+let text = batdoc_core::extract_plain_with(
+    &img,
+    batdoc_core::Format::Image,
+    batdoc_core::ExtractOptions::default(),
+)?;
 ```
 
 See [batdoc-core/README.md](batdoc-core/README.md) for the full API.
