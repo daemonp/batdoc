@@ -41,9 +41,11 @@ In-process **ocrs 0.12** (rten backend — pure-Rust ONNX inference, MIT OR Apac
 |---|---|---|
 | `ocrs` | 0.12 | OCR engine, default features (rten format, no wasm export) |
 | `image` | 0.25.10 | decode; features restricted to `png, jpeg, gif, webp, bmp` — matches the `--images` supported set |
-| `pdf` | 0.10.0 | PDF image XObject extraction for the fallback path; `pdf-extract` stays for text |
+| `lopdf` | 0.38 | PDF image XObject extraction for the fallback path (`Document::get_page_images`); `pdf-extract` stays for text |
 
 All pure Rust; packaging targets (AUR, Homebrew, static musl, deb/rpm/alpine, Docker) unaffected — no packaging changes at all.
+
+**Implementation note (2026-08-13):** the originally proposed `pdf` crate (pdf-rs) 0.10 has a redesigned, half-documented backend-generic API. `lopdf` 0.38 (already a transitive dependency of `pdf-extract`, as is `ureq` 2) exposes a stable `Document::get_page_images`, so it replaces pdf-rs — same pure-Rust constraint, zero new crates in the lockfile graph.
 
 ### Trigger semantics
 
