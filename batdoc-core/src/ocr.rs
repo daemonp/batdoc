@@ -120,7 +120,7 @@ fn engine() -> Result<&'static OcrEngine> {
 }
 
 /// OCR an already-decoded RGB image. `None` when no text was detected.
-fn ocr_rgb_image(img: &image::RgbImage) -> Result<Option<String>> {
+pub(crate) fn ocr_rgb_image(img: &image::RgbImage) -> Result<Option<String>> {
     let source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
         .map_err(|e| BatdocError::Document(format!("OCR input preparation failed: {e}")))?;
     let engine = engine()?;

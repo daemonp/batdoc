@@ -125,7 +125,7 @@ pub fn extract_plain(data: &[u8], format: Format) -> Result<String> {
         Format::Docx => docx::extract_plain(data),
         Format::Xlsx => xlsx::extract_plain(data),
         Format::Pptx => pptx::extract_plain(data),
-        Format::Pdf => pdf::extract_plain(data),
+        Format::Pdf => pdf::extract_plain(data, false),
     }
 }
 
@@ -146,7 +146,7 @@ pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<Str
         Format::Docx => docx::extract_markdown(data, images),
         Format::Xlsx => xlsx::extract_markdown(data, images),
         Format::Pptx => pptx::extract_markdown(data, images),
-        Format::Pdf => pdf::extract_markdown(data),
+        Format::Pdf => pdf::extract_markdown(data, false),
     }
 }
 
