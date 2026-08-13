@@ -3,14 +3,17 @@
 `cat` had [catdoc](http://www.intevation.de/catdoc/). `bat` gets `batdoc`.
 
 Dumps `.doc`, `.docx`, `.xls`, `.xlsx`, `.pptx`, and `.pdf` files to your
-terminal as markdown. To a tty it syntax-highlights and pages (using
-[bat](https://github.com/sharkdp/bat)); piped, it gives you plain text.
+terminal as markdown — and OCRs image files (png/jpg/gif/webp/bmp). To a
+tty it syntax-highlights and pages (using [bat](https://github.com/sharkdp/bat));
+piped, it gives you plain text.
 
 ```
 batdoc report.docx                     # highlighted markdown in terminal
 batdoc financials.xlsx                  # each sheet becomes a markdown table
 batdoc slides.pptx                     # per-slide headings with text
 batdoc paper.pdf                       # multi-page PDF with page headers
+batdoc photo.png                     # OCR — text from a photo or scan
+batdoc --ocr scanned.pdf             # OCR pages that have no text layer
 batdoc --plain legacy.doc > out.txt    # just the text
 cat mystery.bin | batdoc               # stdin works, format detected by magic bytes
 ```
@@ -73,10 +76,11 @@ markdown links. Multi-slide decks get `## Slide N` headings. Speaker
 notes are appended after the deck under `## Notes` when present.
 
 `.pdf` extracts text from text-based PDFs using `pdf-extract`. Multi-page
-documents get `## Page N` headings in markdown mode. Scanned/image-only
-PDFs that contain no extractable text get a clean error message. Malformed
-PDFs that would crash the underlying library are caught and reported as
-errors rather than panics.
+documents get `## Page N` headings in markdown mode. With `--ocr`, pages
+whose text layer is empty are OCR'd from their embedded images (scanned
+documents). Scanned/image-only PDFs that yield no text at all get a clean
+error message. Malformed PDFs that would crash the underlying library are
+caught and reported as errors rather than panics.
 
 ## Options
 
@@ -87,6 +91,8 @@ cat FILE | batdoc [OPTIONS]
   -p, --plain       plain text, no highlighting
   -m, --markdown    force markdown (default on tty)
   -i, --images      embed images as inline base64 data URIs
+  -o, --ocr         OCR text from images: docx/pptx embedded images and
+                    textless PDF pages; image files are always OCR'd
   -h, --help        help
 ```
 
@@ -112,8 +118,33 @@ and for formats without OOXML image support (`.doc`, `.xls`, `.pdf`).
 - No legacy `.ppt` support — only modern `.pptx`.
 - `.pptx` heading detection is font-size based (>=28pt = h1, >=24pt = h2,
   >=20pt = h3). Works well on typical slide decks.
-- PDFs must contain actual text — scanned/image-only PDFs won't produce
-  output (no OCR). Some CJK encodings in PDFs may not extract correctly.
+- OCR (`--ocr`) recognizes Latin scripts only (the ocrs engine is English/
+  European-language focused). CJK scans still won't produce output.
+- OCR models (~12 MB) download on first use — see the OCR section below.
+- Some CJK encodings in PDFs may not extract correctly.
+
+## OCR
+
+`--ocr` runs the [ocrs](https://github.com/robertknight/ocrs) engine (pure
+Rust, rten backend) over:
+
+- **Image files** — `batdoc photo.png` always OCRs (no flag needed; text is
+  the only output an image can produce). PNG, JPEG, GIF, WebP, and BMP.
+- **DOCX/PPTX embedded images** — `batdoc --ocr report.docx` renders OCR'd
+  text as a blockquote after each image (paragraphs in `--plain` mode).
+- **PDF pages without a text layer** — `batdoc --ocr scan.pdf` OCRs the
+  embedded page images (typical one-image-per-page scans). Text-bearing
+  pages are never OCR'd.
+
+Models (~12 MB, two `.rten` files) are downloaded on first OCR use from the
+ocrs upstream distribution and cached in `$BATDOC_MODELS_DIR`, else
+`$XDG_CACHE_HOME/batdoc/models`, else `~/.cache/batdoc/models`. Set
+`BATDOC_MODELS_DIR` to a pre-seeded directory for offline or
+package-managed installs. Without `--ocr`, output is identical to older
+versions. OCR takes roughly 0.5–2 s per image on CPU.
+
+Note: ocrs runs much slower in debug builds; always use a release build
+(`cargo build --release`) when testing OCR.
 
 ## Dependencies
 
@@ -121,7 +152,9 @@ The CLI binary depends on `batdoc-core` (document extraction library),
 `bat` (syntax highlighting), and `is-terminal` (tty detection).
 
 The `batdoc-core` library depends on `cfb`, `encoding_rs`, `quick-xml`,
-`zip`, `pdf-extract`, `base64`, and `thiserror`. No C, no system libs.
+`zip`, `pdf-extract`, `lopdf`, `base64`, and `thiserror`, plus `ocrs`,
+`image`, and `ureq` for OCR and `rten` for model inference. Pure Rust,
+no system libraries.
 
 ## Library
 
@@ -136,6 +169,8 @@ batdoc-core = { git = "https://github.com/daemonp/batdoc" }
 ```rust
 let data = std::fs::read("report.docx")?;
 let markdown = batdoc_core::to_markdown(&data, false)?;
+
+let text = batdoc_core::extract_plain_with(&data, batdoc_core::Format::Image, batdoc_core::ExtractOptions::default())?;
 ```
 
 See [batdoc-core/README.md](batdoc-core/README.md) for the full API.

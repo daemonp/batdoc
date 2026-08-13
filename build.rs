@@ -1,6 +1,9 @@
 use man::prelude::*;
 use std::path::Path;
 
+// The man page DSL is deliberately a single linear declaration; splitting it
+// across helper functions would only obscure the document structure.
+#[allow(clippy::too_many_lines)]
 fn main() {
     let page = Manual::new("batdoc")
         .about("cat(1) for doc, docx, xls, xlsx, pptx, and pdf — renders to markdown with bat")
@@ -27,6 +30,19 @@ fn main() {
         ))
         .flag(
             Flag::new()
+                .short("-o")
+                .long("--ocr")
+                .help(
+                    "OCR text from images using the ocrs engine. For .docx/.pptx, \
+                     embedded images are OCR'd; for .pdf, pages without a text \
+                     layer are OCR'd from their embedded images. Image files \
+                     (.png/.jpg/.gif/.webp/.bmp) are always OCR'd. Models are \
+                     downloaded on first use to $BATDOC_MODELS_DIR, \
+                     $XDG_CACHE_HOME/batdoc/models, or ~/.cache/batdoc/models.",
+                ),
+        )
+        .flag(
+            Flag::new()
                 .short("-h")
                 .long("--help")
                 .help("Show help information."),
@@ -43,7 +59,8 @@ fn main() {
                     "Format is detected by magic bytes (file signature), not file \
                      extension. Supported formats: .doc (OLE2 Word 97+), .docx \
                      (OOXML), .xls (BIFF8 Excel 97+), .xlsx (OOXML), .pptx \
-                     (OOXML), and .pdf.",
+                     (OOXML), .pdf, and raster images (.png, .jpg, .gif, .webp, \
+                     .bmp).",
                 )
                 .paragraph(
                     "When stdout is a terminal, output is pretty-printed as \
@@ -73,6 +90,11 @@ fn main() {
         )
         .example(
             Example::new()
+                .text("Extract text from a photo or scan with OCR")
+                .command("batdoc photo.png"),
+        )
+        .example(
+            Example::new()
                 .text("Read from stdin")
                 .command("curl -sL https://example.com/file.docx | batdoc"),
         )
@@ -85,6 +107,12 @@ fn main() {
                 .paragraph(
                     "The \\fBPAGER\\fR environment variable controls which pager \
                      is used when output is displayed on a terminal.",
+                )
+                .paragraph(
+                    "The \\fBBATDOC_MODELS_DIR\\fR environment variable overrides \
+                     where OCR models are stored. Defaults to \\fB$XDG_CACHE_HOME/batdoc/models\\fR \
+                     or \\fB~/.cache/batdoc/models\\fR. Set it to seed models from a \
+                     system package directory.",
                 ),
         )
         .custom(Section::new("see also").paragraph("bat(1), catdoc(1), pdftotext(1)"))
