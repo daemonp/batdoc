@@ -35,6 +35,17 @@ struct ParaStyle {
     list_level: Option<u8>,
 }
 
+/// A footnote or endnote reference marker inside a paragraph.
+///
+/// The `usize` is the display index (1-based) to render in the output;
+/// how that index is derived from the document's footnote/endnote parts
+/// is handled by the parser (see the extraction-fidelity plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteMarker {
+    Footnote(usize), // display_index
+    Endnote(usize),  // display_index
+}
+
 #[derive(Debug, Clone)]
 struct Run {
     text: String,
@@ -42,6 +53,43 @@ struct Run {
     italic: bool,
     /// If this run is inside a hyperlink, the resolved URL.
     link_url: Option<String>,
+    /// None = ordinary text; Some = marker run with empty `text`.
+    marker: Option<NoteMarker>,
+}
+
+impl Run {
+    /// Create an ordinary text run.
+    fn text(s: impl Into<String>) -> Self {
+        Self {
+            text: s.into(),
+            bold: false,
+            italic: false,
+            link_url: None,
+            marker: None,
+        }
+    }
+
+    /// Create a footnote reference marker run (no visible text of its own).
+    fn footnote_ref(display_index: usize) -> Self {
+        Self {
+            text: String::new(),
+            bold: false,
+            italic: false,
+            link_url: None,
+            marker: Some(NoteMarker::Footnote(display_index)),
+        }
+    }
+
+    /// Create an endnote reference marker run (no visible text of its own).
+    fn endnote_ref(display_index: usize) -> Self {
+        Self {
+            text: String::new(),
+            bold: false,
+            italic: false,
+            link_url: None,
+            marker: Some(NoteMarker::Endnote(display_index)),
+        }
+    }
 }
 
 /// A single table cell containing blocks.
@@ -200,6 +248,7 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -
                         bold: false,
                         italic: false,
                         link_url: None,
+                        marker: None,
                     });
                 } else if name.as_ref() == b"br" {
                     runs.push(Run {
@@ -207,6 +256,7 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -
                         bold: false,
                         italic: false,
                         link_url: None,
+                        marker: None,
                     });
                 }
             }
@@ -344,6 +394,7 @@ fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Opt
             bold,
             italic,
             link_url: None,
+            marker: None,
         })
     };
 
@@ -588,6 +639,16 @@ fn get_val_attr(e: &quick_xml::events::BytesStart) -> Option<String> {
     get_attr(e, b"w:val").or_else(|| get_attr(e, b"val"))
 }
 
+/// Plain-text rendering of a single run: the run's text, or the marker
+/// label (`[n]` footnote / `[eN]` endnote) for marker runs.
+fn run_plain_text(r: &Run) -> std::borrow::Cow<'_, str> {
+    match r.marker {
+        Some(NoteMarker::Footnote(n)) => std::borrow::Cow::Owned(format!("[{n}]")),
+        Some(NoteMarker::Endnote(n)) => std::borrow::Cow::Owned(format!("[e{n}]")),
+        None => std::borrow::Cow::Borrowed(&r.text),
+    }
+}
+
 /// Extract text content from a cell's blocks, joining paragraphs with spaces.
 fn cell_to_text(cell: &[Block], use_markdown: bool) -> String {
     cell.iter()
@@ -596,7 +657,7 @@ fn cell_to_text(cell: &[Block], use_markdown: bool) -> String {
                 let t = if use_markdown {
                     render_runs_markdown(runs)
                 } else {
-                    runs.iter().map(|r| r.text.as_str()).collect::<String>()
+                    runs.iter().map(run_plain_text).collect::<String>()
                 };
                 let t = t.trim().to_string();
                 if t.is_empty() {
@@ -627,7 +688,7 @@ fn render_plain(blocks: &[Block]) -> String {
 fn render_block_plain(block: &Block, out: &mut String, first: &mut bool) {
     match block {
         Block::Paragraph { runs, .. } => {
-            let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+            let text: String = runs.iter().map(run_plain_text).collect();
             let text = text.trim_end();
             if !text.is_empty() {
                 if !*first {
@@ -748,20 +809,59 @@ fn render_block_markdown(block: &Block, out: &mut String) {
     }
 }
 
-/// Render runs with markdown inline formatting (bold/italic/hyperlinks).
+/// Render runs with markdown inline formatting (bold/italic/hyperlinks)
+/// and footnote/endnote markers.
 ///
-/// Adjacent runs sharing the same `link_url` are grouped so the markdown
-/// link wraps the entire visible text: `[text](url)` instead of producing
-/// separate `[part1](url)[part2](url)` fragments.
+/// Marker runs are emitted directly as `[^n]` / `[^eN]` labels so they
+/// are never wrapped in formatting markers or absorbed by hyperlink
+/// grouping. Consecutive ordinary runs are delegated to the shared
+/// markup renderer, which groups adjacent runs sharing the same
+/// `link_url` so the markdown link wraps the entire visible text:
+/// `[text](url)` instead of producing separate
+/// `[part1](url)[part2](url)` fragments. Markers therefore act as
+/// boundaries between hyperlink groups, but never alter the rendering
+/// of ordinary runs.
 fn render_runs_markdown(runs: &[Run]) -> String {
-    markup::render_runs_markdown(runs)
+    let mut out = String::new();
+    let mut i = 0;
+
+    while i < runs.len() {
+        match runs[i].marker {
+            Some(NoteMarker::Footnote(n)) => {
+                out.push_str(&format!("[^{n}]"));
+                i += 1;
+            }
+            Some(NoteMarker::Endnote(n)) => {
+                out.push_str(&format!("[^e{n}]"));
+                i += 1;
+            }
+            None => {
+                let start = i;
+                while i < runs.len() && runs[i].marker.is_none() {
+                    i += 1;
+                }
+                out.push_str(&markup::render_runs_markdown(&runs[start..i]));
+            }
+        }
+    }
+
+    out
 }
 
 /// Implement [`InlineRun`] for docx `Run` so the shared markup renderer
 /// can inspect formatting without knowing the concrete type.
+///
+/// Marker runs expose empty text: their `[^n]` / `[^eN]` labels are
+/// emitted by the docx-local `render_runs_markdown` (which only hands
+/// contiguous ordinary-run slices to the markup renderer), so an empty
+/// `text()` here keeps markers inert if one ever reaches the shared
+/// renderer (e.g. inside a hyperlink slice).
 impl markup::InlineRun for Run {
     fn text(&self) -> &str {
-        &self.text
+        match self.marker {
+            Some(_) => "",
+            None => &self.text,
+        }
     }
     fn bold(&self) -> bool {
         self.bold
@@ -819,10 +919,9 @@ mod tests {
     /// Helper to create a plain Run without a hyperlink.
     fn run(text: &str, bold: bool, italic: bool) -> Run {
         Run {
-            text: text.into(),
             bold,
             italic,
-            link_url: None,
+            ..Run::text(text)
         }
     }
 
@@ -878,10 +977,8 @@ mod tests {
     #[test]
     fn runs_hyperlink_basic() {
         let runs = vec![Run {
-            text: "click here".into(),
-            bold: false,
-            italic: false,
             link_url: Some("https://example.com".into()),
+            ..Run::text("click here")
         }];
         assert_eq!(
             render_runs_markdown(&runs),
@@ -892,10 +989,9 @@ mod tests {
     #[test]
     fn runs_hyperlink_bold() {
         let runs = vec![Run {
-            text: "bold link".into(),
             bold: true,
-            italic: false,
             link_url: Some("https://example.com".into()),
+            ..Run::text("bold link")
         }];
         assert_eq!(
             render_runs_markdown(&runs),
@@ -908,16 +1004,13 @@ mod tests {
         // Two runs with the same URL should be grouped into one markdown link
         let runs = vec![
             Run {
-                text: "part ".into(),
-                bold: false,
-                italic: false,
                 link_url: Some("https://example.com".into()),
+                ..Run::text("part ")
             },
             Run {
-                text: "one".into(),
                 bold: true,
-                italic: false,
                 link_url: Some("https://example.com".into()),
+                ..Run::text("one")
             },
         ];
         assert_eq!(
@@ -931,10 +1024,8 @@ mod tests {
         let runs = vec![
             run("See ", false, false),
             Run {
-                text: "this link".into(),
-                bold: false,
-                italic: false,
                 link_url: Some("https://example.com".into()),
+                ..Run::text("this link")
             },
             run(" for details", false, false),
         ];
@@ -942,6 +1033,100 @@ mod tests {
             render_runs_markdown(&runs),
             "See [this link](https://example.com) for details"
         );
+    }
+
+    // ── marker runs (footnote / endnote) ─────────────────────────
+
+    #[test]
+    fn render_markdown_footnote_marker_in_paragraph() {
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![
+                Run::text("Hello"),
+                Run::footnote_ref(1),
+                Run::text(" world"),
+            ],
+        }];
+        assert_eq!(render_markdown(&blocks).trim_end(), "Hello[^1] world");
+    }
+
+    #[test]
+    fn render_plain_endnote_marker() {
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![Run::text("See"), Run::endnote_ref(2)],
+        }];
+        assert_eq!(render_plain(&blocks).trim_end(), "See[e2]");
+    }
+
+    #[test]
+    fn render_markdown_marker_between_linked_runs() {
+        // Markers must be emitted inline, not swallowed or merged into
+        // hyperlink/bold/italic formatting.
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![Run::text("a"), Run::footnote_ref(3), Run::text("b")],
+        }];
+        assert_eq!(render_markdown(&blocks).trim_end(), "a[^3]b");
+    }
+
+    #[test]
+    fn render_markdown_hyperlink_grouping_preserved_with_marker() {
+        // Sibling guard: adjacent runs sharing a URL still group into one
+        // link after the marker-aware render_runs_markdown refactor.
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![
+                Run {
+                    link_url: Some("https://e".into()),
+                    ..Run::text("x")
+                },
+                Run {
+                    link_url: Some("https://e".into()),
+                    ..Run::text("y")
+                },
+            ],
+        }];
+        assert_eq!(render_markdown(&blocks).trim_end(), "[xy](https://e)");
+    }
+
+    #[test]
+    fn render_plain_marker_inside_table_cell() {
+        // Marker labels flow through the cell_to_text plain path.
+        let blocks = vec![Block::Table {
+            rows: vec![vec![vec![Block::Paragraph {
+                style: ParaStyle::default(),
+                runs: vec![Run::footnote_ref(1)],
+            }]]],
+        }];
+        assert!(render_plain(&blocks).contains("[1]"));
+    }
+
+    #[test]
+    fn render_plain_tab_br_runs_unchanged() {
+        // Guard: tab/br runs (parse sites now construct them with
+        // marker: None) still render verbatim.
+        let tab = Run {
+            text: "\t".into(),
+            bold: false,
+            italic: false,
+            link_url: None,
+            marker: None,
+        };
+        let br = Run {
+            text: "\n".into(),
+            bold: false,
+            italic: false,
+            link_url: None,
+            marker: None,
+        };
+        assert_eq!(run_plain_text(&tab), "\t");
+        assert_eq!(run_plain_text(&br), "\n");
+        let blocks = vec![Block::Paragraph {
+            style: ParaStyle::default(),
+            runs: vec![Run::text("a"), tab, br, Run::text("b")],
+        }];
+        assert_eq!(render_plain(&blocks), "a\t\nb\n");
     }
 
     // ── cell_to_text ─────────────────────────────────────────────
