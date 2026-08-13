@@ -25,9 +25,15 @@ enum Block {
     Table {
         rows: Vec<Row>,
     }, // rows -> cells -> blocks
-    /// An embedded image, stored as a base64 data URI markdown tag.
+    /// An embedded image: the ZIP path of the image data, plus optional
+    /// markdown reference (`--images`) and optional OCR text (`--ocr`).
     Image {
-        markdown: String,
+        /// ZIP path of the embedded image (e.g. `word/media/image1.png`).
+        path: String,
+        /// Inline markdown reference (`![][imageN]`) when `--images` is set.
+        markdown: Option<String>,
+        /// OCR'd text of the image when `--ocr` is set.
+        ocr_text: Option<String>,
     },
 }
 
@@ -203,8 +209,8 @@ fn assign_display_indexes(notes: Vec<Note>, index: &NoteIndex) -> Vec<Note> {
 }
 
 /// Extract plain text from a .docx file.
-pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let (blocks, _, comments, footnotes, endnotes) = parse_docx(data, false)?;
+pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> crate::error::Result<String> {
+    let (blocks, _, comments, footnotes, endnotes) = parse_docx(data, false, ocr)?;
     let mut out = render_plain(&blocks);
     append_extras_plain(&mut out, &comments, &footnotes, &endnotes);
     Ok(out)
@@ -214,11 +220,14 @@ pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
 ///
 /// When `images` is true, embedded images are extracted and included as
 /// reference-style base64 images: `![][imageN]` inline with definitions
-/// appended at the very end. Assembly order is body (with its inline
-/// markers), then the comments/footnotes/endnotes trailers, then the image
-/// definitions.
-pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
-    let (blocks, image_defs, comments, footnotes, endnotes) = parse_docx(data, images)?;
+/// appended at the end of the document. When `ocr` is true, embedded images
+/// are OCR'd and their text is rendered as a blockquote after the image.
+pub(crate) fn extract_markdown(
+    data: &[u8],
+    images: bool,
+    ocr: bool,
+) -> crate::error::Result<String> {
+    let (blocks, image_defs, comments, footnotes, endnotes) = parse_docx(data, images, ocr)?;
     let mut md = render_markdown(&blocks);
     append_extras_markdown(&mut md, &comments, &footnotes, &endnotes);
     if !image_defs.is_empty() {
@@ -267,15 +276,15 @@ fn read_optional_part(
 /// append at the end of the document; `comments`/`footnotes`/`endnotes`
 /// hold the extras parsed from the optional parts (empty when a part is
 /// missing).
-fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<DocxOutput> {
+fn parse_docx(data: &[u8], images: bool, ocr: bool) -> crate::error::Result<DocxOutput> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
 
     // Load hyperlink relationships (rId → URL)
     let rels = xml_util::load_rels(&mut archive, "word/_rels/document.xml.rels");
 
-    // Optionally load image relationships
-    let image_rels = if images {
+    // Optionally load image relationships (needed for images and/or OCR)
+    let image_rels = if images || ocr {
         xml_util::load_image_rels(&mut archive, "word/_rels/document.xml.rels")
     } else {
         xml_util::Rels::new()
@@ -335,11 +344,11 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<DocxOutput> {
     let footnotes = assign_display_indexes(footnotes, &footnotes_idx);
     let endnotes = assign_display_indexes(endnotes, &endnotes_idx);
 
-    // If images enabled, resolve image blocks by reading from the archive
-    let image_defs = if images {
+    // Read image data from the archive when either feature is active
+    let image_defs = if images || ocr {
         let cursor = Cursor::new(data);
         let mut archive = ZipArchive::new(cursor)?;
-        resolve_images(&mut blocks, &mut archive)
+        resolve_images(&mut blocks, &mut archive, images, ocr)?
     } else {
         Vec::new()
     };
@@ -919,7 +928,7 @@ fn parse_hyperlink_runs(
 /// Walks into `<wp:inline>` or `<wp:anchor>` → `<a:graphic>` →
 /// `<a:graphicData>` → `<pic:blipFill>` → `<a:blip r:embed="rIdN"/>`.
 /// Returns a `Block::Image` with the image's ZIP path (to be resolved later)
-/// stored in the `markdown` field as a placeholder.
+/// stored in the `path` field.
 fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block> {
     let mut embed_rid: Option<String> = None;
     let mut depth = 1u32;
@@ -956,51 +965,58 @@ fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block>
     let rid = embed_rid?;
     let target = image_rels.get(&rid)?;
 
-    // Store the resolved ZIP path as a placeholder — will be replaced with
-    // actual base64 content in resolve_images()
+    // Store the resolved ZIP path; resolve_images() will read the data and
+    // fill in the markdown reference and/or OCR text as configured.
     let zip_path = if target.starts_with('/') {
         target.trim_start_matches('/').to_string()
     } else {
         format!("word/{target}")
     };
 
-    Some(Block::Image { markdown: zip_path })
+    Some(Block::Image {
+        path: zip_path,
+        markdown: None,
+        ocr_text: None,
+    })
 }
 
-/// Resolve `Block::Image` placeholders by reading image data from the ZIP
-/// archive and converting to reference-style base64 images.
+/// Resolve `Block::Image` entries by reading image data from the ZIP archive.
 ///
-/// Each image gets a unique label (`image1`, `image2`, ...). The `markdown`
-/// field is replaced with the inline reference (`![][image1]`), and the
-/// corresponding definitions are collected for appending at document end.
-///
-/// Images with unsupported formats (EMF, WMF, etc.) are silently removed.
-fn resolve_images(blocks: &mut Vec<Block>, archive: &mut ZipArchive<Cursor<&[u8]>>) -> Vec<String> {
+/// With `images`, produces reference-style base64 definitions. With `ocr`,
+/// runs OCR on the image bytes. Blocks that end up with neither a markdown
+/// reference nor OCR text (EMF/WMF, unreadable) are removed.
+fn resolve_images(
+    blocks: &mut Vec<Block>,
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    images: bool,
+    ocr: bool,
+) -> crate::error::Result<Vec<String>> {
     let mut definitions = Vec::new();
     let mut counter = 0usize;
 
     for block in blocks.iter_mut() {
-        if let Block::Image { markdown } = block {
-            let zip_path = markdown.clone();
-            if let Some(data) = xml_util::read_image_from_zip(archive, &zip_path, "") {
-                counter += 1;
-                let id = format!("image{counter}");
-                if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
-                    *markdown = img_ref.inline;
-                    definitions.push(img_ref.definition);
-                } else {
-                    // Unsupported format — mark for removal
-                    *markdown = String::new();
+        if let Block::Image { path, markdown, ocr_text } = block {
+            if let Some(data) = xml_util::read_image_from_zip(archive, path, "") {
+                if images {
+                    counter += 1;
+                    let id = format!("image{counter}");
+                    if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
+                        *markdown = Some(img_ref.inline);
+                        definitions.push(img_ref.definition);
+                    }
                 }
-            } else {
-                *markdown = String::new();
+                if ocr {
+                    *ocr_text = crate::ocr::ocr_image_bytes(&data)?;
+                }
             }
         }
     }
-    // Remove empty image blocks (unsupported or unreadable)
-    blocks.retain(|b| !matches!(b, Block::Image { markdown } if markdown.is_empty()));
+    // Remove image blocks with nothing to render (unsupported or unreadable)
+    blocks.retain(|b| {
+        !matches!(b, Block::Image { markdown: None, ocr_text: None, .. })
+    });
 
-    definitions
+    Ok(definitions)
 }
 
 /// Parse a `<w:tbl>` element into a `Block::Table`.
@@ -1183,8 +1199,22 @@ fn render_block_plain(block: &Block, out: &mut String, first: &mut bool) {
                 }
             }
         }
+        Block::Image { ocr_text: Some(text), .. } => {
+            for para in text.split('\n') {
+                let para = para.trim();
+                if para.is_empty() {
+                    continue;
+                }
+                if !*first {
+                    out.push('\n');
+                }
+                out.push_str(para);
+                out.push('\n');
+                *first = false;
+            }
+        }
         Block::Image { .. } => {
-            // Images are not rendered in plain text mode
+            // Images without OCR text are not rendered in plain text mode
         }
     }
 }
@@ -1228,9 +1258,22 @@ fn render_block_markdown(block: &Block, out: &mut String) {
                 out.push_str("\n\n");
             }
         }
-        Block::Image { markdown } => {
-            out.push_str(markdown);
-            out.push_str("\n\n");
+        Block::Image { markdown, ocr_text, .. } => {
+            if let Some(md) = markdown {
+                out.push_str(md);
+                out.push_str("\n\n");
+            }
+            if let Some(text) = ocr_text {
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    out.push_str("> ");
+                    out.push_str(line.trim_end());
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
         }
         Block::Table { rows } => {
             if rows.is_empty() {
@@ -2239,6 +2282,43 @@ mod tests {
         assert!(out.contains("A\\|B"));
     }
 
+    #[test]
+    fn render_block_markdown_image_with_ocr_quote() {
+        let mut out = String::new();
+        let block = Block::Image {
+            path: "word/media/image1.png".into(),
+            markdown: Some("![][image1]".into()),
+            ocr_text: Some("BATDOC\nOCR 123".into()),
+        };
+        render_block_markdown(&block, &mut out);
+        assert_eq!(out, "![][image1]\n\n> BATDOC\n> OCR 123\n\n");
+    }
+
+    #[test]
+    fn render_block_markdown_image_ocr_only_no_tag() {
+        let mut out = String::new();
+        let block = Block::Image {
+            path: "word/media/image1.png".into(),
+            markdown: None,
+            ocr_text: Some("just the text".into()),
+        };
+        render_block_markdown(&block, &mut out);
+        assert_eq!(out, "> just the text\n\n");
+    }
+
+    #[test]
+    fn render_block_plain_image_with_ocr() {
+        let mut out = String::new();
+        let mut first = true;
+        let block = Block::Image {
+            path: "word/media/image1.png".into(),
+            markdown: None,
+            ocr_text: Some("line one\nline two".into()),
+        };
+        render_block_plain(&block, &mut out, &mut first);
+        assert_eq!(out, "line one\n\nline two\n");
+    }
+
     // ── Extra parts: comments / footnotes / endnotes ────────────
 
     use std::io::{Cursor, Write};
@@ -2400,7 +2480,7 @@ mod tests {
             ),
             ("word/footnotes.xml", FOOTNOTES_XML),
         ]);
-        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false).unwrap();
+        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false, false).unwrap();
 
         // Markers now appear in production output for defined ids.
         let md = render_markdown(&blocks);
@@ -2408,7 +2488,7 @@ mod tests {
         // Trailer-included (Task 7): the extract-level output appends the
         // referenced note to a `## Footnotes` section with its text as a
         // definition; unreferenced notes stay out.
-        let full = extract_markdown(&data, false).unwrap();
+        let full = extract_markdown(&data, false, false).unwrap();
         assert!(
             full.contains("## Footnotes"),
             "missing footnotes trailer: {full}"
@@ -2439,7 +2519,7 @@ mod tests {
             ),
             ("word/endnotes.xml", ENDNOTES_XML),
         ]);
-        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false).unwrap();
+        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false, false).unwrap();
 
         let md = render_markdown(&blocks);
         assert!(md.contains("[^e1]"), "missing endnote marker: {md}");
@@ -2458,7 +2538,7 @@ mod tests {
             ),
             ("word/comments.xml", COMMENTS_XML),
         ]);
-        let (blocks, _, comments, footnotes, endnotes) = parse_docx(&data, false).unwrap();
+        let (blocks, _, comments, footnotes, endnotes) = parse_docx(&data, false, false).unwrap();
 
         // Body unaffected; comments carry author + multi-paragraph blocks
         // (rendering into a trailer is Task 7).
@@ -2476,9 +2556,9 @@ mod tests {
             "word/document.xml",
             &document_xml(r#"<w:p><w:r><w:t>Hi</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#),
         )]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
         assert_eq!(md, "Hi\n\n");
-        let plain = extract_plain(&data).unwrap();
+        let plain = extract_plain(&data, false).unwrap();
         assert_eq!(plain, "Hi\n");
     }
 
@@ -2496,7 +2576,7 @@ mod tests {
             ("word/footnotes.xml", FOOTNOTES_XML),
             ("word/endnotes.xml", ENDNOTES_XML),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         // Body carries the inline markers for the referenced notes.
         assert!(md.contains("[^1]"), "footnote marker missing: {md}");
@@ -2533,7 +2613,7 @@ mod tests {
             ),
             ("word/comments.xml", comments_xml),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         // Consecutive Alice comments share one heading; the later Alice
         // comment is NOT consecutive, so the heading repeats. Order of the
@@ -2581,7 +2661,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         // Definition-list form: `[^1]:` on the label line, then every line
         // of the body indented 4 spaces (CommonMark continuation).
@@ -2619,7 +2699,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         // Label line, then every body line indented 4 spaces: the table
         // header starts with 4 spaces + `| `.
@@ -2657,7 +2737,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         assert!(md.contains("Ref"), "body text missing: {md}");
         assert!(!md.contains("[^1]"), "empty note got a marker: {md}");
@@ -2684,7 +2764,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let plain = extract_plain(&data).unwrap();
+        let plain = extract_plain(&data, false).unwrap();
 
         assert!(
             plain.contains("\n\n--- Footnotes ---\n"),
@@ -2720,7 +2800,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         assert!(
             md.contains("[^1]: Referenced note"),
@@ -2742,10 +2822,10 @@ mod tests {
             &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
         )]);
         assert_eq!(
-            extract_markdown(&plain_doc, false).unwrap(),
+            extract_markdown(&plain_doc, false, false).unwrap(),
             "Body only\n\n"
         );
-        assert_eq!(extract_plain(&plain_doc).unwrap(), "Body only\n");
+        assert_eq!(extract_plain(&plain_doc, false).unwrap(), "Body only\n");
 
         // With images enabled and still no extras parts: body, inline image
         // reference, then the trailing definition — nothing else.
@@ -2754,7 +2834,7 @@ mod tests {
             &[],
         );
         assert_eq!(
-            extract_markdown(&image_doc, true).unwrap(),
+            extract_markdown(&image_doc, true, false).unwrap(),
             "Pic\n\n![][image1]\n\n[image1]: <data:image/png;base64,iVBORw0KGgo=>\n"
         );
     }
@@ -2769,7 +2849,7 @@ mod tests {
             r#"<w:p><w:r><w:t>Pic</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>"#,
             &[("word/footnotes.xml", footnotes_xml)],
         );
-        let md = extract_markdown(&data, true).unwrap();
+        let md = extract_markdown(&data, true, false).unwrap();
 
         // The inline image reference renders in the body…
         assert!(md.contains("![][image1]"), "inline image ref: {md}");
@@ -2794,7 +2874,7 @@ mod tests {
             ),
             ("word/comments.xml", COMMENTS_XML),
         ]);
-        let plain = extract_plain(&data).unwrap();
+        let plain = extract_plain(&data, false).unwrap();
 
         // Section heading after the body, one blank line apart; no other
         // trailer sections (empty sections are omitted).
@@ -2847,16 +2927,16 @@ mod tests {
             ("word/comments.xml", comments_xml),
         ]);
         assert_eq!(
-            extract_markdown(&data, false).unwrap(),
+            extract_markdown(&data, false, false).unwrap(),
             "Body\n\n",
             "empty comments section must be omitted: {}",
-            extract_markdown(&data, false).unwrap()
+            extract_markdown(&data, false, false).unwrap()
         );
         assert_eq!(
-            extract_plain(&data).unwrap(),
+            extract_plain(&data, false).unwrap(),
             "Body\n",
             "empty comments section must be omitted: {}",
-            extract_plain(&data).unwrap()
+            extract_plain(&data, false).unwrap()
         );
     }
 
@@ -2871,7 +2951,7 @@ mod tests {
             ),
             ("word/endnotes.xml", ENDNOTES_XML),
         ]);
-        let plain = extract_plain(&data).unwrap();
+        let plain = extract_plain(&data, false).unwrap();
 
         let body_at = plain.find("See").expect("body text");
         let endnotes_at = plain.find("--- Endnotes ---").expect("endnotes section");
@@ -2895,7 +2975,7 @@ mod tests {
             ),
             ("word/footnotes.xml", FOOTNOTES_XML),
         ]);
-        let md = extract_markdown(&data, false).unwrap();
+        let md = extract_markdown(&data, false, false).unwrap();
 
         assert!(
             md.contains("\n\n## Footnotes"),
