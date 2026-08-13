@@ -32,3 +32,21 @@ jobs:
 
       - name: build
         run: cargo build --release
+
+  ocr-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download OCR models
+        run: |
+          mkdir -p ~/.cache/batdoc/models
+          curl -sfL -o ~/.cache/batdoc/models/text-detection.rten https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten
+          curl -sfL -o ~/.cache/batdoc/models/text-recognition.rten https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten
+
+      - name: OCR e2e tests (release mode — ocrs is slow in debug)
+        run: cargo test --release -p batdoc-core --test ocr_e2e -- --ignored
