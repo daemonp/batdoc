@@ -435,8 +435,9 @@ fn push_note_marker(
 ///
 /// A run may contain text, a drawing (image), a footnote/endnote reference
 /// (`w:footnoteReference`/`w:endnoteReference`), or several of these. Note
-/// references become marker runs carrying their display index; ordinary text
-/// is collected into a single run. When `image_rels` is non-empty and a
+/// references become marker runs carrying their display index. Text runs are
+/// emitted in document order, split around marker runs so that text before a
+/// reference stays before its marker. When `image_rels` is non-empty and a
 /// `<w:drawing>` is found inside the run, the image reference is extracted
 /// and returned as a `Block::Image`.
 fn parse_run(
@@ -450,6 +451,17 @@ fn parse_run(
     let mut text = String::new();
     let mut image_block: Option<Block> = None;
     let mut runs: Vec<Run> = Vec::new();
+
+    // Emit any accumulated text as a run before a marker run, so runs keep
+    // their document order even when a run mixes text and references.
+    let flush_text = |runs: &mut Vec<Run>, text: &mut String, bold: bool, italic: bool| {
+        if !text.is_empty() {
+            let mut run = Run::text(std::mem::take(text));
+            run.bold = bold;
+            run.italic = italic;
+            runs.push(run);
+        }
+    };
 
     loop {
         match reader.read_event() {
@@ -476,6 +488,7 @@ fn parse_run(
                     // if a non-empty one appears.
                     b"footnoteReference" | b"endnoteReference" => {
                         if let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
+                            flush_text(&mut runs, &mut text, bold, italic);
                             push_note_marker(&mut runs, name.as_ref(), &id, footnotes, endnotes);
                         }
                         loop {
@@ -503,6 +516,7 @@ fn parse_run(
                     || name.as_ref() == b"endnoteReference"
                 {
                     if let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
+                        flush_text(&mut runs, &mut text, bold, italic);
                         push_note_marker(&mut runs, name.as_ref(), &id, footnotes, endnotes);
                     }
                 } else if name.as_ref() == b"b" || name.as_ref() == b"bCs" {
@@ -520,12 +534,7 @@ fn parse_run(
         }
     }
 
-    if !text.is_empty() {
-        let mut run = Run::text(text);
-        run.bold = bold;
-        run.italic = italic;
-        runs.push(run);
-    }
+    flush_text(&mut runs, &mut text, bold, italic);
 
     (runs, image_block)
 }
@@ -1402,6 +1411,48 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Endnote(1))));
         assert!(runs.iter().any(|r| r.text == "tail" && r.marker.is_none()));
+    }
+
+    #[test]
+    fn parse_run_footnote_ref_after_text_keeps_order() {
+        let mut footnotes = NoteIndex::new();
+        footnotes.add_defined("1");
+        let mut endnotes = NoteIndex::new();
+
+        // A reference inside the same <w:r> after text must render after it:
+        // <w:r><w:t>x</w:t><w:footnoteReference w:id="1"/></w:r> → [x, [^1]].
+        let (runs, img) = parse_run_xml(
+            "<w:t>x</w:t><w:footnoteReference w:id=\"1\"/>",
+            &mut footnotes,
+            &mut endnotes,
+        );
+        assert!(img.is_none());
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs[0].marker.is_none() && runs[0].text == "x",
+            "first run should be text \"x\": {runs:?}"
+        );
+        assert!(
+            runs[1].marker == Some(NoteMarker::Footnote(1)),
+            "second run should be the footnote marker: {runs:?}"
+        );
+
+        // Interleaved <w:t>a</w:t><ref/><w:t>b</w:t> → [a-text, marker, b-text].
+        let (runs, _) = parse_run_xml(
+            "<w:t>a</w:t><w:footnoteReference w:id=\"1\"/><w:t>b</w:t>",
+            &mut footnotes,
+            &mut endnotes,
+        );
+        assert_eq!(runs.len(), 3);
+        assert!(
+            runs[0].marker.is_none() && runs[0].text == "a",
+            "first run should be text \"a\": {runs:?}"
+        );
+        assert_eq!(runs[1].marker, Some(NoteMarker::Footnote(1)));
+        assert!(
+            runs[2].marker.is_none() && runs[2].text == "b",
+            "last run should be text \"b\": {runs:?}"
+        );
     }
 
     #[test]
