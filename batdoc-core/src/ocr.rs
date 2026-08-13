@@ -5,8 +5,10 @@
 //! → `~/.cache/batdoc/models`.
 
 use crate::error::{BatdocError, Result};
+use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Detection model (text regions). 2.4 MB.
 const DETECTION_MODEL_URL: &str =
@@ -76,6 +78,86 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Paths of the two OCR model files once present locally.
+struct ModelPaths {
+    detection: PathBuf,
+    recognition: PathBuf,
+}
+
+/// Ensure both model files exist locally, downloading when needed.
+fn ensure_models() -> Result<ModelPaths> {
+    let dir = cache_dir();
+    let detection = dir.join(DETECTION_MODEL_FILE);
+    let recognition = dir.join(RECOGNITION_MODEL_FILE);
+    ensure_file(&detection, DETECTION_MODEL_URL)?;
+    ensure_file(&recognition, RECOGNITION_MODEL_URL)?;
+    Ok(ModelPaths { detection, recognition })
+}
+
+type EngineResult = std::result::Result<OcrEngine, String>;
+
+fn build_engine() -> EngineResult {
+    let paths = ensure_models().map_err(|e| e.to_string())?;
+    let detection_model = rten::Model::load_file(&paths.detection)
+        .map_err(|e| format!("failed to load OCR detection model: {e}"))?;
+    let recognition_model = rten::Model::load_file(&paths.recognition)
+        .map_err(|e| format!("failed to load OCR recognition model: {e}"))?;
+    OcrEngine::new(OcrEngineParams {
+        detection_model: Some(detection_model),
+        recognition_model: Some(recognition_model),
+        ..Default::default()
+    })
+    .map_err(|e| format!("failed to initialize OCR engine: {e}"))
+}
+
+/// Process-wide OCR engine, built once on first use.
+fn engine() -> Result<&'static OcrEngine> {
+    static ENGINE: LazyLock<EngineResult> = LazyLock::new(build_engine);
+    match &*ENGINE {
+        Ok(engine) => Ok(engine),
+        Err(message) => Err(BatdocError::Document(message.clone())),
+    }
+}
+
+/// OCR an already-decoded RGB image. `None` when no text was detected.
+fn ocr_rgb_image(img: &image::RgbImage) -> Result<Option<String>> {
+    let source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
+        .map_err(|e| BatdocError::Document(format!("OCR input preparation failed: {e}")))?;
+    let engine = engine()?;
+    let input = engine
+        .prepare_input(source)
+        .map_err(|e| BatdocError::Document(format!("OCR preprocessing failed: {e}")))?;
+    let text = engine
+        .get_text(&input)
+        .map_err(|e| BatdocError::Document(format!("OCR failed: {e}")))?;
+    let text = text.trim();
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text.to_string()))
+    }
+}
+
+/// Decode and OCR an image byte slice (PNG/JPEG/GIF/WebP/BMP).
+///
+/// `None` when the bytes are not a decodable image or OCR found no text.
+pub(crate) fn ocr_image_bytes(data: &[u8]) -> Result<Option<String>> {
+    let img = match image::load_from_memory(data) {
+        Ok(img) => img.into_rgb8(),
+        Err(_) => return Ok(None),
+    };
+    ocr_rgb_image(&img)
+}
+
+/// Extract text from an image file (top-level `Format::Image` entry point).
+#[allow(dead_code)] // used from Task 6 (Format::Image)
+pub(crate) fn extract_image_plain(data: &[u8]) -> Result<String> {
+    match ocr_image_bytes(data)? {
+        Some(text) => Ok(text),
+        None => Err(BatdocError::Document("no text found in image".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +220,17 @@ mod tests {
         assert!(result.is_err());
         assert!(!file.exists(), "no partial model file may remain");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ocr_image_bytes_undecodable_returns_none() {
+        // Garbage bytes: decode fails before any model/network access.
+        assert_eq!(ocr_image_bytes(b"not an image").unwrap(), None);
+    }
+
+    #[test]
+    fn extract_image_plain_undecodable_errors() {
+        let err = extract_image_plain(b"garbage").unwrap_err().to_string();
+        assert!(err.contains("no text found in image"));
     }
 }
