@@ -7,6 +7,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
@@ -41,9 +42,6 @@ struct ParaStyle {
 /// The `usize` is the display index (1-based) to render in the output;
 /// how that index is derived from the document's footnote/endnote parts
 /// is handled by the parser (see the extraction-fidelity plan).
-// Variants are only constructed from tests until Task 5 wires
-// w:footnoteReference/w:endnoteReference parsing.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoteMarker {
     Footnote(usize), // display_index
@@ -61,9 +59,6 @@ struct Run {
     marker: Option<NoteMarker>,
 }
 
-// Constructors are only exercised from tests until Task 5 wires
-// w:footnoteReference/w:endnoteReference parsing.
-#[allow(dead_code)]
 impl Run {
     /// Create an ordinary text run.
     fn text(s: impl Into<String>) -> Self {
@@ -103,6 +98,57 @@ impl Run {
 type Cell = Vec<Block>;
 /// A table row: a sequence of cells.
 type Row = Vec<Cell>;
+
+/// Tracks `display_index` assignment for footnote/endnote references.
+///
+/// One instance per note type (footnotes, endnotes), numbering from 1.
+/// The first body reference to a defined `w:id` claims the next index;
+/// later references to the same id reuse it.
+struct NoteIndex {
+    /// w:id → assigned `display_index` (first body reference wins).
+    assigned: HashMap<String, usize>,
+    /// Whether a definition exists for a w:id (seeded by the extras part
+    /// parse; tests seed via `add_defined`, Task 6 fills it for real).
+    defined: HashSet<String>,
+    /// Next `display_index` to assign.
+    next: usize,
+}
+
+impl NoteIndex {
+    fn new() -> Self {
+        Self {
+            assigned: HashMap::new(),
+            defined: HashSet::new(),
+            next: 1,
+        }
+    }
+
+    /// Seed a defined id (used by tests now, Task 6 production).
+    #[allow(dead_code)] // Only exercised from tests until Task 6 seeds real definitions.
+    fn add_defined(&mut self, id: impl Into<String>) {
+        self.defined.insert(id.into());
+    }
+
+    /// Returns `Some(display_index)` if defined; assigns next on first sight.
+    fn marker_for(&mut self, id: &str) -> Option<usize> {
+        if !self.defined.contains(id) {
+            return None;
+        }
+        if let Some(&n) = self.assigned.get(id) {
+            return Some(n);
+        }
+        let n = self.next;
+        self.next += 1;
+        self.assigned.insert(id.to_string(), n);
+        Some(n)
+    }
+}
+
+impl Default for NoteIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Extract plain text from a .docx file.
 pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
@@ -156,7 +202,20 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<(Vec<Block>, Ve
     let mut blocks = Vec::new();
     let mut in_body = false;
 
-    parse_body(&mut reader, &mut blocks, &mut in_body, &rels, &image_rels);
+    // Footnote/endnote display indexes are assigned on first body reference.
+    // Definitions are seeded from the note parts (Task 6); until then the
+    // indexes start empty, so body refs emit no markers yet.
+    let mut footnotes = NoteIndex::new();
+    let mut endnotes = NoteIndex::new();
+    parse_body(
+        &mut reader,
+        &mut blocks,
+        &mut in_body,
+        &rels,
+        &image_rels,
+        &mut footnotes,
+        &mut endnotes,
+    );
 
     // If images enabled, resolve image blocks by reading from the archive
     let image_defs = if images {
@@ -177,6 +236,8 @@ fn parse_body(
     in_body: &mut bool,
     rels: &Rels,
     image_rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
 ) {
     loop {
         match reader.read_event() {
@@ -185,11 +246,12 @@ fn parse_body(
                 match name.as_ref() {
                     b"body" => *in_body = true,
                     b"p" if *in_body => {
-                        let mut para_blocks = parse_paragraph(reader, rels, image_rels);
+                        let mut para_blocks =
+                            parse_paragraph(reader, rels, image_rels, footnotes, endnotes);
                         blocks.append(&mut para_blocks);
                     }
                     b"tbl" if *in_body => {
-                        let table = parse_table(reader, rels);
+                        let table = parse_table(reader, rels, footnotes, endnotes);
                         blocks.push(table);
                     }
                     _ => {}
@@ -210,7 +272,13 @@ fn parse_body(
 /// is active, any `<w:drawing>` elements (which live inside `<w:r>` runs)
 /// produce additional `Block::Image` entries. The paragraph is always first,
 /// followed by any images found.
-fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -> Vec<Block> {
+fn parse_paragraph(
+    reader: &mut Reader<&[u8]>,
+    rels: &Rels,
+    image_rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) -> Vec<Block> {
     let mut style = ParaStyle::default();
     let mut runs: Vec<Run> = Vec::new();
     let mut image_blocks: Vec<Block> = Vec::new();
@@ -222,10 +290,8 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -
                 match name.as_ref() {
                     b"pPr" => parse_para_props(reader, &mut style),
                     b"r" => {
-                        let (run_opt, img_opt) = parse_run(reader, image_rels);
-                        if let Some(run) = run_opt {
-                            runs.push(run);
-                        }
+                        let (run_runs, img_opt) = parse_run(reader, image_rels, footnotes, endnotes);
+                        runs.extend(run_runs);
                         if let Some(blk) = img_opt {
                             image_blocks.push(blk);
                         }
@@ -239,6 +305,8 @@ fn parse_paragraph(reader: &mut Reader<&[u8]>, rels: &Rels, image_rels: &Rels) -
                             url.as_deref(),
                             image_rels,
                             &mut image_blocks,
+                            footnotes,
+                            endnotes,
                         );
                     }
                     _ => {}
@@ -338,16 +406,50 @@ fn parse_heading_level(val: &str) -> Option<u8> {
     None
 }
 
-/// Parse a `<w:r>` element into a text `Run` and/or an image `Block`.
+/// Emit a marker `Run` for a `w:footnoteReference`/`w:endnoteReference` id.
 ///
-/// A run may contain text, a drawing (image), or both. When `image_rels`
-/// is non-empty and a `<w:drawing>` is found inside the run, the image
-/// reference is extracted and returned as a `Block::Image`.
-fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Option<Block>) {
+/// The display index is assigned by the matching [`NoteIndex`] on first
+/// sight; references to ids with no definition are dropped (no marker).
+fn push_note_marker(
+    runs: &mut Vec<Run>,
+    name: &[u8],
+    id: &str,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) {
+    let marker = if name == b"footnoteReference" {
+        footnotes.marker_for(id).map(NoteMarker::Footnote)
+    } else {
+        endnotes.marker_for(id).map(NoteMarker::Endnote)
+    };
+    if let Some(marker) = marker {
+        let run = match marker {
+            NoteMarker::Footnote(n) => Run::footnote_ref(n),
+            NoteMarker::Endnote(n) => Run::endnote_ref(n),
+        };
+        runs.push(run);
+    }
+}
+
+/// Parse a `<w:r>` element into text/marker `Run`s and/or an image `Block`.
+///
+/// A run may contain text, a drawing (image), a footnote/endnote reference
+/// (`w:footnoteReference`/`w:endnoteReference`), or several of these. Note
+/// references become marker runs carrying their display index; ordinary text
+/// is collected into a single run. When `image_rels` is non-empty and a
+/// `<w:drawing>` is found inside the run, the image reference is extracted
+/// and returned as a `Block::Image`.
+fn parse_run(
+    reader: &mut Reader<&[u8]>,
+    image_rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) -> (Vec<Run>, Option<Block>) {
     let mut bold = false;
     let mut italic = false;
     let mut text = String::new();
     let mut image_block: Option<Block> = None;
+    let mut runs: Vec<Run> = Vec::new();
 
     loop {
         match reader.read_event() {
@@ -369,6 +471,25 @@ fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Opt
                             image_block = Some(blk);
                         }
                     }
+                    // Defensive Start form: note references are empty
+                    // elements in practice, but consume through the end tag
+                    // if a non-empty one appears.
+                    b"footnoteReference" | b"endnoteReference" => {
+                        if let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
+                            push_note_marker(&mut runs, name.as_ref(), &id, footnotes, endnotes);
+                        }
+                        loop {
+                            match reader.read_event() {
+                                Ok(Event::End(ref e))
+                                    if e.local_name().as_ref() == name.as_ref() =>
+                                {
+                                    break;
+                                }
+                                Ok(Event::Eof) | Err(_) => break,
+                                _ => {}
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -378,6 +499,12 @@ fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Opt
                     text.push('\t');
                 } else if name.as_ref() == b"br" {
                     text.push('\n');
+                } else if name.as_ref() == b"footnoteReference"
+                    || name.as_ref() == b"endnoteReference"
+                {
+                    if let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
+                        push_note_marker(&mut runs, name.as_ref(), &id, footnotes, endnotes);
+                    }
                 } else if name.as_ref() == b"b" || name.as_ref() == b"bCs" {
                     // Self-closing <w:b/> in rPr means bold on
                     bold = true;
@@ -393,19 +520,14 @@ fn parse_run(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> (Option<Run>, Opt
         }
     }
 
-    let run = if text.is_empty() {
-        None
-    } else {
-        Some(Run {
-            text,
-            bold,
-            italic,
-            link_url: None,
-            marker: None,
-        })
-    };
+    if !text.is_empty() {
+        let mut run = Run::text(text);
+        run.bold = bold;
+        run.italic = italic;
+        runs.push(run);
+    }
 
-    (run, image_block)
+    (runs, image_block)
 }
 
 /// Parse <w:rPr> to extract bold/italic.
@@ -450,12 +572,14 @@ fn parse_hyperlink_runs(
     url: Option<&str>,
     image_rels: &Rels,
     image_blocks: &mut Vec<Block>,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
 ) {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"r" => {
-                let (run_opt, img_opt) = parse_run(reader, image_rels);
-                if let Some(mut run) = run_opt {
+                let (run_runs, img_opt) = parse_run(reader, image_rels, footnotes, endnotes);
+                for mut run in run_runs {
                     run.link_url = url.map(String::from);
                     runs.push(run);
                 }
@@ -562,7 +686,12 @@ fn resolve_images(blocks: &mut Vec<Block>, archive: &mut ZipArchive<Cursor<&[u8]
 }
 
 /// Parse a `<w:tbl>` element into a `Block::Table`.
-fn parse_table(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
+fn parse_table(
+    reader: &mut Reader<&[u8]>,
+    rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) -> Block {
     let mut rows: Vec<Row> = Vec::new();
 
     loop {
@@ -570,7 +699,7 @@ fn parse_table(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 if name.as_ref() == b"tr" {
-                    let row = parse_table_row(reader, rels);
+                    let row = parse_table_row(reader, rels, footnotes, endnotes);
                     rows.push(row);
                 }
             }
@@ -586,7 +715,12 @@ fn parse_table(reader: &mut Reader<&[u8]>, rels: &Rels) -> Block {
 }
 
 /// Parse a `<w:tr>` element into a row of cells.
-fn parse_table_row(reader: &mut Reader<&[u8]>, rels: &Rels) -> Row {
+fn parse_table_row(
+    reader: &mut Reader<&[u8]>,
+    rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) -> Row {
     let mut cells: Row = Vec::new();
 
     loop {
@@ -594,7 +728,7 @@ fn parse_table_row(reader: &mut Reader<&[u8]>, rels: &Rels) -> Row {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 if name.as_ref() == b"tc" {
-                    let cell = parse_table_cell(reader, rels);
+                    let cell = parse_table_cell(reader, rels, footnotes, endnotes);
                     cells.push(cell);
                 }
             }
@@ -613,7 +747,12 @@ fn parse_table_row(reader: &mut Reader<&[u8]>, rels: &Rels) -> Row {
 ///
 /// Images inside table cells are not extracted (impractical in markdown
 /// tables), so an empty `image_rels` is used for paragraph parsing.
-fn parse_table_cell(reader: &mut Reader<&[u8]>, rels: &Rels) -> Cell {
+fn parse_table_cell(
+    reader: &mut Reader<&[u8]>,
+    rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) -> Cell {
     let empty_image_rels = xml_util::Rels::new();
     let mut blocks = Vec::new();
 
@@ -623,10 +762,13 @@ fn parse_table_cell(reader: &mut Reader<&[u8]>, rels: &Rels) -> Cell {
                 let name = e.local_name();
                 match name.as_ref() {
                     b"p" => {
-                        let mut para_blocks = parse_paragraph(reader, rels, &empty_image_rels);
+                        let mut para_blocks =
+                            parse_paragraph(reader, rels, &empty_image_rels, footnotes, endnotes);
                         blocks.append(&mut para_blocks);
                     }
-                    b"tbl" => blocks.push(parse_table(reader, rels)), // nested table
+                    b"tbl" => {
+                        blocks.push(parse_table(reader, rels, footnotes, endnotes)); // nested table
+                    }
                     _ => {}
                 }
             }
@@ -1182,6 +1324,169 @@ mod tests {
             runs: vec![Run::text("a"), tab, br, Run::text("b")],
         }];
         assert_eq!(render_plain(&blocks), "a\t\nb\n");
+    }
+
+    // ── NoteIndex (footnote/endnote display index assignment) ────
+
+    #[test]
+    fn note_index_first_ref_assigns_and_reuses() {
+        let mut idx = NoteIndex::new();
+        idx.add_defined("1");
+        assert_eq!(idx.marker_for("1"), Some(1));
+        assert_eq!(idx.marker_for("1"), Some(1)); // reused, not re-assigned
+        assert_eq!(idx.marker_for("2"), None); // undefined → no index
+        assert_eq!(idx.marker_for("1"), Some(1)); // still assigned
+        idx.add_defined("2");
+        assert_eq!(idx.marker_for("2"), Some(2)); // next counter after 1
+    }
+
+    // ── parse_run footnote/endnote reference markers ─────────────
+
+    /// Wrap an XML fragment in `<w:r>…</w:r>` and feed it to `parse_run`.
+    fn parse_run_xml(
+        xml: &str,
+        footnotes: &mut NoteIndex,
+        endnotes: &mut NoteIndex,
+    ) -> (Vec<Run>, Option<Block>) {
+        let full = format!("<w:r>{xml}</w:r>");
+        let mut reader = Reader::from_str(&full);
+        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:r>
+        parse_run(&mut reader, &Rels::new(), footnotes, endnotes)
+    }
+
+    #[test]
+    fn parse_run_footnote_reference_emits_marker_run() {
+        let mut footnotes = NoteIndex::new();
+        footnotes.add_defined("1");
+        let mut endnotes = NoteIndex::new();
+
+        // Defined id → marker run (display index 1) plus the text run.
+        let (runs, img) = parse_run_xml(
+            "<w:footnoteReference w:id=\"1\"/><w:t>text</w:t>",
+            &mut footnotes,
+            &mut endnotes,
+        );
+        assert!(img.is_none());
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.iter().any(|r| r.marker == Some(NoteMarker::Footnote(1))),
+            "missing footnote marker run: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|r| r.text == "text" && r.marker.is_none()),
+            "missing text run: {runs:?}"
+        );
+
+        // Dangling id (no definition) → no marker run, only the text run.
+        let (runs, _) = parse_run_xml(
+            "<w:footnoteReference w:id=\"99\"/><w:t>text</w:t>",
+            &mut footnotes,
+            &mut endnotes,
+        );
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "text");
+    }
+
+    #[test]
+    fn parse_run_endnote_reference_emits_marker_run() {
+        let mut footnotes = NoteIndex::new();
+        let mut endnotes = NoteIndex::new();
+        endnotes.add_defined("7");
+
+        // Endnote ids keep a separate counter from footnotes.
+        let (runs, _) = parse_run_xml(
+            "<w:endnoteReference w:id=\"7\"/><w:t>tail</w:t>",
+            &mut footnotes,
+            &mut endnotes,
+        );
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Endnote(1))));
+        assert!(runs.iter().any(|r| r.text == "tail" && r.marker.is_none()));
+    }
+
+    #[test]
+    fn parse_paragraph_footnote_ref_in_opening() {
+        let mut footnotes = NoteIndex::new();
+        footnotes.add_defined("1");
+        let mut endnotes = NoteIndex::new();
+
+        let xml = "<w:p><w:r><w:footnoteReference w:id=\"1\"/></w:r><w:r><w:t>X</w:t></w:r></w:p>";
+        let full = format!("<w:body>{xml}</w:body>");
+        let mut reader = Reader::from_str(&full);
+        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:body>
+        let blocks = parse_paragraph(
+            &mut reader,
+            &Rels::new(),
+            &Rels::new(),
+            &mut footnotes,
+            &mut endnotes,
+        );
+
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Paragraph { runs, .. } => {
+                assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Footnote(1))));
+                assert!(runs.iter().any(|r| r.text == "X"));
+            }
+            _ => panic!("expected a paragraph block"),
+        }
+        // End-to-end: parse → render yields the marker label right before X.
+        assert_eq!(render_markdown(&blocks).trim_end(), "[^1]X");
+    }
+
+    #[test]
+    fn parse_paragraph_footnote_ref_inside_hyperlink() {
+        let mut footnotes = NoteIndex::new();
+        footnotes.add_defined("1");
+        let mut endnotes = NoteIndex::new();
+
+        let xml = "<w:p><w:hyperlink r:id=\"rId9\"><w:r><w:t>see</w:t></w:r>\
+                   <w:r><w:footnoteReference w:id=\"1\"/></w:r></w:hyperlink></w:p>";
+        let full = format!("<w:body>{xml}</w:body>");
+        let mut reader = Reader::from_str(&full);
+        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:body>
+        let mut rels = Rels::new();
+        rels.insert("rId9".into(), "https://example.com".into());
+        let blocks = parse_paragraph(
+            &mut reader,
+            &rels,
+            &Rels::new(),
+            &mut footnotes,
+            &mut endnotes,
+        );
+
+        match &blocks[0] {
+            Block::Paragraph { runs, .. } => {
+                assert!(runs.iter().any(|r| r.marker == Some(NoteMarker::Footnote(1))));
+                assert!(runs.iter().any(
+                    |r| r.text == "see" && r.link_url.as_deref() == Some("https://example.com")
+                ));
+            }
+            _ => panic!("expected a paragraph block"),
+        }
+        // The marker splits the hyperlink group and renders its own label.
+        assert_eq!(
+            render_markdown(&blocks).trim_end(),
+            "[see](https://example.com)[^1]"
+        );
+    }
+
+    #[test]
+    fn parse_table_cell_footnote_ref() {
+        let mut footnotes = NoteIndex::new();
+        footnotes.add_defined("1");
+        let mut endnotes = NoteIndex::new();
+
+        let xml = "<w:tbl><w:tr><w:tc><w:p><w:r><w:footnoteReference w:id=\"1\"/>\
+                   <w:t>note</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+        let full = format!("<w:body>{xml}</w:body>");
+        let mut reader = Reader::from_str(&full);
+        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:body>
+        let table = parse_table(&mut reader, &Rels::new(), &mut footnotes, &mut endnotes);
+
+        assert!(matches!(&table, Block::Table { rows } if rows.len() == 1));
+        let md = render_markdown(std::slice::from_ref(&table));
+        assert!(md.contains("[^1]"), "table markdown missing marker: {md}");
     }
 
     // ── cell_to_text ─────────────────────────────────────────────
