@@ -155,12 +155,15 @@ fn parse_pptx(
             Vec::new()
         };
 
+        // Discover speaker notes from the notesSlide relationship. Missing
+        // rels, missing targets, and whitespace-only bodies yield no notes.
+        let notes = load_slide_notes(&mut archive, &path);
+
         slides.push(Slide {
             number: num,
             shapes,
             images,
-            // Notes discovery is a later task; parse keeps slides notes-free.
-            notes: Vec::new(),
+            notes,
         });
     }
 
@@ -332,6 +335,123 @@ fn parse_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Optio
     }
 
     if paragraphs.is_empty() {
+        None
+    } else {
+        Some(ShapeText { paragraphs })
+    }
+}
+
+/// Discover speaker notes for a slide from its `notesSlide` relationship.
+///
+/// Reads the slide's relationship file, finds the first `notesSlide`
+/// target, resolves it to a ZIP path relative to the slide's directory,
+/// and parses the notes part. Missing or unreadable rels/notes parts and
+/// whitespace-only notes bodies all yield no notes.
+fn load_slide_notes(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    slide_path: &str,
+) -> Vec<ShapeText> {
+    let mut rels_xml = String::new();
+    match archive.by_name(&xml_util::rels_path(slide_path)) {
+        Ok(mut entry) => {
+            if entry.read_to_string(&mut rels_xml).is_err() {
+                return Vec::new();
+            }
+        }
+        Err(_) => return Vec::new(),
+    }
+
+    let Some(target) = xml_util::find_rel_target_by_type_suffix(&rels_xml, "/notesSlide") else {
+        return Vec::new();
+    };
+    let base_dir = slide_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let notes_path = xml_util::resolve_zip_target(&target, base_dir);
+
+    let mut xml = String::new();
+    match archive.by_name(&notes_path) {
+        Ok(mut entry) => {
+            if entry.read_to_string(&mut xml).is_err() {
+                return Vec::new();
+            }
+        }
+        Err(_) => return Vec::new(),
+    }
+
+    let shapes = parse_notes_slide_xml(&xml);
+    if notes_nonempty(&shapes) {
+        shapes
+    } else {
+        Vec::new()
+    }
+}
+
+/// Parse a notes slide's XML, extracting the text of `body` placeholders.
+///
+/// Only shapes anchored to a `body` placeholder contribute speaker notes;
+/// slide-image placeholders (`sldImg`), titles, and freeform shapes are
+/// ignored. Run hyperlinks are not resolved — notes rels are not loaded,
+/// so the run walker runs against an empty `Rels`.
+fn parse_notes_slide_xml(xml: &str) -> Vec<ShapeText> {
+    let mut reader = Reader::from_str(xml);
+    let rels = Rels::new();
+    let mut shapes = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"sp" => {
+                if let Some(shape) = parse_notes_shape(&mut reader, &rels, b"sp") {
+                    shapes.push(shape);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    shapes
+}
+
+/// Parse a single notes `<p:sp>` shape, keeping only `body` placeholders.
+///
+/// Records the placeholder type from `<p:ph type="…"/>` (which appears in
+/// `<p:nvSpPr>/<p:nvPr>` before the text body), then parses `txBody` with
+/// the same walker used for slides. Shapes whose placeholder type is not
+/// `body` — including freeform shapes with no `<p:ph>` at all — are dropped.
+fn parse_notes_shape(
+    reader: &mut Reader<&[u8]>,
+    rels: &Rels,
+    end_tag: &[u8],
+) -> Option<ShapeText> {
+    let mut ph_type: Option<String> = None;
+    let mut paragraphs = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let name = e.local_name();
+                if name.as_ref() == b"ph" && ph_type.is_none() {
+                    ph_type = get_attr(e, b"type");
+                } else if name.as_ref() == b"txBody" {
+                    parse_text_body(reader, rels, &mut paragraphs);
+                }
+            }
+            Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"ph" => {
+                if ph_type.is_none() {
+                    ph_type = get_attr(e, b"type");
+                }
+            }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == end_tag => {
+                break;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Only shapes anchored to a `body` placeholder carry speaker notes.
+    // Empty text bodies are dropped here; whitespace-only notes are
+    // filtered out by load_slide_notes.
+    if ph_type.as_deref() != Some("body") || paragraphs.is_empty() {
         None
     } else {
         Some(ShapeText { paragraphs })
@@ -1507,5 +1627,142 @@ mod tests {
         }];
         assert!(!render_markdown(&slides).contains("## Notes"));
         assert!(!render_plain(&slides).contains("--- Notes ---"));
+    }
+
+    // ── ZIP integration: speaker notes discovery ──────────────────
+
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    fn zip_entry(z: &mut ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &str) {
+        z.start_file(name, SimpleFileOptions::default()).unwrap();
+        z.write_all(body.as_bytes()).unwrap();
+    }
+
+    /// Minimal one-slide pptx whose notes slide's `body` placeholder says
+    /// `"Speak slowly"` alongside a `sldImg` placeholder and a freeform shape.
+    fn minimal_pptx_with_notes() -> Vec<u8> {
+        minimal_pptx("Speak slowly", "../notesSlides/notesSlide1.xml")
+    }
+
+    /// Same deck, but the notes `body` placeholder text is `notes_body`.
+    fn minimal_pptx_with_notes_body(notes_body: &str) -> Vec<u8> {
+        minimal_pptx(notes_body, "../notesSlides/notesSlide1.xml")
+    }
+
+    /// Build a one-slide pptx whose slide rels point the notesSlide at
+    /// `notes_target`, with `notes_body` as the body placeholder text.
+    fn minimal_pptx(notes_body: &str, notes_target: &str) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut z = ZipWriter::new(buf);
+        zip_entry(
+            &mut z,
+            "[Content_Types].xml",
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#,
+        );
+        zip_entry(
+            &mut z,
+            "ppt/presentation.xml",
+            r#"<?xml version="1.0"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst>
+    <p:sldId id="256" r:id="rId1"/>
+  </p:sldIdLst>
+</p:presentation>"#,
+        );
+        zip_entry(
+            &mut z,
+            "ppt/_rels/presentation.xml.rels",
+            r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>"#,
+        );
+        zip_entry(
+            &mut z,
+            "ppt/slides/slide1.xml",
+            r#"<?xml version="1.0"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree>
+    <p:sp>
+      <p:txBody><a:p><a:r><a:t>Deck title</a:t></a:r></a:p></p:txBody>
+    </p:sp>
+  </p:spTree></p:cSld>
+</p:sld>"#,
+        );
+        zip_entry(
+            &mut z,
+            "ppt/slides/_rels/slide1.xml.rels",
+            &format!(
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="{notes_target}"/>
+</Relationships>"#
+            ),
+        );
+        zip_entry(
+            &mut z,
+            "ppt/notesSlides/notesSlide1.xml",
+            &format!(
+                r#"<?xml version="1.0"?>
+<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree>
+    <p:sp>
+      <p:nvSpPr><p:nvPr><p:ph type="sldImg"/></p:nvPr></p:nvSpPr>
+      <p:txBody><a:p><a:r><a:t>SHOULD NOT APPEAR</a:t></a:r></a:p></p:txBody>
+    </p:sp>
+    <p:sp>
+      <p:nvSpPr><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr>
+      <p:txBody><a:p><a:r><a:t>{notes_body}</a:t></a:r></a:p></p:txBody>
+    </p:sp>
+    <p:sp>
+      <p:txBody><a:p><a:r><a:t>freeform ignored</a:t></a:r></a:p></p:txBody>
+    </p:sp>
+  </p:spTree></p:cSld>
+</p:notes>"#
+            ),
+        );
+        z.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extract_markdown_includes_speaker_notes() {
+        let data = minimal_pptx_with_notes();
+        let md = extract_markdown(&data, false).unwrap();
+        assert!(md.contains("Deck title"), "md: {md:?}");
+        assert!(md.contains("## Notes"), "md: {md:?}");
+        assert!(md.contains("Speak slowly"), "md: {md:?}");
+        assert!(!md.contains("SHOULD NOT APPEAR"), "md: {md:?}");
+        assert!(!md.contains("freeform ignored"), "md: {md:?}");
+    }
+
+    #[test]
+    fn extract_whitespace_notes_body_omits_section() {
+        let data = minimal_pptx_with_notes_body("   ");
+        let md = extract_markdown(&data, false).unwrap();
+        let plain = extract_plain(&data).unwrap();
+        assert!(!md.contains("## Notes"), "md: {md:?}");
+        assert!(!plain.contains("--- Notes ---"), "plain: {plain:?}");
+    }
+
+    #[test]
+    fn extract_missing_notes_target_ok() {
+        let data = minimal_pptx("Speak slowly", "../notesSlides/missing.xml");
+        let md = extract_markdown(&data, false).unwrap();
+        assert!(md.contains("Deck title"), "md: {md:?}");
+        assert!(!md.contains("## Notes"), "md: {md:?}");
+    }
+
+    #[test]
+    fn extract_plain_includes_speaker_notes() {
+        let data = minimal_pptx_with_notes();
+        let plain = extract_plain(&data).unwrap();
+        assert!(plain.contains("--- Notes ---"), "plain: {plain:?}");
+        assert!(plain.contains("[Slide 1]"), "plain: {plain:?}");
+        assert!(plain.contains("Speak slowly"), "plain: {plain:?}");
     }
 }
