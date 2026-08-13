@@ -418,8 +418,8 @@ fn parse_block_children(
 /// opened element, +1 per nested start, −1 per end, exit at 0): the skip
 /// ends only when the opened element itself closes, so nested elements
 /// reusing the same local name are swallowed as part of the subtree instead
-/// of ending the skip early. `name` identifies the skipped element.
-fn skip_element(reader: &mut Reader<&[u8]>, name: &[u8]) {
+/// of ending the skip early.
+fn skip_element(reader: &mut Reader<&[u8]>) {
     let mut depth = 1u32;
     loop {
         match &reader.read_event() {
@@ -434,7 +434,6 @@ fn skip_element(reader: &mut Reader<&[u8]>, name: &[u8]) {
             _ => {}
         }
     }
-    let _ = name;
 }
 
 /// Shared parse for the footnote/endnote parts, which share a shape
@@ -463,13 +462,13 @@ fn parse_notes_xml(xml: &str, note_tag: &[u8]) -> Vec<Note> {
             Ok(Event::Start(e)) if e.local_name().as_ref() == note_tag => {
                 let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) else {
                     // Missing id: consume the element without interpreting it.
-                    skip_element(&mut reader, note_tag);
+                    skip_element(&mut reader);
                     continue;
                 };
                 if id == "-1" || id == "0" || !seen.insert(id.clone()) {
                     // Separator (-1), continuation (0), or duplicate id
                     // (first wins): skip.
-                    skip_element(&mut reader, note_tag);
+                    skip_element(&mut reader);
                     continue;
                 }
                 let blocks = parse_block_children(
@@ -524,13 +523,13 @@ fn parse_comments_xml(xml: &str) -> Vec<Comment> {
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"comment" => {
                 let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) else {
                     // Comment without an id: nothing to key it by, drop it.
-                    skip_element(&mut reader, b"comment");
+                    skip_element(&mut reader);
                     continue;
                 };
                 if !seen.insert(id.clone()) {
                     // Duplicate id: first wins; consume the body unparsed so
                     // it can never leak text or markers.
-                    skip_element(&mut reader, b"comment");
+                    skip_element(&mut reader);
                     continue;
                 }
                 let mut author = get_attr(e, b"w:author")
@@ -806,7 +805,7 @@ fn parse_run(
                     // no consumption; this defensive Start form swallows the
                     // whole subtree if a non-empty one ever appears.
                     b"footnoteRef" | b"endnoteRef" | b"annotationRef" => {
-                        skip_element(reader, name.as_ref());
+                        skip_element(reader);
                     }
                     _ => {}
                 }
