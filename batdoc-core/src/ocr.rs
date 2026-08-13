@@ -25,10 +25,10 @@ fn cache_dir_from(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(xdg) = get_env("XDG_CACHE_HOME") {
         return PathBuf::from(xdg).join("batdoc").join("models");
     }
-    match get_env("HOME") {
-        Some(home) => PathBuf::from(home).join(".cache").join("batdoc").join("models"),
-        None => PathBuf::from(".cache").join("batdoc").join("models"),
-    }
+    get_env("HOME").map_or_else(
+        || PathBuf::from(".cache").join("batdoc").join("models"),
+        |home| PathBuf::from(home).join(".cache").join("batdoc").join("models"),
+    )
 }
 
 fn cache_dir() -> PathBuf {
@@ -52,7 +52,7 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
         })?;
     }
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
     let response = ureq::get(url).call().map_err(|e| {
         BatdocError::Document(format!(
             "failed to download OCR model from {url}: {e}\n\
