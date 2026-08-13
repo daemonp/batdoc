@@ -107,8 +107,8 @@ type Row = Vec<Cell>;
 struct NoteIndex {
     /// w:id → assigned `display_index` (first body reference wins).
     assigned: HashMap<String, usize>,
-    /// Whether a definition exists for a w:id (seeded by the extras part
-    /// parse; tests seed via `add_defined`, Task 6 fills it for real).
+    /// Whether a definition exists for a w:id (seeded from the note parts by
+    /// `parse_docx`; tests seed via `add_defined`).
     defined: HashSet<String>,
     /// Next `display_index` to assign.
     next: usize,
@@ -123,8 +123,9 @@ impl NoteIndex {
         }
     }
 
-    /// Seed a defined id (used by tests now, Task 6 production).
-    #[allow(dead_code)] // Only exercised from tests until Task 6 seeds real definitions.
+    /// Record that a definition exists for a note id, so body references to
+    /// it emit a marker. Seeded by `parse_docx` from the note parts; tests
+    /// seed it directly to exercise marker assignment.
     fn add_defined(&mut self, id: impl Into<String>) {
         self.defined.insert(id.into());
     }
@@ -150,9 +151,60 @@ impl Default for NoteIndex {
     }
 }
 
+/// A document comment from `word/comments.xml`.
+///
+/// Fields are populated by the parser and consumed by the trailer rendering
+/// in the next extraction-fidelity task (and by tests); until then they are
+/// written but not read in lib builds.
+#[allow(dead_code)]
+struct Comment {
+    id: String,
+    author: String,
+    blocks: Vec<Block>, // comments can be multi-paragraph
+}
+
+/// A footnote or endnote definition from the note parts.
+///
+/// `display_index` is 0 until the body walk assigns the first reference to
+/// this note's `w:id`; notes never referenced in the body keep 0 (the
+/// trailer renders only referenced notes).
+///
+/// The `blocks` field is populated by the parser and consumed by the trailer
+/// rendering in the next extraction-fidelity task (and by tests).
+#[allow(dead_code)]
+struct Note {
+    id: String,
+    display_index: usize,
+    blocks: Vec<Block>,
+}
+
+/// Whether any block holds non-whitespace text.
+///
+/// Used to drop empty extras (e.g. a comment whose body is only separator
+/// paragraphs). Marker runs count as empty (they carry no text of their own).
+fn blocks_have_text(blocks: &[Block]) -> bool {
+    blocks.iter().any(|block| match block {
+        Block::Paragraph { runs, .. } => runs.iter().any(|r| !r.text.trim().is_empty()),
+        Block::Table { rows } => rows.iter().flatten().any(|cell| blocks_have_text(cell)),
+        Block::Image { .. } => false,
+    })
+}
+
+/// Copy the display indexes the body walk assigned (`index.assigned`) onto
+/// the parsed definitions; notes never referenced in the body keep 0.
+fn assign_display_indexes(notes: Vec<Note>, index: &NoteIndex) -> Vec<Note> {
+    notes
+        .into_iter()
+        .map(|mut note| {
+            note.display_index = index.assigned.get(&note.id).copied().unwrap_or(0);
+            note
+        })
+        .collect()
+}
+
 /// Extract plain text from a .docx file.
 pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let (blocks, _) = parse_docx(data, false)?;
+    let (blocks, _, _, _, _) = parse_docx(data, false)?;
     Ok(render_plain(&blocks))
 }
 
@@ -162,7 +214,9 @@ pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
 /// reference-style base64 images: `![][imageN]` inline with definitions
 /// appended at the end of the document.
 pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
-    let (blocks, image_defs) = parse_docx(data, images)?;
+    // Comments/footnotes/endnotes are parsed here but rendered into trailers
+    // by a follow-up task; until then the output is body-only.
+    let (blocks, image_defs, _, _, _) = parse_docx(data, images)?;
     let mut md = render_markdown(&blocks);
     if !image_defs.is_empty() {
         for def in &image_defs {
@@ -173,13 +227,31 @@ pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Resul
     Ok(md)
 }
 
-/// Parse the docx XML into structured blocks and image reference definitions.
+/// What [`parse_docx`] produces: body blocks, image reference definitions,
+/// and the extras from the optional comment/footnote/endnote parts.
+type DocxOutput = (Vec<Block>, Vec<String>, Vec<Comment>, Vec<Note>, Vec<Note>);
+
+/// Read an optional ZIP part's full text; `None` when the part is absent.
+///
+/// The comment/footnote/endnote parts are optional in a docx: a missing part
+/// is not an error, it just yields no extras.
+fn read_optional_part(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
+    let mut xml = String::new();
+    archive.by_name(name).ok()?.read_to_string(&mut xml).ok()?;
+    Some(xml)
+}
+
+/// Parse the docx XML into structured blocks, image reference definitions,
+/// and the document extras (comments, footnotes, endnotes).
 ///
 /// When `images` is true, image relationships are loaded and `<w:drawing>`
 /// elements are extracted as `Block::Image` entries with inline references.
-/// The second element of the tuple contains the reference definitions to
-/// append at the end of the document.
-fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<(Vec<Block>, Vec<String>)> {
+/// The returned [`DocxOutput`] tuple is `(blocks, image_defs, comments,
+/// footnotes, endnotes)`: `image_defs` holds the reference definitions to
+/// append at the end of the document; `comments`/`footnotes`/`endnotes`
+/// hold the extras parsed from the optional parts (empty when a part is
+/// missing).
+fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<DocxOutput> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
 
@@ -193,6 +265,18 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<(Vec<Block>, Ve
         xml_util::Rels::new()
     };
 
+    // Optional extras parts: missing parts parse to empty vectors, keeping
+    // docs without comments/footnotes/endnotes identical to before.
+    let comments = read_optional_part(&mut archive, "word/comments.xml")
+        .map(|xml| parse_comments_xml(&xml))
+        .unwrap_or_default();
+    let footnotes = read_optional_part(&mut archive, "word/footnotes.xml")
+        .map(|xml| parse_footnotes_xml(&xml))
+        .unwrap_or_default();
+    let endnotes = read_optional_part(&mut archive, "word/endnotes.xml")
+        .map(|xml| parse_endnotes_xml(&xml))
+        .unwrap_or_default();
+
     let mut xml = String::new();
     archive
         .by_name("word/document.xml")?
@@ -200,22 +284,30 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<(Vec<Block>, Ve
 
     let mut reader = Reader::from_str(&xml);
     let mut blocks = Vec::new();
-    let mut in_body = false;
 
-    // Footnote/endnote display indexes are assigned on first body reference.
-    // Definitions are seeded from the note parts (Task 6); until then the
-    // indexes start empty, so body refs emit no markers yet.
-    let mut footnotes = NoteIndex::new();
-    let mut endnotes = NoteIndex::new();
+    // Seed the note indexes with the parsed definitions so body references
+    // emit markers exactly for defined ids (dangling refs stay silent).
+    let mut footnotes_idx = NoteIndex::new();
+    let mut endnotes_idx = NoteIndex::new();
+    for note in &footnotes {
+        footnotes_idx.add_defined(&note.id);
+    }
+    for note in &endnotes {
+        endnotes_idx.add_defined(&note.id);
+    }
     parse_body(
         &mut reader,
         &mut blocks,
-        &mut in_body,
         &rels,
         &image_rels,
-        &mut footnotes,
-        &mut endnotes,
+        &mut footnotes_idx,
+        &mut endnotes_idx,
     );
+
+    // Record the display indexes the body walk assigned to each definition;
+    // notes never referenced keep 0.
+    let footnotes = assign_display_indexes(footnotes, &footnotes_idx);
+    let endnotes = assign_display_indexes(endnotes, &endnotes_idx);
 
     // If images enabled, resolve image blocks by reading from the archive
     let image_defs = if images {
@@ -226,44 +318,201 @@ fn parse_docx(data: &[u8], images: bool) -> crate::error::Result<(Vec<Block>, Ve
         Vec::new()
     };
 
-    Ok((blocks, image_defs))
+    Ok((blocks, image_defs, comments, footnotes, endnotes))
 }
 
 /// Walk the XML and collect blocks from the document body.
+///
+/// The block children of `<w:body>` are collected via the shared
+/// [`parse_block_children`] walker; anything outside the body is ignored.
 fn parse_body(
     reader: &mut Reader<&[u8]>,
     blocks: &mut Vec<Block>,
-    in_body: &mut bool,
     rels: &Rels,
     image_rels: &Rels,
     footnotes: &mut NoteIndex,
     endnotes: &mut NoteIndex,
 ) {
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let name = e.local_name();
-                match name.as_ref() {
-                    b"body" => *in_body = true,
-                    b"p" if *in_body => {
-                        let mut para_blocks =
-                            parse_paragraph(reader, rels, image_rels, footnotes, endnotes);
-                        blocks.append(&mut para_blocks);
-                    }
-                    b"tbl" if *in_body => {
-                        let table = parse_table(reader, rels, footnotes, endnotes);
-                        blocks.push(table);
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"body" => {
-                *in_body = false;
+        match &reader.read_event() {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"body" => {
+                blocks.extend(parse_block_children(
+                    reader, b"body", rels, image_rels, footnotes, endnotes,
+                ));
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
     }
+}
+
+/// Parse the block-level children (`w:p`, `w:tbl`) of the element opened at
+/// the reader's current position, stopping at the matching end tag (`stop`)
+/// or at EOF.
+///
+/// Shared by the document-body walker ([`parse_body`]) and the extra-part
+/// parsers (comments, footnotes, endnotes), so definitions reuse the body's
+/// paragraph/table machinery. Extra parts pass empty `Rels` and empty note
+/// indexes: hyperlinks are not resolved inside definitions and nested note
+/// references produce no markers there.
+fn parse_block_children(
+    reader: &mut Reader<&[u8]>,
+    stop: &[u8],
+    rels: &Rels,
+    image_rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    loop {
+        match &reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"p" => {
+                    let mut para_blocks =
+                        parse_paragraph(reader, rels, image_rels, footnotes, endnotes);
+                    blocks.append(&mut para_blocks);
+                }
+                b"tbl" => {
+                    blocks.push(parse_table(reader, rels, footnotes, endnotes));
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if e.local_name().as_ref() == stop => break,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// Consume the subtree of the element whose `Start` was just read, without
+/// interpreting its contents.
+fn skip_element(reader: &mut Reader<&[u8]>, name: &[u8]) {
+    loop {
+        match &reader.read_event() {
+            Ok(Event::End(e)) if e.local_name().as_ref() == name => break,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
+/// Shared parse for the footnote/endnote parts, which share a shape
+/// (`<w:footnotes>`/`<w:endnotes>` root with `w:footnote`/`w:endnote` note
+/// elements).
+///
+/// Rules:
+/// - Separator (`w:id` `-1`) and continuation (`w:id` `0`) notes are skipped.
+/// - Duplicate ids keep the first occurrence.
+/// - Bodies parse with the shared block walker; ref glyphs
+///   (`w:footnoteRef`/`w:endnoteRef`) are skipped by `parse_run` so they
+///   never leak text, and nested note references produce no markers (the
+///   indexes passed here are empty by design).
+fn parse_notes_xml(xml: &str, note_tag: &[u8]) -> Vec<Note> {
+    let mut reader = Reader::from_str(xml);
+    let mut notes = Vec::new();
+    let mut seen = HashSet::new();
+    // Empty rels and empty note indexes: no hyperlink resolution and no
+    // nested note markers inside definitions.
+    let empty_rels = Rels::new();
+    let mut footnotes = NoteIndex::new();
+    let mut endnotes = NoteIndex::new();
+
+    loop {
+        match &reader.read_event() {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == note_tag => {
+                let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) else {
+                    // Missing id: consume the element without interpreting it.
+                    skip_element(&mut reader, note_tag);
+                    continue;
+                };
+                if id == "-1" || id == "0" || !seen.insert(id.clone()) {
+                    // Separator (-1), continuation (0), or duplicate id
+                    // (first wins): skip.
+                    skip_element(&mut reader, note_tag);
+                    continue;
+                }
+                let blocks = parse_block_children(
+                    &mut reader,
+                    note_tag,
+                    &empty_rels,
+                    &empty_rels,
+                    &mut footnotes,
+                    &mut endnotes,
+                );
+                notes.push(Note {
+                    id,
+                    display_index: 0,
+                    blocks,
+                });
+                // parse_block_children consumed through End(note_tag).
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    notes
+}
+
+/// Parse `word/footnotes.xml` into note definitions in document order.
+fn parse_footnotes_xml(xml: &str) -> Vec<Note> {
+    parse_notes_xml(xml, b"footnote")
+}
+
+/// Parse `word/endnotes.xml` into note definitions (same shape and rules as
+/// [`parse_footnotes_xml`]).
+fn parse_endnotes_xml(xml: &str) -> Vec<Note> {
+    parse_notes_xml(xml, b"endnote")
+}
+
+/// Parse `word/comments.xml` into comments in document order.
+///
+/// Comments keep their `w:author` (missing/empty → "Anonymous"); comments
+/// whose body has no non-whitespace text are dropped; duplicate ids keep the
+/// first occurrence. The `w:annotationRef` glyph inside comment bodies is
+/// skipped by `parse_run`.
+fn parse_comments_xml(xml: &str) -> Vec<Comment> {
+    let mut reader = Reader::from_str(xml);
+    let mut comments = Vec::new();
+    let mut seen = HashSet::new();
+    let empty_rels = Rels::new();
+    let mut footnotes = NoteIndex::new();
+    let mut endnotes = NoteIndex::new();
+
+    loop {
+        match &reader.read_event() {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"comment" => {
+                let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) else {
+                    // Comment without an id: nothing to key it by, drop it.
+                    skip_element(&mut reader, b"comment");
+                    continue;
+                };
+                let mut author = get_attr(e, b"w:author")
+                    .or_else(|| get_attr(e, b"author"))
+                    .unwrap_or_default();
+                if author.trim().is_empty() {
+                    author = "Anonymous".to_string();
+                }
+                let blocks = parse_block_children(
+                    &mut reader,
+                    b"comment",
+                    &empty_rels,
+                    &empty_rels,
+                    &mut footnotes,
+                    &mut endnotes,
+                );
+                if !seen.insert(id.clone()) {
+                    continue; // duplicate id: first wins
+                }
+                if blocks_have_text(&blocks) {
+                    comments.push(Comment { id, author, blocks });
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    comments
 }
 
 /// Parse a `<w:p>` element into blocks.
@@ -437,7 +686,9 @@ fn push_note_marker(
 /// (`w:footnoteReference`/`w:endnoteReference`), or several of these. Note
 /// references become marker runs carrying their display index. Text runs are
 /// emitted in document order, split around marker runs so that text before a
-/// reference stays before its marker. When `image_rels` is non-empty and a
+/// reference stays before its marker. Ref glyphs (`w:footnoteRef`,
+/// `w:endnoteRef`, `w:annotationRef` — the no-id markers in note/comment
+/// bodies) are skipped entirely. When `image_rels` is non-empty and a
 /// `<w:drawing>` is found inside the run, the image reference is extracted
 /// and returned as a `Block::Image`.
 fn parse_run(
@@ -503,6 +754,16 @@ fn parse_run(
                             }
                         }
                     }
+                    // Ref glyphs (`w:footnoteRef`, `w:endnoteRef`,
+                    // `w:annotationRef`): empty elements without an id that
+                    // mark a reference site inside the note/comment bodies.
+                    // Skipped (also in the Empty arm below) so they never
+                    // leak text or produce marker runs. The Empty form needs
+                    // no consumption; this defensive Start form swallows the
+                    // whole subtree if a non-empty one ever appears.
+                    b"footnoteRef" | b"endnoteRef" | b"annotationRef" => {
+                        skip_element(reader, name.as_ref());
+                    }
                     _ => {}
                 }
             }
@@ -524,6 +785,11 @@ fn parse_run(
                     bold = true;
                 } else if name.as_ref() == b"i" || name.as_ref() == b"iCs" {
                     italic = true;
+                } else if name.as_ref() == b"footnoteRef"
+                    || name.as_ref() == b"endnoteRef"
+                    || name.as_ref() == b"annotationRef"
+                {
+                    // Ref glyph (empty form): skipped; never text or marker.
                 }
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == b"r" => {
@@ -1689,5 +1955,210 @@ mod tests {
         let mut out = String::new();
         render_block_markdown(&table, &mut out);
         assert!(out.contains("A\\|B"));
+    }
+
+    // ── Extra parts: comments / footnotes / endnotes ────────────
+
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    fn zip_entry(z: &mut ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &str) {
+        z.start_file(name, SimpleFileOptions::default()).unwrap();
+        z.write_all(body.as_bytes()).unwrap();
+    }
+
+    /// Build a minimal docx ZIP from the given parts plus a dummy
+    /// `[Content_Types].xml`. `word/document.xml` must be present; the
+    /// optional extra parts (footnotes/endnotes/comments) may be omitted.
+    fn minimal_docx(parts: &[(&str, &str)]) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut z = ZipWriter::new(buf);
+        zip_entry(
+            &mut z,
+            "[Content_Types].xml",
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#,
+        );
+        for (name, body) in parts {
+            zip_entry(&mut z, name, body);
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    /// Wrap `body_children` in a minimal `word/document.xml`.
+    fn document_xml(body_children: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:body>{body_children}</w:body>
+</w:document>"#
+        )
+    }
+
+    const FOOTNOTES_XML: &str = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="-1"><w:p><w:r><w:t>separator</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="0"><w:p><w:r><w:t>continuation</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/><w:t>Source A</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="2"><w:p/></w:footnote>
+  <w:footnote w:id="1"><w:p><w:r><w:t>duplicate</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+
+    const ENDNOTES_XML: &str = r#"<?xml version="1.0"?>
+<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:endnote w:id="-1"><w:p><w:r><w:t>separator</w:t></w:r></w:p></w:endnote>
+  <w:endnote w:id="1"><w:p><w:r><w:endnoteRef/><w:t>Endnote B</w:t></w:r></w:p></w:endnote>
+</w:endnotes>"#;
+
+    const COMMENTS_XML: &str = r#"<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Alice">
+    <w:p><w:r><w:t>First para</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Second para</w:t></w:r></w:p>
+  </w:comment>
+  <w:comment w:id="1" w:author="Alice"><w:p><w:r><w:t>Last word</w:t></w:r></w:p></w:comment>
+  <w:comment w:id="2"><w:p><w:r><w:t>No author</w:t></w:r></w:p></w:comment>
+  <w:comment w:id="3" w:author="Bob"><w:p><w:r><w:t>   </w:t></w:r></w:p></w:comment>
+</w:comments>"#;
+
+    #[test]
+    fn parse_footnotes_xml_skips_separators_and_takes_blocks() {
+        let notes = parse_footnotes_xml(FOOTNOTES_XML);
+        let ids: Vec<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+
+        // First occurrence of id 1 wins; its body is parsed; the glyph
+        // contributes nothing; separators/continuations/duplicates leak none.
+        assert_eq!(render_plain(&notes[0].blocks).trim_end(), "Source A");
+        // id 2 is an empty paragraph: kept as a definition (the trailer in a
+        // later task decides what to display), not filtered here.
+        assert_eq!(render_plain(&notes[1].blocks).trim_end(), "");
+    }
+
+    #[test]
+    fn parse_endnotes_xml_skips_separators_and_takes_blocks() {
+        let notes = parse_endnotes_xml(ENDNOTES_XML);
+        let ids: Vec<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["1"]);
+        assert_eq!(render_plain(&notes[0].blocks).trim_end(), "Endnote B");
+    }
+
+    #[test]
+    fn parse_comments_xml_groups_and_defaults_author() {
+        let comments = parse_comments_xml(COMMENTS_XML);
+        let ids: Vec<&str> = comments.iter().map(|c| c.id.as_str()).collect();
+        // Whitespace-only comment (id 3) is dropped; order preserved.
+        assert_eq!(ids, ["0", "1", "2"]);
+        assert_eq!(comments[0].author, "Alice");
+        assert_eq!(comments[0].blocks.len(), 2); // multi-paragraph body
+        assert_eq!(comments[1].author, "Alice");
+        assert_eq!(comments[2].author, "Anonymous"); // missing author
+        assert_eq!(render_plain(&comments[2].blocks).trim_end(), "No author");
+    }
+
+    #[test]
+    fn parse_comments_xml_skips_annotation_glyph() {
+        let xml = r#"<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="A"><w:p><w:r><w:annotationRef/><w:t>clean text</w:t></w:r></w:p></w:comment>
+</w:comments>"#;
+        let comments = parse_comments_xml(xml);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(render_plain(&comments[0].blocks).trim_end(), "clean text");
+    }
+
+    #[test]
+    fn parse_footnotes_xml_skips_ref_glyph() {
+        let xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/><w:t>Note text</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let notes = parse_footnotes_xml(xml);
+        assert_eq!(notes.len(), 1);
+        // Only "Note text": the glyph emits nothing (no stray text/marker).
+        assert_eq!(render_plain(&notes[0].blocks).trim_end(), "Note text");
+    }
+
+    #[test]
+    fn parse_docx_seeds_footnote_definitions_and_assigns_index() {
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Body</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:t> tail</w:t></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", FOOTNOTES_XML),
+        ]);
+        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false).unwrap();
+
+        // Markers now appear in production output for defined ids.
+        let md = render_markdown(&blocks);
+        assert!(md.contains("[^1]"), "missing marker: {md}");
+        assert!(!md.contains("## Footnotes"), "trailer rendering is Task 7: {md}");
+
+        // Definitions kept in part order; the referenced note got the display
+        // index assigned by the body walk, the unreferenced one stays 0.
+        assert_eq!(footnotes.len(), 2);
+        assert_eq!(footnotes[0].id, "1");
+        assert_eq!(footnotes[0].display_index, 1);
+        assert_eq!(footnotes[1].id, "2");
+        assert_eq!(footnotes[1].display_index, 0);
+        assert!(endnotes.is_empty());
+    }
+
+    #[test]
+    fn parse_docx_seeds_endnote_definitions() {
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>See</w:t><w:endnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/endnotes.xml", ENDNOTES_XML),
+        ]);
+        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false).unwrap();
+
+        let md = render_markdown(&blocks);
+        assert!(md.contains("[^e1]"), "missing endnote marker: {md}");
+        assert!(footnotes.is_empty());
+        assert_eq!(endnotes.len(), 1);
+        assert_eq!(endnotes[0].id, "1");
+        assert_eq!(endnotes[0].display_index, 1);
+    }
+
+    #[test]
+    fn parse_docx_comments_populated() {
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(r"<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
+            ),
+            ("word/comments.xml", COMMENTS_XML),
+        ]);
+        let (blocks, _, comments, footnotes, endnotes) = parse_docx(&data, false).unwrap();
+
+        // Body unaffected; comments carry author + multi-paragraph blocks
+        // (rendering into a trailer is Task 7).
+        assert_eq!(render_markdown(&blocks).trim_end(), "Body only");
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0].author, "Alice");
+        assert_eq!(comments[0].blocks.len(), 2);
+        assert!(footnotes.is_empty());
+        assert!(endnotes.is_empty());
+    }
+
+    #[test]
+    fn extract_no_footnote_part_no_markers() {
+        let data = minimal_docx(&[(
+            "word/document.xml",
+            &document_xml(r#"<w:p><w:r><w:t>Hi</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#),
+        )]);
+        let md = extract_markdown(&data, false).unwrap();
+        assert_eq!(md, "Hi\n\n");
+        let plain = extract_plain(&data).unwrap();
+        assert_eq!(plain, "Hi\n");
     }
 }
