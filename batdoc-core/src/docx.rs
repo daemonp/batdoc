@@ -153,11 +153,14 @@ impl Default for NoteIndex {
 
 /// A document comment from `word/comments.xml`.
 ///
-/// Fields are populated by the parser and consumed by the trailer rendering
-/// in the next extraction-fidelity task (and by tests); until then they are
-/// written but not read in lib builds.
-#[allow(dead_code)]
+/// `author` and `blocks` are rendered into a `## Comments` /
+/// `--- Comments ---` trailer, grouped into runs of consecutive comments
+/// sharing an author. Empty-author comments map to `Anonymous` at parse
+/// time. The `id` is parse-side bookkeeping (duplicate ids keep the first
+/// occurrence) and is not rendered.
 struct Comment {
+    /// Dedup key; kept for tests and parse order, not shown in the trailers.
+    #[allow(dead_code)]
     id: String,
     author: String,
     blocks: Vec<Block>, // comments can be multi-paragraph
@@ -166,12 +169,9 @@ struct Comment {
 /// A footnote or endnote definition from the note parts.
 ///
 /// `display_index` is 0 until the body walk assigns the first reference to
-/// this note's `w:id`; notes never referenced in the body keep 0 (the
-/// trailer renders only referenced notes).
-///
-/// The `blocks` field is populated by the parser and consumed by the trailer
-/// rendering in the next extraction-fidelity task (and by tests).
-#[allow(dead_code)]
+/// this note's `w:id`; notes never referenced in the body keep 0 and are
+/// omitted from the trailers, which render only referenced notes in
+/// ascending `display_index` order.
 struct Note {
     id: String,
     display_index: usize,
@@ -204,20 +204,23 @@ fn assign_display_indexes(notes: Vec<Note>, index: &NoteIndex) -> Vec<Note> {
 
 /// Extract plain text from a .docx file.
 pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let (blocks, _, _, _, _) = parse_docx(data, false)?;
-    Ok(render_plain(&blocks))
+    let (blocks, _, comments, footnotes, endnotes) = parse_docx(data, false)?;
+    let mut out = render_plain(&blocks);
+    append_extras_plain(&mut out, &comments, &footnotes, &endnotes);
+    Ok(out)
 }
 
 /// Extract markdown-formatted text from a .docx file.
 ///
 /// When `images` is true, embedded images are extracted and included as
 /// reference-style base64 images: `![][imageN]` inline with definitions
-/// appended at the end of the document.
+/// appended at the very end. Assembly order is body (with its inline
+/// markers), then the comments/footnotes/endnotes trailers, then the image
+/// definitions.
 pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
-    // Comments/footnotes/endnotes are parsed here but rendered into trailers
-    // by a follow-up task; until then the output is body-only.
-    let (blocks, image_defs, _, _, _) = parse_docx(data, images)?;
+    let (blocks, image_defs, comments, footnotes, endnotes) = parse_docx(data, images)?;
     let mut md = render_markdown(&blocks);
+    append_extras_markdown(&mut md, &comments, &footnotes, &endnotes);
     if !image_defs.is_empty() {
         for def in &image_defs {
             md.push_str(def);
@@ -1328,6 +1331,237 @@ impl markup::InlineRun for Run {
     }
 }
 
+// ── Extras trailers (comments / footnotes / endnotes) ───────────
+
+/// Ensure the output ends with a blank line (two newlines) so a following
+/// trailer section or group heading is separated from what precedes it.
+/// No-op on empty output or when a blank line is already present.
+fn ensure_trailer_blank_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        if out.ends_with('\n') {
+            out.push('\n');
+        } else {
+            out.push_str("\n\n");
+        }
+    }
+}
+
+/// Append the extras trailers to a rendered markdown body in the fixed order
+/// Comments, Footnotes, Endnotes. Empty sections are omitted entirely; a
+/// single blank line separates the body from the first trailer.
+fn append_extras_markdown(
+    out: &mut String,
+    comments: &[Comment],
+    footnotes: &[Note],
+    endnotes: &[Note],
+) {
+    append_comments_markdown(out, comments);
+    append_footnotes_markdown(out, footnotes);
+    append_endnotes_markdown(out, endnotes);
+}
+
+/// Append a `## Comments` section: consecutive same-author comments share one
+/// `### Author` heading; a non-consecutive repeat of an author gets the
+/// heading again, preserving comment order.
+fn append_comments_markdown(out: &mut String, comments: &[Comment]) {
+    if comments.is_empty() {
+        return;
+    }
+    ensure_trailer_blank_line(out);
+    out.push_str("## Comments\n\n");
+    let mut i = 0;
+    while i < comments.len() {
+        let author = comments[i].author.as_str();
+        out.push_str("### ");
+        out.push_str(author);
+        out.push_str("\n\n");
+        let mut j = i;
+        while j < comments.len() && comments[j].author == author {
+            for block in &comments[j].blocks {
+                render_block_markdown(block, out);
+            }
+            // Blank line between comments; also gives the next heading its
+            // separation when the last block is a list item ending in '\n'.
+            ensure_trailer_blank_line(out);
+            j += 1;
+        }
+        i = j;
+    }
+}
+
+/// The referenced notes of one kind, in ascending display-index order.
+fn referenced_notes(notes: &[Note]) -> Vec<&Note> {
+    let mut referenced: Vec<&Note> = notes.iter().filter(|n| n.display_index > 0).collect();
+    referenced.sort_by_key(|n| n.display_index);
+    referenced
+}
+
+/// Append a `## Footnotes` section with one definition per referenced note.
+fn append_footnotes_markdown(out: &mut String, footnotes: &[Note]) {
+    let notes = referenced_notes(footnotes);
+    if notes.is_empty() {
+        return;
+    }
+    ensure_trailer_blank_line(out);
+    out.push_str("## Footnotes\n\n");
+    for note in notes {
+        render_note_definition_markdown(out, "", note);
+    }
+}
+
+/// Append a `## Endnotes` section with one definition per referenced note.
+fn append_endnotes_markdown(out: &mut String, endnotes: &[Note]) {
+    let notes = referenced_notes(endnotes);
+    if notes.is_empty() {
+        return;
+    }
+    ensure_trailer_blank_line(out);
+    out.push_str("## Endnotes\n\n");
+    for note in notes {
+        render_note_definition_markdown(out, "e", note);
+    }
+}
+
+/// Render one note's markdown definition: `[^{prefix}{n}]: text` for a
+/// single-paragraph note (`prefix` is `""` for footnotes and `"e"` for
+/// endnotes), or a definition-list form whose continuation lines are
+/// indented 4 spaces (`CommonMark`) for multi-paragraph notes. Blocks whose
+/// markdown renders empty are skipped; a note with nothing to show emits
+/// nothing.
+fn render_note_definition_markdown(out: &mut String, prefix: &str, note: &Note) {
+    let mut body = String::new();
+    let mut rendered = 0usize;
+    for block in &note.blocks {
+        let mut piece = String::new();
+        render_block_markdown(block, &mut piece);
+        if !piece.trim_end().is_empty() {
+            rendered += 1;
+            body.push_str(&piece);
+        }
+    }
+    if rendered == 0 {
+        return;
+    }
+    out.push_str("[^");
+    out.push_str(prefix);
+    let _ = write!(out, "{}", note.display_index);
+    out.push(']');
+    if rendered == 1 {
+        // Single paragraph: inline label on the definition line.
+        out.push_str(": ");
+        out.push_str(body.trim_end());
+        out.push_str("\n\n");
+        return;
+    }
+    // Multi-block: indent every line of the body 4 spaces, leaving blank
+    // lines between blocks empty.
+    out.push_str(":\n");
+    for line in body.trim_end().lines() {
+        if !line.is_empty() {
+            out.push_str("    ");
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
+/// Append the extras trailers to a rendered plain-text body.
+fn append_extras_plain(
+    out: &mut String,
+    comments: &[Comment],
+    footnotes: &[Note],
+    endnotes: &[Note],
+) {
+    append_comments_plain(out, comments);
+    append_footnotes_plain(out, footnotes);
+    append_endnotes_plain(out, endnotes);
+}
+
+/// Append a `--- Comments ---` section: per group of consecutive same-author
+/// comments, a `[Author]` line followed by the comment paragraph lines, with
+/// a blank line between groups.
+fn append_comments_plain(out: &mut String, comments: &[Comment]) {
+    if comments.is_empty() {
+        return;
+    }
+    ensure_trailer_blank_line(out);
+    out.push_str("--- Comments ---\n");
+    let mut i = 0;
+    while i < comments.len() {
+        let author = comments[i].author.as_str();
+        let _ = writeln!(out, "[{author}]");
+        // Shared `first` flag joins adjacent paragraphs/comments the way the
+        // plain body renderer does (single newline between lines).
+        let mut first = true;
+        let mut j = i;
+        while j < comments.len() && comments[j].author == author {
+            for block in &comments[j].blocks {
+                render_block_plain(block, out, &mut first);
+            }
+            j += 1;
+        }
+        out.push('\n'); // blank line between groups
+        i = j;
+    }
+}
+
+/// Append a `--- Footnotes ---` section with one entry per referenced note.
+fn append_footnotes_plain(out: &mut String, footnotes: &[Note]) {
+    let notes = referenced_notes(footnotes);
+    if notes.is_empty() {
+        return;
+    }
+    ensure_trailer_blank_line(out);
+    out.push_str("--- Footnotes ---\n");
+    for note in notes {
+        render_note_plain(out, "", note);
+    }
+}
+
+/// Append a `--- Endnotes ---` section with one entry per referenced note.
+fn append_endnotes_plain(out: &mut String, endnotes: &[Note]) {
+    let notes = referenced_notes(endnotes);
+    if notes.is_empty() {
+        return;
+    }
+    ensure_trailer_blank_line(out);
+    out.push_str("--- Endnotes ---\n");
+    for note in notes {
+        render_note_plain(out, "e", note);
+    }
+}
+
+/// Render one note's plain-text entry: the first line carries the
+/// `[{prefix}{n}]` bracket, continuation paragraphs follow on their own
+/// lines without a repeated bracket. A note whose blocks all render empty
+/// emits nothing. A blank line separates consecutive entries.
+fn render_note_plain(out: &mut String, prefix: &str, note: &Note) {
+    let mut body = String::new();
+    let mut first = true;
+    for block in &note.blocks {
+        render_block_plain(block, &mut body, &mut first);
+    }
+    let body = body.trim_end();
+    if body.is_empty() {
+        return;
+    }
+    let mut lines = body.lines();
+    if let Some(head) = lines.next() {
+        out.push('[');
+        out.push_str(prefix);
+        let _ = write!(out, "{}", note.display_index);
+        out.push_str("] ");
+        out.push_str(head);
+        out.push('\n');
+    }
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1998,18 +2232,45 @@ mod tests {
         z.write_all(body.as_bytes()).unwrap();
     }
 
+    /// Dummy package content-types part; no relationships are declared, so
+    /// only ZIP presence matters to `parse_docx`.
+    const CONTENT_TYPES: &str = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#;
+
     /// Build a minimal docx ZIP from the given parts plus a dummy
     /// `[Content_Types].xml`. `word/document.xml` must be present; the
     /// optional extra parts (footnotes/endnotes/comments) may be omitted.
     fn minimal_docx(parts: &[(&str, &str)]) -> Vec<u8> {
         let buf = Cursor::new(Vec::new());
         let mut z = ZipWriter::new(buf);
-        zip_entry(
-            &mut z,
-            "[Content_Types].xml",
-            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#,
-        );
+        zip_entry(&mut z, "[Content_Types].xml", CONTENT_TYPES);
         for (name, body) in parts {
+            zip_entry(&mut z, name, body);
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    /// Image relationship mapping `rId5` → `word/media/image1.png`, plus the
+    /// 8-byte PNG signature (base64 `iVBORw0KGgo=`), which `detect_image_mime`
+    /// recognizes as `image/png`.
+    const IMAGE_RELS_XML: &str = r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>"#;
+    const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// Build a docx whose body embeds `media/image1.png` (via `rId5`), plus
+    /// any extra parts. The drawing reference is written as
+    /// `<w:drawing><a:blip r:embed="rId5"/></w:drawing>` inside a run.
+    fn image_docx(body_children: &str, extras: &[(&str, &str)]) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut z = ZipWriter::new(buf);
+        zip_entry(&mut z, "[Content_Types].xml", CONTENT_TYPES);
+        zip_entry(&mut z, "word/document.xml", &document_xml(body_children));
+        zip_entry(&mut z, "word/_rels/document.xml.rels", IMAGE_RELS_XML);
+        z.start_file("word/media/image1.png", SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(&PNG_SIGNATURE).unwrap();
+        for (name, body) in extras {
             zip_entry(&mut z, name, body);
         }
         z.finish().unwrap().into_inner()
@@ -2126,7 +2387,12 @@ mod tests {
         // Markers now appear in production output for defined ids.
         let md = render_markdown(&blocks);
         assert!(md.contains("[^1]"), "missing marker: {md}");
-        assert!(!md.contains("## Footnotes"), "trailer rendering is Task 7: {md}");
+        // Trailer-included (Task 7): the extract-level output appends the
+        // referenced note to a `## Footnotes` section with its text as a
+        // definition; unreferenced notes stay out.
+        let full = extract_markdown(&data, false).unwrap();
+        assert!(full.contains("## Footnotes"), "missing footnotes trailer: {full}");
+        assert!(full.contains("[^1]: Source A"), "missing footnote definition: {full}");
 
         // Definitions kept in part order; the referenced note got the display
         // index assigned by the body walk, the unreferenced one stays 0.
@@ -2190,6 +2456,315 @@ mod tests {
         assert_eq!(md, "Hi\n\n");
         let plain = extract_plain(&data).unwrap();
         assert_eq!(plain, "Hi\n");
+    }
+
+    // ── extract_* trailers: comments / footnotes / endnotes ──────
+
+    #[test]
+    fn extract_markdown_footnotes_and_endnotes_trailers() {
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Body</w:t><w:footnoteReference w:id="1"/><w:t> and </w:t><w:endnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", FOOTNOTES_XML),
+            ("word/endnotes.xml", ENDNOTES_XML),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        // Body carries the inline markers for the referenced notes.
+        assert!(md.contains("[^1]"), "footnote marker missing: {md}");
+        assert!(md.contains("[^e1]"), "endnote marker missing: {md}");
+        // Trailers follow the body in the fixed order footnotes → endnotes;
+        // no comments part → no comments section.
+        let body_at = md.find("Body").expect("body text");
+        let footnotes_at = md.find("## Footnotes").expect("footnotes section");
+        let endnotes_at = md.find("## Endnotes").expect("endnotes section");
+        assert!(body_at < footnotes_at, "body must precede trailers: {md}");
+        assert!(footnotes_at < endnotes_at, "footnotes must precede endnotes: {md}");
+        // Definitions carry the note text.
+        assert!(md.contains("[^1]: Source A"), "footnote definition: {md}");
+        assert!(md.contains("[^e1]: Endnote B"), "endnote definition: {md}");
+        assert!(!md.contains("## Comments"), "no comments expected: {md}");
+    }
+
+    #[test]
+    fn extract_markdown_comments_grouped_by_author() {
+        let comments_xml = r#"<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Alice"><w:p><w:r><w:t>First thought</w:t></w:r></w:p><w:p><w:r><w:t>Second thought</w:t></w:r></w:p></w:comment>
+  <w:comment w:id="1" w:author="Alice"><w:p><w:r><w:t>Third thought</w:t></w:r></w:p></w:comment>
+  <w:comment w:id="2" w:author="Bob"><w:p><w:r><w:t>Bob's note</w:t></w:r></w:p></w:comment>
+  <w:comment w:id="3" w:author="Alice"><w:p><w:r><w:t>Return thought</w:t></w:r></w:p></w:comment>
+</w:comments>"#;
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml("<w:p><w:r><w:t>Body</w:t></w:r></w:p>"),
+            ),
+            ("word/comments.xml", comments_xml),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        // Consecutive Alice comments share one heading; the later Alice
+        // comment is NOT consecutive, so the heading repeats. Order of the
+        // headings matches the comment order.
+        assert_eq!(md.matches("### Alice").count(), 2, "expected two Alice groups: {md}");
+        assert_eq!(md.matches("### Bob").count(), 1, "expected one Bob group: {md}");
+        let first_alice = md.find("### Alice").expect("first Alice heading");
+        let bob = md.find("### Bob").expect("Bob heading");
+        let second_alice = md.rfind("### Alice").expect("second Alice heading");
+        assert!(first_alice < bob && bob < second_alice, "heading order: {md}");
+        for text in [
+            "First thought",
+            "Second thought",
+            "Third thought",
+            "Bob's note",
+            "Return thought",
+        ] {
+            assert!(md.contains(text), "missing comment text {text:?}: {md}");
+        }
+    }
+
+    #[test]
+    fn extract_markdown_multi_block_footnote_indented() {
+        let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/><w:t>First paragraph.</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph.</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Cited</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", footnotes_xml),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        // Definition-list form: `[^1]:` on the label line, then every line
+        // of the body indented 4 spaces (CommonMark continuation).
+        assert!(
+            md.contains("[^1]:\n    First paragraph."),
+            "indented definition: {md}"
+        );
+        assert!(
+            md.contains("    Second paragraph."),
+            "indented continuation: {md}"
+        );
+        // The inline single-line form is for single-paragraph notes only.
+        assert!(
+            !md.contains("[^1]: First paragraph."),
+            "inline form used for multi-block note: {md}"
+        );
+    }
+
+    #[test]
+    fn extract_plain_footnotes_multi_paragraph_continuation() {
+        let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/><w:t>First paragraph.</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph.</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Cited</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", footnotes_xml),
+        ]);
+        let plain = extract_plain(&data).unwrap();
+
+        assert!(
+            plain.contains("\n\n--- Footnotes ---\n"),
+            "blank line before trailer: {plain}"
+        );
+        // First line carries the [1] bracket; the second paragraph continues
+        // on its own line WITHOUT a repeated bracket. The plain renderer
+        // separates consecutive paragraph blocks with a blank line (its
+        // regular between-paragraph convention), so both are expected here.
+        assert!(
+            plain.contains("[1] First paragraph.\n\nSecond paragraph."),
+            "continuation without bracket: {plain}"
+        );
+        assert!(
+            !plain.contains("[1] Second paragraph."),
+            "repeated bracket on continuation: {plain}"
+        );
+    }
+
+    #[test]
+    fn extract_markdown_unreferenced_footnote_omitted() {
+        let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/><w:t>Referenced note</w:t></w:r></w:p></w:footnote>
+  <w:footnote w:id="2"><w:p><w:r><w:t>Hidden note</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Only one</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", footnotes_xml),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        assert!(
+            md.contains("[^1]: Referenced note"),
+            "referenced note missing: {md}"
+        );
+        assert!(!md.contains("Hidden note"), "unreferenced note leaked: {md}");
+        assert!(!md.contains("[^2]"), "unreferenced note got a label: {md}");
+    }
+
+    #[test]
+    fn extract_markdown_empty_extras_identical_to_body_only() {
+        // No extras parts at all → output is exactly the body (regression:
+        // trailer wiring must not alter body-only documents).
+        let plain_doc = minimal_docx(&[(
+            "word/document.xml",
+            &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
+        )]);
+        assert_eq!(extract_markdown(&plain_doc, false).unwrap(), "Body only\n\n");
+        assert_eq!(extract_plain(&plain_doc).unwrap(), "Body only\n");
+
+        // With images enabled and still no extras parts: body, inline image
+        // reference, then the trailing definition — nothing else.
+        let image_doc = image_docx(
+            r#"<w:p><w:r><w:t>Pic</w:t></w:r><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>"#,
+            &[],
+        );
+        assert_eq!(
+            extract_markdown(&image_doc, true).unwrap(),
+            "Pic\n\n![][image1]\n\n[image1]: <data:image/png;base64,iVBORw0KGgo=>\n"
+        );
+    }
+
+    #[test]
+    fn extract_markdown_images_extras_before_defs() {
+        let footnotes_xml = r#"<?xml version="1.0"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/><w:t>Source A</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+        let data = image_docx(
+            r#"<w:p><w:r><w:t>Pic</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>"#,
+            &[("word/footnotes.xml", footnotes_xml)],
+        );
+        let md = extract_markdown(&data, true).unwrap();
+
+        // The inline image reference renders in the body…
+        assert!(md.contains("![][image1]"), "inline image ref: {md}");
+        // …but the definition block is appended AFTER the extras trailers.
+        let footnotes_at = md.find("## Footnotes").expect("footnotes section");
+        let defs_at = md.find("[image1]: <data:image/png;base64,").expect("image definition");
+        assert!(footnotes_at < defs_at, "extras must precede image defs: {md}");
+        assert!(md.contains("[^1]: Source A"), "footnote definition: {md}");
+    }
+
+    #[test]
+    fn extract_plain_comments_trailer() {
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
+            ),
+            ("word/comments.xml", COMMENTS_XML),
+        ]);
+        let plain = extract_plain(&data).unwrap();
+
+        // Section heading after the body, one blank line apart; no other
+        // trailer sections (empty sections are omitted).
+        let body_at = plain.find("Body only").expect("body text");
+        let comments_at = plain.find("--- Comments ---").expect("comments section");
+        assert!(body_at < comments_at, "body must precede trailer: {plain}");
+        assert!(
+            plain.contains("\n\n--- Comments ---\n"),
+            "blank line before trailer: {plain}"
+        );
+        assert!(!plain.contains("--- Footnotes ---"), "no footnotes: {plain}");
+        // Consecutive Alice comments share one [Alice] group; the missing
+        // author maps to [Anonymous] at parse; Bob's whitespace-only comment
+        // is dropped entirely.
+        assert_eq!(plain.matches("[Alice]").count(), 1, "Alice must be grouped: {plain}");
+        assert!(plain.contains("[Anonymous]"), "anonymous group: {plain}");
+        for text in ["First para", "Second para", "Last word", "No author"] {
+            assert!(plain.contains(text), "missing comment text {text:?}: {plain}");
+        }
+        assert!(!plain.contains("[Bob]"), "empty comment must be dropped: {plain}");
+    }
+
+    #[test]
+    fn extract_markdown_empty_comments_section_omitted() {
+        // A comments part whose every comment body is whitespace-only parses
+        // to zero comments: both renderers must omit the section entirely
+        // and stay byte-identical to the body-only document.
+        let comments_xml = r#"<?xml version="1.0"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Nobody"><w:p><w:r><w:t>   </w:t></w:r></w:p></w:comment>
+</w:comments>"#;
+        let data = minimal_docx(&[
+            ("word/document.xml", &document_xml("<w:p><w:r><w:t>Body</w:t></w:r></w:p>")),
+            ("word/comments.xml", comments_xml),
+        ]);
+        assert_eq!(
+            extract_markdown(&data, false).unwrap(),
+            "Body\n\n",
+            "empty comments section must be omitted: {}",
+            extract_markdown(&data, false).unwrap()
+        );
+        assert_eq!(
+            extract_plain(&data).unwrap(),
+            "Body\n",
+            "empty comments section must be omitted: {}",
+            extract_plain(&data).unwrap()
+        );
+    }
+
+    #[test]
+    fn extract_plain_endnotes_trailer() {
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>See</w:t><w:endnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/endnotes.xml", ENDNOTES_XML),
+        ]);
+        let plain = extract_plain(&data).unwrap();
+
+        let body_at = plain.find("See").expect("body text");
+        let endnotes_at = plain.find("--- Endnotes ---").expect("endnotes section");
+        assert!(body_at < endnotes_at, "body must precede trailer: {plain}");
+        assert!(plain.contains("[e1] Endnote B"), "endnote definition: {plain}");
+    }
+
+    #[test]
+    fn extract_markdown_trailer_spacing_single_blank_line() {
+        // Body ending in a paragraph already ends with a blank line; the
+        // trailer must not add more than one blank line between them.
+        let data = minimal_docx(&[
+            (
+                "word/document.xml",
+                &document_xml(
+                    r#"<w:p><w:r><w:t>Body</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#,
+                ),
+            ),
+            ("word/footnotes.xml", FOOTNOTES_XML),
+        ]);
+        let md = extract_markdown(&data, false).unwrap();
+
+        assert!(
+            md.contains("\n\n## Footnotes"),
+            "exactly one blank line before trailer: {md}"
+        );
+        assert!(!md.contains("\n\n\n"), "more than one blank line: {md}");
     }
 
     // ── read_optional_part: missing vs present-but-unreadable ─────────
