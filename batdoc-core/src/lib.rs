@@ -12,6 +12,7 @@ mod docx;
 mod error;
 mod heuristic;
 mod markup;
+mod ocr;
 mod pdf;
 mod pptx;
 mod sheet;
