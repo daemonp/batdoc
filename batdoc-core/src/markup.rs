@@ -170,6 +170,41 @@ pub(crate) fn image_to_base64_ref(data: &[u8], id: &str) -> Option<ImageRef> {
     })
 }
 
+/// Append OCR'd image text as a markdown blockquote: one `> ` line per
+/// non-blank line of `text` (trailing whitespace trimmed), then a blank
+/// line. Shared by the DOCX and PPTX renderers.
+pub(crate) fn push_ocr_blockquote(out: &mut String, text: &str) {
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str("> ");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
+/// Append OCR'd image text as plain-text paragraphs: each non-blank line
+/// becomes a paragraph, blank-line separated. `first` tracks whether
+/// anything has been written to `out` yet, so no leading blank line is
+/// emitted for the very first paragraph. Shared by the DOCX and PPTX
+/// renderers.
+pub(crate) fn push_ocr_plain(out: &mut String, text: &str, first: &mut bool) {
+    for para in text.split('\n') {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        if !*first {
+            out.push('\n');
+        }
+        out.push_str(para);
+        out.push('\n');
+        *first = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +419,22 @@ mod tests {
     fn image_to_base64_ref_unsupported() {
         let data = &[0x01, 0x00, 0x00, 0x00]; // not a recognized format
         assert!(image_to_base64_ref(data, "image1").is_none());
+    }
+
+    #[test]
+    fn ocr_blockquote_skips_blank_lines() {
+        let mut out = String::new();
+        push_ocr_blockquote(&mut out, "one\n\n  \ntwo  \n");
+        assert_eq!(out, "> one\n> two\n\n");
+    }
+
+    #[test]
+    fn ocr_plain_paragraphs_respect_first_flag() {
+        let mut out = String::new();
+        let mut first = true;
+        push_ocr_plain(&mut out, "a\n\nb", &mut first);
+        assert_eq!(out, "a\n\nb\n");
+        push_ocr_plain(&mut out, "c", &mut first);
+        assert_eq!(out, "a\n\nb\n\nc\n");
     }
 }
