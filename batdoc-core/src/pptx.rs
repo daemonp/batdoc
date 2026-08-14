@@ -787,7 +787,10 @@ fn render_plain(slides: &[Slide]) -> String {
             render_shape_plain(shape, &mut out);
         }
 
-        let mut first_ocr = true;
+        // `first` starts false (unlike shared-paragraph DOCX state, the
+        // shape loop does not feed it) so the first OCR paragraph is
+        // blank-line separated from the body text, matching DOCX plain.
+        let mut first_ocr = false;
         for ocr in &slide.image_ocr {
             crate::markup::push_ocr_plain(&mut out, ocr, &mut first_ocr);
         }
@@ -1690,6 +1693,25 @@ mod tests {
         let text = render_plain(&slides);
         assert!(text.contains("line one"), "got: {text}");
         assert!(text.contains("line two"), "got: {text}");
+    }
+
+    #[test]
+    fn render_plain_blank_line_between_body_and_ocr() {
+        // Plain rendering separates the body from the first OCR paragraph
+        // with a blank line (and OCR paragraphs from each other), matching
+        // DOCX plain rendering's shared-paragraph semantics.
+        let slides = vec![Slide {
+            number: 1,
+            shapes: vec![shape_with_text("Body")],
+            images: Vec::new(),
+            notes: Vec::new(),
+            image_ocr: vec!["line one\nline two".into()],
+        }];
+        let text = render_plain(&slides);
+        assert!(
+            text.contains("Body\n\nline one\n\nline two"),
+            "got: {text:?}"
+        );
     }
 
     // ── ZIP integration: speaker notes discovery ──────────────────
