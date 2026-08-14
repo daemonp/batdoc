@@ -42,7 +42,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Cache OCR models
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/batdoc/models
+          key: ocr-models-v1
+
       - name: Download OCR models
+        if: steps.model-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.cache/batdoc/models
           curl -sfL -o ~/.cache/batdoc/models/text-detection.rten https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten
