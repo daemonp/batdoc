@@ -804,8 +804,10 @@ fn format_number(val: f64) -> String {
 /// Invalid surrogates are replaced with U+FFFD.
 pub(crate) fn decode_utf16le(data: &[u8]) -> String {
     let iter = data
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair));
     char::decode_utf16(iter)
         .map(|r| r.unwrap_or('\u{FFFD}'))
         .collect()

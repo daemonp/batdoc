@@ -94,8 +94,8 @@ fn extract_word8_text(data: &[u8], codepage: u16) -> Vec<u16> {
         let block = &data[offset..block_end];
 
         if detect_unicode_block(block) {
-            for pair in block.chunks_exact(2) {
-                result.push(u16::from_le_bytes([pair[0], pair[1]]));
+            for pair in block.as_chunks::<2>().0 {
+                result.push(u16::from_le_bytes(*pair));
             }
         } else {
             for &b in block {
@@ -117,7 +117,7 @@ fn extract_word8_text(data: &[u8], codepage: u16) -> Vec<u16> {
 
 /// Detect if a 256-byte block is UTF-16LE encoded.
 fn detect_unicode_block(block: &[u8]) -> bool {
-    block.chunks_exact(2).any(|pair| {
+    block.as_chunks::<2>().0.iter().any(|pair| {
         let c = pair[0];
         (c == 0x20 || c == 0x0D || c.is_ascii_punctuation()) && pair[1] == 0x00
     })
