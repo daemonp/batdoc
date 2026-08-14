@@ -787,18 +787,7 @@ fn render_plain(slides: &[Slide]) -> String {
 
         let mut first_ocr = true;
         for ocr in &slide.image_ocr {
-            for para in ocr.split('\n') {
-                let para = para.trim();
-                if para.is_empty() {
-                    continue;
-                }
-                if !first_ocr {
-                    out.push('\n');
-                }
-                first_ocr = false;
-                out.push_str(para);
-                out.push('\n');
-            }
+            crate::markup::push_ocr_plain(&mut out, ocr, &mut first_ocr);
         }
     }
 
@@ -838,15 +827,7 @@ fn render_markdown(slides: &[Slide]) -> String {
         }
 
         for ocr in &slide.image_ocr {
-            for line in ocr.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                out.push_str("> ");
-                out.push_str(line.trim_end());
-                out.push('\n');
-            }
-            out.push('\n');
+            crate::markup::push_ocr_blockquote(&mut out, ocr);
         }
     }
 

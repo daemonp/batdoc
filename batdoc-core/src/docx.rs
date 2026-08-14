@@ -1215,18 +1215,7 @@ fn render_block_plain(block: &Block, out: &mut String, first: &mut bool) {
             ocr_text: Some(text),
             ..
         } => {
-            for para in text.split('\n') {
-                let para = para.trim();
-                if para.is_empty() {
-                    continue;
-                }
-                if !*first {
-                    out.push('\n');
-                }
-                out.push_str(para);
-                out.push('\n');
-                *first = false;
-            }
+            crate::markup::push_ocr_plain(out, text, first);
         }
         Block::Image { .. } => {
             // Images without OCR text are not rendered in plain text mode
@@ -1281,15 +1270,7 @@ fn render_block_markdown(block: &Block, out: &mut String) {
                 out.push_str("\n\n");
             }
             if let Some(text) = ocr_text {
-                for line in text.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    out.push_str("> ");
-                    out.push_str(line.trim_end());
-                    out.push('\n');
-                }
-                out.push('\n');
+                crate::markup::push_ocr_blockquote(out, text);
             }
         }
         Block::Table { rows } => {
