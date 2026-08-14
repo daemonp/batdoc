@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "batdoc"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "bat",
  "batdoc-core",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "batdoc-core"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "base64",
  "cfb",

@@ -43,7 +43,7 @@ RUN mkdir -p dpkg/usr/bin dpkg/usr/share/doc/batdoc dpkg/usr/share/man/man1 dpkg
     && gzip -9 dpkg/usr/share/man/man1/batdoc.1 \
     && install -m644 README.md dpkg/usr/share/doc/batdoc/README \
     && install -m644 LICENSE dpkg/usr/share/doc/batdoc/copyright \
-    && printf 'Package: batdoc\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: Damon Petta <d@disassemble.net>\nDescription: cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat\n Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files\n and dumps their text to stdout as syntax-highlighted markdown via bat.\n' "${VERSION}" > dpkg/DEBIAN/control \
+    && printf 'Package: batdoc\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: Damon Petta <d@disassemble.net>\nDescription: cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat\n Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, PDF files, and\n raster images (via OCR) and dumps their text to stdout as\n syntax-highlighted markdown via bat.\n' "${VERSION}" > dpkg/DEBIAN/control \
     && dpkg-deb --build dpkg /out/batdoc_${VERSION}-1_amd64.deb
 
 # ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ RUN printf '# Maintainer: Damon Petta <d@disassemble.net>\n\
 pkgname=batdoc\n\
 pkgver=%s\n\
 pkgrel=0\n\
-pkgdesc="cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat"\n\
+pkgdesc="cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat"\n\
 url="https://github.com/daemonp/batdoc"\n\
 arch="x86_64"\n\
 license="MIT"\n\

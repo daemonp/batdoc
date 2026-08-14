@@ -1,5 +1,5 @@
 class Batdoc < Formula
-  desc "cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat"
+  desc "cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat"
   homepage "https://github.com/daemonp/batdoc"
   url "https://github.com/daemonp/batdoc/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "PLACEHOLDER"

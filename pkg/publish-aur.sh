@@ -111,7 +111,7 @@ sed -e "s/^pkgver=.*/pkgver=$VERSION/" \
 
 cat > "$WORK/batdoc/.SRCINFO" << EOF
 pkgbase = batdoc
-	pkgdesc = cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat
+	pkgdesc = cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat
 	pkgver = $VERSION
 	pkgrel = 1
 	url = https://github.com/$REPO
@@ -141,7 +141,7 @@ sed -e "s/^pkgver=.*/pkgver=$VERSION/" \
 
 cat > "$WORK/batdoc-bin/.SRCINFO" << EOF
 pkgbase = batdoc-bin
-	pkgdesc = cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat. Pre-compiled.
+	pkgdesc = cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat. Pre-compiled.
 	pkgver = $VERSION
 	pkgrel = 1
 	url = https://github.com/$REPO

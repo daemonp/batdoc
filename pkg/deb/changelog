@@ -1,3 +1,14 @@
+batdoc (1.5.0-1) unstable; urgency=medium
+
+  * OCR support: raster image input (.png, .jpg, .gif, .webp, .bmp) is
+    always OCR'd; new --ocr flag extends OCR to embedded DOCX/PPTX images
+    and textless PDF pages.
+  * Extract speaker notes from PPTX; comments, footnotes, and endnotes
+    from DOCX.
+  * Drop the -o short flag; image OCR renders as plain text on TTY.
+
+ -- Damon Petta <d@disassemble.net>  Fri, 14 Aug 2026 10:15:00 -0400
+
 batdoc (1.0.0-1) unstable; urgency=medium
 
   * Initial release.

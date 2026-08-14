@@ -14,10 +14,13 @@ Rules-Requires-Root: no
 Package: batdoc
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends}
-Description: cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat
- Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files
- and dumps their text to stdout. When stdout is a terminal the output is
- pretty-printed as syntax-highlighted markdown via bat; when piped,
- plain text is emitted. Format is detected by file signature, not extension.
+Description: cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat
+ Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, PDF files, and
+ raster images (.png, .jpg, .gif, .webp, .bmp) and dumps their text to
+ stdout. Image files are OCR'd with the ocrs engine; --ocr extends OCR to
+ embedded DOCX/PPTX images and textless PDF pages. When stdout is a
+ terminal the output is pretty-printed as syntax-highlighted markdown via
+ bat; when piped, plain text is emitted. Format is detected by file
+ signature, not extension.
  .
- Spiritual successor to catdoc. Seven crates, no C, no system libs.
+ Spiritual successor to catdoc. Pure Rust: no C, no system libs.

@@ -1,7 +1,7 @@
 Name:           batdoc
 Version:        1.0.0
 Release:        1%{?dist}
-Summary:        cat(1) for doc, docx, xls, xlsx, pptx, and pdf -- renders to markdown with bat
+Summary:        cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat
 
 License:        MIT
 URL:            https://github.com/daemonp/batdoc
@@ -12,12 +12,14 @@ BuildRequires:  rust
 BuildRequires:  gcc
 
 %description
-Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, and PDF files
-and dumps their text to stdout. When stdout is a terminal the output is
-pretty-printed as syntax-highlighted markdown via bat; when piped, plain text
-is emitted. Format is detected by file signature, not extension.
+Reads legacy .doc and .xls, modern .docx, .xlsx, and .pptx, PDF files, and
+raster images (.png, .jpg, .gif, .webp, .bmp) and dumps their text to stdout.
+Image files are OCR'd with the ocrs engine; --ocr extends OCR to embedded
+DOCX/PPTX images and textless PDF pages. When stdout is a terminal the output
+is pretty-printed as syntax-highlighted markdown via bat; when piped, plain
+text is emitted. Format is detected by file signature, not extension.
 
-Spiritual successor to catdoc. Seven crates, no C, no system libs.
+Spiritual successor to catdoc. Pure Rust: no C, no system libs.
 
 %prep
 %autosetup -n %{name}-%{version} -p1
@@ -39,5 +41,11 @@ cargo test --locked
 %{_mandir}/man1/%{name}.1*
 
 %changelog
+* Fri Aug 14 2026 Damon Petta <d@disassemble.net> - 1.5.0-1
+- OCR support: raster image input always OCR'd; --ocr extends OCR to
+  embedded DOCX/PPTX images and textless PDF pages
+- Extract PPTX speaker notes; DOCX comments, footnotes, and endnotes
+- Drop the -o short flag; image OCR renders as plain text on TTY
+
 * Sat Feb 14 2026 Damon Petta <d@disassemble.net> - 1.0.0-1
 - Initial package
