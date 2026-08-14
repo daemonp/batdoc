@@ -177,10 +177,10 @@ pub fn extract_plain_with(data: &[u8], format: Format, opts: ExtractOptions) -> 
     match format {
         Format::Doc => doc::extract_plain(data),
         Format::Xls => xls::extract_plain(data),
-        Format::Docx => docx::extract_plain(data, opts.ocr),
+        Format::Docx => docx::extract_plain(data, opts),
         Format::Xlsx => xlsx::extract_plain(data),
-        Format::Pptx => pptx::extract_plain(data, opts.ocr),
-        Format::Pdf => pdf::extract_plain(data, opts.ocr),
+        Format::Pptx => pptx::extract_plain(data, opts),
+        Format::Pdf => pdf::extract_plain(data, opts),
         Format::Image => ocr::extract_image_plain(data),
     }
 }
@@ -214,10 +214,10 @@ pub fn extract_markdown_with(data: &[u8], format: Format, opts: ExtractOptions) 
     match format {
         Format::Doc => doc::extract_markdown(data),
         Format::Xls => xls::extract_markdown(data),
-        Format::Docx => docx::extract_markdown(data, opts.images, opts.ocr),
+        Format::Docx => docx::extract_markdown(data, opts),
         Format::Xlsx => xlsx::extract_markdown(data, opts.images),
-        Format::Pptx => pptx::extract_markdown(data, opts.images, opts.ocr),
-        Format::Pdf => pdf::extract_markdown(data, opts.ocr),
+        Format::Pptx => pptx::extract_markdown(data, opts),
+        Format::Pdf => pdf::extract_markdown(data, opts),
         Format::Image => ocr::extract_image_plain(data),
     }
 }

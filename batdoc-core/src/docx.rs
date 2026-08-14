@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 use crate::markup;
 use crate::xml_util::{self, get_attr, Rels};
+use crate::ExtractOptions;
 
 /// Extracted document structure for rich output.
 #[derive(Debug)]
@@ -209,8 +210,14 @@ fn assign_display_indexes(notes: Vec<Note>, index: &NoteIndex) -> Vec<Note> {
 }
 
 /// Extract plain text from a .docx file.
-pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> crate::error::Result<String> {
-    let (blocks, _, comments, footnotes, endnotes) = parse_docx(data, false, ocr)?;
+pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
+    let (blocks, _, comments, footnotes, endnotes) = parse_docx(
+        data,
+        ExtractOptions {
+            images: false,
+            ..opts
+        },
+    )?;
     let mut out = render_plain(&blocks);
     append_extras_plain(&mut out, &comments, &footnotes, &endnotes);
     Ok(out)
@@ -218,16 +225,12 @@ pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> crate::error::Result<Stri
 
 /// Extract markdown-formatted text from a .docx file.
 ///
-/// When `images` is true, embedded images are extracted and included as
+/// When `opts.images` is set, embedded images are extracted and included as
 /// reference-style base64 images: `![][imageN]` inline with definitions
-/// appended at the end of the document. When `ocr` is true, embedded images
+/// appended at the end of the document. When `opts.ocr` is set, embedded images
 /// are OCR'd and their text is rendered as a blockquote after the image.
-pub(crate) fn extract_markdown(
-    data: &[u8],
-    images: bool,
-    ocr: bool,
-) -> crate::error::Result<String> {
-    let (blocks, image_defs, comments, footnotes, endnotes) = parse_docx(data, images, ocr)?;
+pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
+    let (blocks, image_defs, comments, footnotes, endnotes) = parse_docx(data, opts)?;
     let mut md = render_markdown(&blocks);
     append_extras_markdown(&mut md, &comments, &footnotes, &endnotes);
     if !image_defs.is_empty() {
@@ -269,14 +272,14 @@ fn read_optional_part(
 /// Parse the docx XML into structured blocks, image reference definitions,
 /// and the document extras (comments, footnotes, endnotes).
 ///
-/// When `images` is true, image relationships are loaded and `<w:drawing>`
+/// When `opts.images` is set, image relationships are loaded and `<w:drawing>`
 /// elements are extracted as `Block::Image` entries with inline references.
 /// The returned [`DocxOutput`] tuple is `(blocks, image_defs, comments,
 /// footnotes, endnotes)`: `image_defs` holds the reference definitions to
 /// append at the end of the document; `comments`/`footnotes`/`endnotes`
 /// hold the extras parsed from the optional parts (empty when a part is
 /// missing).
-fn parse_docx(data: &[u8], images: bool, ocr: bool) -> crate::error::Result<DocxOutput> {
+fn parse_docx(data: &[u8], opts: ExtractOptions) -> crate::error::Result<DocxOutput> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
 
@@ -284,7 +287,7 @@ fn parse_docx(data: &[u8], images: bool, ocr: bool) -> crate::error::Result<Docx
     let rels = xml_util::load_rels(&mut archive, "word/_rels/document.xml.rels");
 
     // Optionally load image relationships (needed for images and/or OCR)
-    let image_rels = if images || ocr {
+    let image_rels = if opts.images || opts.ocr {
         xml_util::load_image_rels(&mut archive, "word/_rels/document.xml.rels")
     } else {
         xml_util::Rels::new()
@@ -345,10 +348,10 @@ fn parse_docx(data: &[u8], images: bool, ocr: bool) -> crate::error::Result<Docx
     let endnotes = assign_display_indexes(endnotes, &endnotes_idx);
 
     // Read image data from the archive when either feature is active
-    let image_defs = if images || ocr {
+    let image_defs = if opts.images || opts.ocr {
         let cursor = Cursor::new(data);
         let mut archive = ZipArchive::new(cursor)?;
-        resolve_images(&mut blocks, &mut archive, images, ocr)?
+        resolve_images(&mut blocks, &mut archive, opts)?
     } else {
         Vec::new()
     };
@@ -988,8 +991,7 @@ fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block>
 fn resolve_images(
     blocks: &mut Vec<Block>,
     archive: &mut ZipArchive<Cursor<&[u8]>>,
-    images: bool,
-    ocr: bool,
+    opts: ExtractOptions,
 ) -> crate::error::Result<Vec<String>> {
     let mut definitions = Vec::new();
     let mut counter = 0usize;
@@ -1002,7 +1004,7 @@ fn resolve_images(
         } = block
         {
             if let Some(data) = xml_util::read_image_from_zip(archive, path, "") {
-                if images {
+                if opts.images {
                     counter += 1;
                     let id = format!("image{counter}");
                     if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
@@ -1010,7 +1012,7 @@ fn resolve_images(
                         definitions.push(img_ref.definition);
                     }
                 }
-                if ocr {
+                if opts.ocr {
                     *ocr_text = crate::ocr::ocr_image_bytes(&data)?;
                 }
             }
@@ -2478,7 +2480,8 @@ mod tests {
             ),
             ("word/footnotes.xml", FOOTNOTES_XML),
         ]);
-        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false, false).unwrap();
+        let (blocks, _, _, footnotes, endnotes) =
+            parse_docx(&data, crate::ExtractOptions::default()).unwrap();
 
         // Markers now appear in production output for defined ids.
         let md = render_markdown(&blocks);
@@ -2486,7 +2489,7 @@ mod tests {
         // Trailer-included (Task 7): the extract-level output appends the
         // referenced note to a `## Footnotes` section with its text as a
         // definition; unreferenced notes stay out.
-        let full = extract_markdown(&data, false, false).unwrap();
+        let full = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
         assert!(
             full.contains("## Footnotes"),
             "missing footnotes trailer: {full}"
@@ -2517,7 +2520,8 @@ mod tests {
             ),
             ("word/endnotes.xml", ENDNOTES_XML),
         ]);
-        let (blocks, _, _, footnotes, endnotes) = parse_docx(&data, false, false).unwrap();
+        let (blocks, _, _, footnotes, endnotes) =
+            parse_docx(&data, crate::ExtractOptions::default()).unwrap();
 
         let md = render_markdown(&blocks);
         assert!(md.contains("[^e1]"), "missing endnote marker: {md}");
@@ -2536,7 +2540,8 @@ mod tests {
             ),
             ("word/comments.xml", COMMENTS_XML),
         ]);
-        let (blocks, _, comments, footnotes, endnotes) = parse_docx(&data, false, false).unwrap();
+        let (blocks, _, comments, footnotes, endnotes) =
+            parse_docx(&data, crate::ExtractOptions::default()).unwrap();
 
         // Body unaffected; comments carry author + multi-paragraph blocks
         // (rendering into a trailer is Task 7).
@@ -2554,9 +2559,9 @@ mod tests {
             "word/document.xml",
             &document_xml(r#"<w:p><w:r><w:t>Hi</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#),
         )]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
         assert_eq!(md, "Hi\n\n");
-        let plain = extract_plain(&data, false).unwrap();
+        let plain = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
         assert_eq!(plain, "Hi\n");
     }
 
@@ -2574,7 +2579,7 @@ mod tests {
             ("word/footnotes.xml", FOOTNOTES_XML),
             ("word/endnotes.xml", ENDNOTES_XML),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         // Body carries the inline markers for the referenced notes.
         assert!(md.contains("[^1]"), "footnote marker missing: {md}");
@@ -2611,7 +2616,7 @@ mod tests {
             ),
             ("word/comments.xml", comments_xml),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         // Consecutive Alice comments share one heading; the later Alice
         // comment is NOT consecutive, so the heading repeats. Order of the
@@ -2659,7 +2664,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         // Definition-list form: `[^1]:` on the label line, then every line
         // of the body indented 4 spaces (CommonMark continuation).
@@ -2697,7 +2702,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         // Label line, then every body line indented 4 spaces: the table
         // header starts with 4 spaces + `| `.
@@ -2735,7 +2740,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         assert!(md.contains("Ref"), "body text missing: {md}");
         assert!(!md.contains("[^1]"), "empty note got a marker: {md}");
@@ -2762,7 +2767,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let plain = extract_plain(&data, false).unwrap();
+        let plain = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
 
         assert!(
             plain.contains("\n\n--- Footnotes ---\n"),
@@ -2798,7 +2803,7 @@ mod tests {
             ),
             ("word/footnotes.xml", footnotes_xml),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         assert!(
             md.contains("[^1]: Referenced note"),
@@ -2820,10 +2825,13 @@ mod tests {
             &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
         )]);
         assert_eq!(
-            extract_markdown(&plain_doc, false, false).unwrap(),
+            extract_markdown(&plain_doc, crate::ExtractOptions::default()).unwrap(),
             "Body only\n\n"
         );
-        assert_eq!(extract_plain(&plain_doc, false).unwrap(), "Body only\n");
+        assert_eq!(
+            extract_plain(&plain_doc, crate::ExtractOptions::default()).unwrap(),
+            "Body only\n"
+        );
 
         // With images enabled and still no extras parts: body, inline image
         // reference, then the trailing definition — nothing else.
@@ -2832,7 +2840,14 @@ mod tests {
             &[],
         );
         assert_eq!(
-            extract_markdown(&image_doc, true, false).unwrap(),
+            extract_markdown(
+                &image_doc,
+                crate::ExtractOptions {
+                    images: true,
+                    ..crate::ExtractOptions::default()
+                }
+            )
+            .unwrap(),
             "Pic\n\n![][image1]\n\n[image1]: <data:image/png;base64,iVBORw0KGgo=>\n"
         );
     }
@@ -2847,7 +2862,14 @@ mod tests {
             r#"<w:p><w:r><w:t>Pic</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>"#,
             &[("word/footnotes.xml", footnotes_xml)],
         );
-        let md = extract_markdown(&data, true, false).unwrap();
+        let md = extract_markdown(
+            &data,
+            crate::ExtractOptions {
+                images: true,
+                ..crate::ExtractOptions::default()
+            },
+        )
+        .unwrap();
 
         // The inline image reference renders in the body…
         assert!(md.contains("![][image1]"), "inline image ref: {md}");
@@ -2872,7 +2894,7 @@ mod tests {
             ),
             ("word/comments.xml", COMMENTS_XML),
         ]);
-        let plain = extract_plain(&data, false).unwrap();
+        let plain = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
 
         // Section heading after the body, one blank line apart; no other
         // trailer sections (empty sections are omitted).
@@ -2925,16 +2947,16 @@ mod tests {
             ("word/comments.xml", comments_xml),
         ]);
         assert_eq!(
-            extract_markdown(&data, false, false).unwrap(),
+            extract_markdown(&data, crate::ExtractOptions::default()).unwrap(),
             "Body\n\n",
             "empty comments section must be omitted: {}",
-            extract_markdown(&data, false, false).unwrap()
+            extract_markdown(&data, crate::ExtractOptions::default()).unwrap()
         );
         assert_eq!(
-            extract_plain(&data, false).unwrap(),
+            extract_plain(&data, crate::ExtractOptions::default()).unwrap(),
             "Body\n",
             "empty comments section must be omitted: {}",
-            extract_plain(&data, false).unwrap()
+            extract_plain(&data, crate::ExtractOptions::default()).unwrap()
         );
     }
 
@@ -2949,7 +2971,7 @@ mod tests {
             ),
             ("word/endnotes.xml", ENDNOTES_XML),
         ]);
-        let plain = extract_plain(&data, false).unwrap();
+        let plain = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
 
         let body_at = plain.find("See").expect("body text");
         let endnotes_at = plain.find("--- Endnotes ---").expect("endnotes section");
@@ -2973,7 +2995,7 @@ mod tests {
             ),
             ("word/footnotes.xml", FOOTNOTES_XML),
         ]);
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
 
         assert!(
             md.contains("\n\n## Footnotes"),

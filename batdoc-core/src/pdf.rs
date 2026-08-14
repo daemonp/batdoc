@@ -6,6 +6,7 @@
 //! [`BatdocError::Document`] errors.
 
 use crate::error::{BatdocError, Result};
+use crate::ExtractOptions;
 use lopdf::xobject::PdfImage;
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -81,8 +82,9 @@ fn ocr_candidates<'a>(images: &'a [PdfImage<'a>]) -> Vec<&'a PdfImage<'a>> {
         .map(|img| {
             (
                 img,
-                u64::try_from(img.width.max(0)).unwrap_or(0)
-                    * u64::try_from(img.height.max(0)).unwrap_or(0),
+                u64::try_from(img.width.max(0))
+                    .unwrap_or(0)
+                    .saturating_mul(u64::try_from(img.height.max(0)).unwrap_or(0)),
             )
         })
         .filter(|(_, area)| *area > 0 && *area <= MAX_OCR_IMAGE_PIXELS)
@@ -225,8 +227,8 @@ fn no_text_error(ocr: bool) -> BatdocError {
 }
 
 /// Extract plain text from a PDF.
-pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> Result<String> {
-    let pages = extract_pages_with_ocr(data, ocr)?;
+pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> Result<String> {
+    let pages = extract_pages_with_ocr(data, opts.ocr)?;
     let nonempty: Vec<&str> = pages
         .iter()
         .map(String::as_str)
@@ -234,7 +236,7 @@ pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> Result<String> {
         .collect();
 
     if nonempty.is_empty() {
-        return Err(no_text_error(ocr));
+        return Err(no_text_error(opts.ocr));
     }
 
     Ok(nonempty.join("\n"))
@@ -244,8 +246,8 @@ pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> Result<String> {
 ///
 /// Each page gets a `## Page N` heading. Single-page documents omit the
 /// heading since it would be redundant.
-pub(crate) fn extract_markdown(data: &[u8], ocr: bool) -> Result<String> {
-    let pages = extract_pages_with_ocr(data, ocr)?;
+pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<String> {
+    let pages = extract_pages_with_ocr(data, opts.ocr)?;
     let nonempty: Vec<(usize, &str)> = pages
         .iter()
         .enumerate()
@@ -259,7 +261,7 @@ pub(crate) fn extract_markdown(data: &[u8], ocr: bool) -> Result<String> {
         .collect();
 
     if nonempty.is_empty() {
-        return Err(no_text_error(ocr));
+        return Err(no_text_error(opts.ocr));
     }
 
     let mut out = String::new();
@@ -314,7 +316,7 @@ mod tests {
     #[test]
     fn malformed_data_returns_error() {
         let garbage = b"not a pdf at all";
-        let result = extract_plain(garbage, false);
+        let result = extract_plain(garbage, crate::ExtractOptions::default());
         assert!(result.is_err());
     }
 
@@ -322,7 +324,7 @@ mod tests {
     fn empty_pdf_header_returns_error() {
         // A minimal PDF header with no real content
         let data = b"%PDF-1.4\n%%EOF\n";
-        let result = extract_plain(data, false);
+        let result = extract_plain(data, crate::ExtractOptions::default());
         assert!(result.is_err());
     }
 
@@ -356,10 +358,20 @@ trailer\n\
 startxref\n\
 110\n\
 %%EOF\n";
-        let plain_err = extract_plain(data, false).unwrap_err().to_string();
+        let plain_err = extract_plain(data, crate::ExtractOptions::default())
+            .unwrap_err()
+            .to_string();
         assert!(plain_err.contains("scanned/image-only"));
         assert!(!plain_err.contains("OCR"));
-        let ocr_err = extract_plain(data, true).unwrap_err().to_string();
+        let ocr_err = extract_plain(
+            data,
+            crate::ExtractOptions {
+                ocr: true,
+                ..crate::ExtractOptions::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(ocr_err.contains("OCR found nothing"));
     }
 
@@ -479,5 +491,23 @@ startxref\n\
             origin_dict: &dict,
         };
         assert!(decode_pdf_image(&img).is_none());
+    }
+
+    #[test]
+    fn decode_jpeg_bounded_enforces_dim_limits() {
+        let encode = |w: u32, h: u32| {
+            let img = image::RgbImage::from_pixel(w, h, image::Rgb([128, 128, 128]));
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut buf, image::ImageFormat::Jpeg)
+                .unwrap();
+            buf.into_inner()
+        };
+        // Within limits: decodes.
+        let ok = encode(64, 64);
+        assert_eq!(decode_jpeg_bounded(&ok).unwrap().dimensions(), (64, 64));
+        // Width beyond MAX_OCR_IMAGE_DIM: rejected by the strict dim limit.
+        let wide = encode(MAX_OCR_IMAGE_DIM + 1, 2);
+        assert!(decode_jpeg_bounded(&wide).is_none());
     }
 }

@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 use crate::markup;
 use crate::xml_util::{self, get_attr, Rels};
+use crate::ExtractOptions;
 
 /// A parsed slide: its number and extracted text runs.
 #[derive(Debug)]
@@ -70,23 +71,25 @@ struct TextRun {
 }
 
 /// Extract plain text from a .pptx file.
-pub(crate) fn extract_plain(data: &[u8], ocr: bool) -> crate::error::Result<String> {
-    let (slides, _) = parse_pptx(data, false, ocr)?;
+pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
+    let (slides, _) = parse_pptx(
+        data,
+        ExtractOptions {
+            images: false,
+            ..opts
+        },
+    )?;
     Ok(render_plain(&slides))
 }
 
 /// Extract markdown-formatted text from a .pptx file.
 ///
-/// When `images` is true, embedded images are extracted and included as
+/// When `opts.images` is set, embedded images are extracted and included as
 /// reference-style base64 images with definitions appended at the end.
-/// When `ocr` is true, embedded images are OCR'd and rendered as a
+/// When `opts.ocr` is set, embedded images are OCR'd and rendered as a
 /// blockquote after each slide's images.
-pub(crate) fn extract_markdown(
-    data: &[u8],
-    images: bool,
-    ocr: bool,
-) -> crate::error::Result<String> {
-    let (slides, image_defs) = parse_pptx(data, images, ocr)?;
+pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
+    let (slides, image_defs) = parse_pptx(data, opts)?;
     let mut md = render_markdown(&slides);
     if !image_defs.is_empty() {
         for def in &image_defs {
@@ -101,13 +104,12 @@ pub(crate) fn extract_markdown(
 
 /// Parse the pptx archive into slides and image reference definitions.
 ///
-/// When `extract_images` is true, image relationships are loaded and
-/// `<p:pic>` elements are extracted as reference-style images. When `ocr`
-/// is true, the same images are additionally OCR'd.
+/// When `opts.images` is set, image relationships are loaded and
+/// `<p:pic>` elements are extracted as reference-style images. When `opts.ocr`
+/// is set, the same images are additionally OCR'd.
 fn parse_pptx(
     data: &[u8],
-    extract_images: bool,
-    ocr: bool,
+    opts: ExtractOptions,
 ) -> crate::error::Result<(Vec<Slide>, Vec<String>)> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
@@ -133,7 +135,7 @@ fn parse_pptx(
         let rels = xml_util::load_rels(&mut archive, &slide_rels_path);
 
         // Optionally load image rels for this slide
-        let image_rels = if extract_images || ocr {
+        let image_rels = if opts.images || opts.ocr {
             xml_util::load_image_rels(&mut archive, &slide_rels_path)
         } else {
             xml_util::Rels::new()
@@ -142,7 +144,7 @@ fn parse_pptx(
         let shapes = parse_slide_xml(&xml, &rels);
 
         // Extract images from <p:pic> elements (for --images refs and/or OCR)
-        let (images, image_ocr) = if (extract_images || ocr) && !image_rels.is_empty() {
+        let (images, image_ocr) = if (opts.images || opts.ocr) && !image_rels.is_empty() {
             let pic_rids = parse_slide_pic_rids(&xml);
             let base_dir = path.rsplit_once('/').map_or("ppt", |(dir, _)| dir);
             let mut inline_refs = Vec::new();
@@ -152,7 +154,7 @@ fn parse_pptx(
                     if let Some(data) =
                         xml_util::read_image_from_zip(&mut archive, target, base_dir)
                     {
-                        if extract_images {
+                        if opts.images {
                             image_counter += 1;
                             let id = format!("image{image_counter}");
                             if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
@@ -160,7 +162,7 @@ fn parse_pptx(
                                 all_image_defs.push(img_ref.definition);
                             }
                         }
-                        if ocr {
+                        if opts.ocr {
                             if let Some(text) = crate::ocr::ocr_image_bytes(&data)? {
                                 ocr_texts.push(text);
                             }
@@ -1793,7 +1795,7 @@ mod tests {
     #[test]
     fn extract_markdown_includes_speaker_notes() {
         let data = minimal_pptx_with_notes();
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
         assert!(md.contains("Deck title"), "md: {md:?}");
         assert!(md.contains("## Notes"), "md: {md:?}");
         assert!(md.contains("Speak slowly"), "md: {md:?}");
@@ -1804,8 +1806,8 @@ mod tests {
     #[test]
     fn extract_whitespace_notes_body_omits_section() {
         let data = minimal_pptx_with_notes_body("   ");
-        let md = extract_markdown(&data, false, false).unwrap();
-        let plain = extract_plain(&data, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        let plain = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
         assert!(!md.contains("## Notes"), "md: {md:?}");
         assert!(!plain.contains("--- Notes ---"), "plain: {plain:?}");
     }
@@ -1813,7 +1815,7 @@ mod tests {
     #[test]
     fn extract_missing_notes_target_ok() {
         let data = minimal_pptx("Speak slowly", "../notesSlides/missing.xml");
-        let md = extract_markdown(&data, false, false).unwrap();
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
         assert!(md.contains("Deck title"), "md: {md:?}");
         assert!(!md.contains("## Notes"), "md: {md:?}");
     }
@@ -1821,7 +1823,7 @@ mod tests {
     #[test]
     fn extract_plain_includes_speaker_notes() {
         let data = minimal_pptx_with_notes();
-        let plain = extract_plain(&data, false).unwrap();
+        let plain = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
         assert!(plain.contains("--- Notes ---"), "plain: {plain:?}");
         assert!(plain.contains("[Slide 1]"), "plain: {plain:?}");
         assert!(plain.contains("Speak slowly"), "plain: {plain:?}");
