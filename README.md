@@ -23,6 +23,49 @@ are distinguished by peeking at internal streams; ZIP files (`.docx`/`.xlsx`/`.p
 by checking for `word/document.xml` vs `xl/workbook.xml` vs `ppt/presentation.xml`;
 PDFs by the `%PDF-` header.
 
+## For AI agents
+
+Copy the block below to `~/.agents/skills/batdoc/SKILL.md` to give a local
+agent a discoverable `batdoc` skill for processing documents and images:
+
+````markdown
+---
+name: batdoc
+description: Use when processing PDF, DOC, DOCX, XLS, XLSX, or PPTX files,
+  or OCRing images (PNG/JPG/GIF/WEBP/BMP), to extract their text as
+  markdown or plain text.
+---
+
+# batdoc
+
+Dumps office documents and PDFs to the terminal as markdown, and OCRs
+images. Format is detected by file signature, not extension — stdin works
+too.
+
+## When to use
+
+- PDF, text layer or scanned → `batdoc --ocr paper.pdf`
+- Office documents (doc/docx/xls/xlsx/pptx) → `batdoc report.docx`
+- Images or scans of text → `batdoc photo.png` (image files are always OCR'd)
+
+## Quick reference
+
+    batdoc report.docx                  # markdown, highlighted, paged on a tty
+    batdoc --plain legacy.doc > out.txt # plain text
+    batdoc --ocr scanned.pdf            # OCR pages with no text layer
+    batdoc --images report.docx         # embed images as base64 data URIs
+    cat mystery.bin | batdoc            # format detected from magic bytes
+
+## Notes
+
+- `--plain` for text-only output; markdown is the default on a tty.
+- OCR needs no flag for image files; `--ocr` also covers docx/pptx embedded
+  images and textless PDF pages.
+- OCR models (~12 MB) download on first use; pre-seed `$BATDOC_MODELS_DIR`
+  for offline or package-managed installs.
+- Use a release build — OCR is much slower in debug builds.
+````
+
 ## Install
 
 **Arch Linux (AUR):**
