@@ -6,6 +6,7 @@
 //! [`BatdocError::Document`] errors.
 
 use crate::error::{BatdocError, Result};
+use crate::ocr::MAX_OCR_IMAGE_DIM;
 use crate::ExtractOptions;
 use lopdf::xobject::PdfImage;
 use std::fmt::Write as _;
@@ -67,10 +68,6 @@ const MAX_OCR_IMAGES_PER_PAGE: usize = 4;
 /// Maximum decoded pixels per embedded image (~100 MP ≈ 300 MB RGB).
 /// Larger images are skipped so a single image cannot exhaust memory.
 const MAX_OCR_IMAGE_PIXELS: u64 = 100_000_000;
-/// Maximum width/height accepted when decoding embedded JPEGs. Strict
-/// decoder-side guard against a JPEG whose real dimensions exceed the
-/// dimensions declared in the PDF dictionary (`10_000²` = the pixel budget).
-const MAX_OCR_IMAGE_DIM: u32 = 10_000;
 
 /// Select up to [`MAX_OCR_IMAGES_PER_PAGE`] OCR candidates, largest by
 /// declared pixel area first, skipping images whose decoded size would

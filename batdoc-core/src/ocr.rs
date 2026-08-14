@@ -22,6 +22,9 @@ const RECOGNITION_MODEL_FILE: &str = "text-recognition.rten";
 
 /// Network timeout for model downloads.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
+/// Maximum accepted model download size (the real models are 2.4 MB and
+/// 9.3 MB; a larger response means a compromised/redirected URL).
+const MAX_MODEL_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Age after which leftover `*.tmp.<pid>` download files are swept.
 const STALE_TMP_AGE: Duration = Duration::from_hours(1);
 
@@ -75,11 +78,19 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
              (set BATDOC_MODELS_DIR to a directory containing the model files)"
             ))
         })?;
+    // Read at most 64 MiB so an oversized/redirected response cannot fill
+    // memory; a longer body is rejected before any file is written.
     let mut buf = Vec::new();
     response
         .into_reader()
+        .take(MAX_MODEL_DOWNLOAD_BYTES + 1)
         .read_to_end(&mut buf)
         .map_err(|e| BatdocError::Document(format!("failed to read OCR model download: {e}")))?;
+    if buf.len() as u64 > MAX_MODEL_DOWNLOAD_BYTES {
+        return Err(BatdocError::Document(
+            "OCR model file exceeds 64 MiB".into(),
+        ));
+    }
     std::fs::write(&tmp, &buf).map_err(|e| {
         BatdocError::Document(format!(
             "failed to write OCR model to {}: {e}",
@@ -203,11 +214,33 @@ pub(crate) fn ocr_rgb_image(img: &image::RgbImage) -> Result<Option<String>> {
     }
 }
 
+/// Maximum width/height accepted when decoding images for OCR. Strict
+/// decoder-side guard (shared with PDF embedded-image decoding) so a
+/// crafted image whose header claims huge dimensions cannot allocate past
+/// the OCR pixel budget (`10_000²` ≈ 100 MP ≈ 300 MB RGB).
+pub(crate) const MAX_OCR_IMAGE_DIM: u32 = 10_000;
+
+/// Decode limits for OCR image input, matching PDF embedded-image decoding:
+/// `Limits::default()` (512 MiB alloc cap) plus width/height ≤
+/// [`MAX_OCR_IMAGE_DIM`].
+fn ocr_decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_OCR_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_OCR_IMAGE_DIM);
+    limits
+}
+
 /// Decode and OCR an image byte slice (PNG/JPEG/GIF/WebP/BMP).
 ///
-/// `None` when the bytes are not a decodable image or OCR found no text.
+/// `None` when the bytes are not a decodable image (including images beyond
+/// the decode limits) or OCR found no text.
 pub(crate) fn ocr_image_bytes(data: &[u8]) -> Result<Option<String>> {
-    let img = match image::load_from_memory(data) {
+    let Ok(mut reader) = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()
+    else {
+        return Ok(None);
+    };
+    reader.limits(ocr_decode_limits());
+    let img = match reader.decode() {
         Ok(img) => img.into_rgb8(),
         Err(_) => return Ok(None),
     };
