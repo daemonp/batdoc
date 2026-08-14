@@ -205,6 +205,20 @@ pub(crate) fn push_ocr_plain(out: &mut String, text: &str, first: &mut bool) {
     }
 }
 
+/// Ensure a blank line separates the body from a trailer section: adds the
+/// missing newline(s) unless the output already ends with two newlines.
+/// No-op on empty output or when a blank line is already present. Shared by
+/// the DOCX (comments/footnotes/endnotes) and PPTX (notes) renderers.
+pub(crate) fn ensure_trailer_blank_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with("\n\n") {
+        if out.ends_with('\n') {
+            out.push('\n');
+        } else {
+            out.push_str("\n\n");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

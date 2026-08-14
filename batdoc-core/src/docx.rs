@@ -969,12 +969,10 @@ fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block>
     let target = image_rels.get(&rid)?;
 
     // Store the resolved ZIP path; resolve_images() will read the data and
-    // fill in the markdown reference and/or OCR text as configured.
-    let zip_path = if target.starts_with('/') {
-        target.trim_start_matches('/').to_string()
-    } else {
-        format!("word/{target}")
-    };
+    // fill in the markdown reference and/or OCR text as configured. Joins
+    // `word/` + target and normalizes `..`/`.` segments, mirroring the
+    // previous manual join (read_image_from_zip re-normalizes anyway).
+    let zip_path = xml_util::resolve_zip_target(target, "word");
 
     Some(Block::Image {
         path: zip_path,
@@ -1387,19 +1385,6 @@ impl markup::InlineRun for Run {
 
 // ── Extras trailers (comments / footnotes / endnotes) ───────────
 
-/// Ensure the output ends with a blank line (two newlines) so a following
-/// trailer section or group heading is separated from what precedes it.
-/// No-op on empty output or when a blank line is already present.
-fn ensure_trailer_blank_line(out: &mut String) {
-    if !out.is_empty() && !out.ends_with("\n\n") {
-        if out.ends_with('\n') {
-            out.push('\n');
-        } else {
-            out.push_str("\n\n");
-        }
-    }
-}
-
 /// Append the extras trailers to a rendered markdown body in the fixed order
 /// Comments, Footnotes, Endnotes. Empty sections are omitted entirely; a
 /// single blank line separates the body from the first trailer.
@@ -1421,7 +1406,7 @@ fn append_comments_markdown(out: &mut String, comments: &[Comment]) {
     if comments.is_empty() {
         return;
     }
-    ensure_trailer_blank_line(out);
+    markup::ensure_trailer_blank_line(out);
     out.push_str("## Comments\n\n");
     let mut i = 0;
     while i < comments.len() {
@@ -1436,7 +1421,7 @@ fn append_comments_markdown(out: &mut String, comments: &[Comment]) {
             }
             // Blank line between comments; also gives the next heading its
             // separation when the last block is a list item ending in '\n'.
-            ensure_trailer_blank_line(out);
+            markup::ensure_trailer_blank_line(out);
             j += 1;
         }
         i = j;
@@ -1456,7 +1441,7 @@ fn append_footnotes_markdown(out: &mut String, footnotes: &[Note]) {
     if notes.is_empty() {
         return;
     }
-    ensure_trailer_blank_line(out);
+    markup::ensure_trailer_blank_line(out);
     out.push_str("## Footnotes\n\n");
     for note in notes {
         render_note_definition_markdown(out, "", note);
@@ -1469,7 +1454,7 @@ fn append_endnotes_markdown(out: &mut String, endnotes: &[Note]) {
     if notes.is_empty() {
         return;
     }
-    ensure_trailer_blank_line(out);
+    markup::ensure_trailer_blank_line(out);
     out.push_str("## Endnotes\n\n");
     for note in notes {
         render_note_definition_markdown(out, "e", note);
@@ -1543,7 +1528,7 @@ fn append_comments_plain(out: &mut String, comments: &[Comment]) {
     if comments.is_empty() {
         return;
     }
-    ensure_trailer_blank_line(out);
+    markup::ensure_trailer_blank_line(out);
     out.push_str("--- Comments ---\n");
     let mut i = 0;
     while i < comments.len() {
@@ -1570,7 +1555,7 @@ fn append_footnotes_plain(out: &mut String, footnotes: &[Note]) {
     if notes.is_empty() {
         return;
     }
-    ensure_trailer_blank_line(out);
+    markup::ensure_trailer_blank_line(out);
     out.push_str("--- Footnotes ---\n");
     for note in notes {
         render_note_plain(out, "", note);
@@ -1583,7 +1568,7 @@ fn append_endnotes_plain(out: &mut String, endnotes: &[Note]) {
     if notes.is_empty() {
         return;
     }
-    ensure_trailer_blank_line(out);
+    markup::ensure_trailer_blank_line(out);
     out.push_str("--- Endnotes ---\n");
     for note in notes {
         render_note_plain(out, "e", note);

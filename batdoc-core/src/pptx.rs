@@ -941,18 +941,6 @@ fn notes_nonempty(notes: &[ShapeText]) -> bool {
     })
 }
 
-/// Ensure a blank line separates the body from a trailer section: adds the
-/// missing newline(s) unless the output already ends with two newlines.
-fn ensure_trailer_blank_line(out: &mut String) {
-    if !out.is_empty() && !out.ends_with("\n\n") {
-        if out.ends_with('\n') {
-            out.push('\n');
-        } else {
-            out.push_str("\n\n");
-        }
-    }
-}
-
 /// Append a `## Notes` trailer listing slides with speaker notes. Only slides
 /// with non-empty notes appear, under `### Slide N` sub-headings.
 fn append_notes_markdown(slides: &[Slide], out: &mut String) {
@@ -962,7 +950,7 @@ fn append_notes_markdown(slides: &[Slide], out: &mut String) {
             continue;
         }
         if !any {
-            ensure_trailer_blank_line(out);
+            markup::ensure_trailer_blank_line(out);
             out.push_str("## Notes\n\n");
             any = true;
         }
@@ -981,7 +969,7 @@ fn append_notes_plain(slides: &[Slide], out: &mut String) {
             continue;
         }
         if !any {
-            ensure_trailer_blank_line(out);
+            markup::ensure_trailer_blank_line(out);
             out.push_str("--- Notes ---\n");
             any = true;
         }
