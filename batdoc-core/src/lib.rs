@@ -23,11 +23,16 @@ mod xlsx;
 mod xml_util;
 
 pub use error::{BatdocError, Result};
+pub use ocr::models_present;
 
 use std::io::Cursor;
 
 /// Supported document formats.
+///
+/// `#[non_exhaustive]`: new variants may be added in minor releases;
+/// downstream matches must include a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Format {
     /// Legacy OLE2 Word 97+ binary format.
     Doc,
@@ -119,12 +124,16 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
     if data.len() >= 3 && data[..3] == [0xFF, 0xD8, 0xFF] {
         return Ok(Format::Image); // JPEG
     }
-    if data.len() >= 6 && &data[..3] == b"GIF" {
+    if data.len() >= 6 && (&data[..6] == b"GIF87a" || &data[..6] == b"GIF89a") {
         return Ok(Format::Image); // GIF
     }
     if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         return Ok(Format::Image); // WebP
     }
+    // BMP's 2-byte "BM" signature is weak: any file starting with those
+    // bytes is routed to OCR and fails with "no text found in image"
+    // rather than "unrecognized format". Accepted trade-off — real-world
+    // collisions are rare.
     if data.len() >= 2 && &data[..2] == b"BM" {
         return Ok(Format::Image); // BMP
     }
@@ -268,6 +277,13 @@ mod tests {
     #[test]
     fn format_image_displays_as_image() {
         assert_eq!(Format::Image.to_string(), "IMAGE");
+    }
+
+    #[test]
+    fn detect_format_requires_full_gif_magic() {
+        assert_eq!(detect_format(b"GIF87a....").unwrap(), Format::Image);
+        assert_eq!(detect_format(b"GIF89a....").unwrap(), Format::Image);
+        assert!(detect_format(b"GIFzzz....").is_err());
     }
 
     #[test]
