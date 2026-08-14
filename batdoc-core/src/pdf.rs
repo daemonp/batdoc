@@ -8,6 +8,7 @@
 use crate::error::{BatdocError, Result};
 use lopdf::xobject::PdfImage;
 use std::fmt::Write as _;
+use std::io::Cursor;
 use std::panic::{self, AssertUnwindSafe};
 
 /// Extract pages of text from a PDF byte slice, returning one `String` per
@@ -60,43 +61,22 @@ fn clean_page(raw: &str) -> String {
     }
 }
 
-/// Produce the per-page text, OCR'ing empty pages when `ocr` is set.
-fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
-    let pages = extract_pages(data)?;
-    if !ocr {
-        return Ok(pages.iter().map(|p| clean_page(p)).collect());
-    }
-    let mut out = Vec::with_capacity(pages.len());
-    for (i, page) in pages.iter().enumerate() {
-        let cleaned = clean_page(page);
-        if !cleaned.is_empty() {
-            out.push(cleaned);
-        } else if let Some(ocr_text) = ocr_page(data, i)? {
-            out.push(clean_page(&ocr_text));
-        } else {
-            out.push(String::new());
-        }
-    }
-    Ok(out)
-}
+/// Maximum number of embedded images OCR'd per page (largest first).
+const MAX_OCR_IMAGES_PER_PAGE: usize = 4;
+/// Maximum decoded pixels per embedded image (~100 MP ≈ 300 MB RGB).
+/// Larger images are skipped so a single image cannot exhaust memory.
+const MAX_OCR_IMAGE_PIXELS: u64 = 100_000_000;
+/// Maximum width/height accepted when decoding embedded JPEGs. Strict
+/// decoder-side guard against a JPEG whose real dimensions exceed the
+/// dimensions declared in the PDF dictionary (`10_000²` = the pixel budget).
+const MAX_OCR_IMAGE_DIM: u32 = 10_000;
 
-/// OCR the embedded images of one page (0-based index). `None` when the page
-/// has no OCR-able images or no text was detected.
-fn ocr_page(data: &[u8], page_index: usize) -> Result<Option<String>> {
-    let Ok(doc) = lopdf::Document::load_mem(data) else {
-        return Ok(None);
-    };
-    let pages = doc.get_pages();
-    let Some(page_id) = pages.values().nth(page_index) else {
-        return Ok(None);
-    };
-    let Ok(images) = doc.get_page_images(*page_id) else {
-        return Ok(None);
-    };
-
-    // Rank by stored pixel area and decode only the largest 4 — the cap must
-    // bound peak memory too (compressed images expand when decoded).
-    let mut candidates: Vec<(&PdfImage<'_>, u64)> = images
+/// Select up to [`MAX_OCR_IMAGES_PER_PAGE`] OCR candidates, largest by
+/// declared pixel area first, skipping images whose decoded size would
+/// exceed [`MAX_OCR_IMAGE_PIXELS`]. The cap must bound peak memory, which
+/// the declared dimensions determine (compressed images expand when decoded).
+fn ocr_candidates<'a>(images: &'a [PdfImage<'a>]) -> Vec<&'a PdfImage<'a>> {
+    let mut candidates: Vec<(&PdfImage, u64)> = images
         .iter()
         .map(|img| {
             (
@@ -105,11 +85,76 @@ fn ocr_page(data: &[u8], page_index: usize) -> Result<Option<String>> {
                     * u64::try_from(img.height.max(0)).unwrap_or(0),
             )
         })
+        .filter(|(_, area)| *area > 0 && *area <= MAX_OCR_IMAGE_PIXELS)
         .collect();
     candidates.sort_by_key(|(_, area)| std::cmp::Reverse(*area));
+    candidates
+        .into_iter()
+        .take(MAX_OCR_IMAGES_PER_PAGE)
+        .map(|(img, _)| img)
+        .collect()
+}
 
+/// Decode JPEG bytes with strict dimension limits, so a stream whose real
+/// dimensions exceed the PDF dictionary's claim cannot allocate beyond the
+/// OCR pixel budget.
+fn decode_jpeg_bounded(bytes: &[u8]) -> Option<image::RgbImage> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes));
+    reader.set_format(image::ImageFormat::Jpeg);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_OCR_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_OCR_IMAGE_DIM);
+    reader.limits(limits);
+    reader.decode().ok().map(image::DynamicImage::into_rgb8)
+}
+
+/// Produce the per-page text, OCR'ing empty pages when `ocr` is set.
+fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
+    let pages = extract_pages(data)?;
+    if !ocr {
+        return Ok(pages.iter().map(|p| clean_page(p)).collect());
+    }
+    // Parse the document with lopdf ONCE for image extraction; if that
+    // fails, empty pages fall through as "no text" (same as non-OCR).
+    let doc_pages = lopdf::Document::load_mem(data)
+        .ok()
+        .map(|doc| (doc.get_pages().into_values().collect::<Vec<_>>(), doc));
+    let mut out = Vec::with_capacity(pages.len());
+    for (i, page) in pages.iter().enumerate() {
+        let cleaned = clean_page(page);
+        if !cleaned.is_empty() {
+            out.push(cleaned);
+            continue;
+        }
+        let ocr_text = match &doc_pages {
+            Some((page_ids, doc)) => ocr_page(doc, page_ids, i)?,
+            None => None,
+        };
+        out.push(ocr_text.map_or_else(String::new, |t| clean_page(&t)));
+    }
+    Ok(out)
+}
+
+/// OCR the embedded images of one page (0-based index into `page_ids`).
+/// `None` when the page has no OCR-able images or no text was detected.
+///
+/// Page-order invariant: `pdf_extract` iterates the page tree in document
+/// order and lopdf's `get_pages()` numbers pages from the same tree in
+/// ascending order, so `page_ids[i]` corresponds to `pages[i]` produced by
+/// [`extract_pages`].
+fn ocr_page(
+    doc: &lopdf::Document,
+    page_ids: &[lopdf::ObjectId],
+    page_index: usize,
+) -> Result<Option<String>> {
+    let Some(page_id) = page_ids.get(page_index) else {
+        return Ok(None);
+    };
+    let Ok(images) = doc.get_page_images(*page_id) else {
+        return Ok(None);
+    };
     let mut texts = Vec::new();
-    for (img, _) in candidates.into_iter().take(4) {
+    for img in ocr_candidates(&images) {
         let Some(rgb) = decode_pdf_image(img) else {
             continue;
         };
@@ -131,9 +176,7 @@ fn ocr_page(data: &[u8], page_index: usize) -> Result<Option<String>> {
 fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
     let filters: Vec<&str> = img.filters.iter().flatten().map(String::as_str).collect();
     if filters.contains(&"DCTDecode") {
-        return image::load_from_memory(img.content)
-            .ok()
-            .map(image::DynamicImage::into_rgb8);
+        return decode_jpeg_bounded(img.content);
     }
     if filters.iter().any(|f| *f != "FlateDecode") {
         return None; // unknown encoding
@@ -318,6 +361,37 @@ startxref\n\
         assert!(!plain_err.contains("OCR"));
         let ocr_err = extract_plain(data, true).unwrap_err().to_string();
         assert!(ocr_err.contains("OCR found nothing"));
+    }
+
+    #[test]
+    fn ocr_candidates_caps_and_ranks() {
+        let dict = lopdf::Dictionary::new();
+        let mk = |width: i64, height: i64| PdfImage {
+            id: (1, 0),
+            width,
+            height,
+            color_space: Some("DeviceRGB".to_string()),
+            filters: Some(Vec::new()),
+            bits_per_component: Some(8),
+            content: &[],
+            origin_dict: &dict,
+        };
+        let images = vec![
+            mk(100, 100),       // 10k px
+            mk(20_000, 20_000), // 400 MP — over budget, excluded
+            mk(1000, 1000),     // 1 MP — largest valid
+            mk(500, 500),
+            mk(200, 200),
+            mk(50, 50),
+            mk(0, 100), // zero area — excluded
+        ];
+        let picked = ocr_candidates(&images);
+        // 5 valid images → capped at 4, largest first; oversized/zero excluded.
+        assert_eq!(picked.len(), 4);
+        assert_eq!((picked[0].width, picked[0].height), (1000, 1000));
+        assert_eq!((picked[1].width, picked[1].height), (500, 500));
+        assert_eq!((picked[2].width, picked[2].height), (200, 200));
+        assert_eq!((picked[3].width, picked[3].height), (100, 100));
     }
 
     #[test]
