@@ -91,7 +91,7 @@ cat FILE | batdoc [OPTIONS]
   -p, --plain       plain text, no highlighting
   -m, --markdown    force markdown (default on tty)
   -i, --images      embed images as inline base64 data URIs
-  -o, --ocr         OCR text from images: docx/pptx embedded images and
+      --ocr         OCR text from images: docx/pptx embedded images and
                     textless PDF pages; image files are always OCR'd
   -h, --help        help
 ```

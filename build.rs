@@ -30,7 +30,6 @@ fn main() {
         ))
         .flag(
             Flag::new()
-                .short("-o")
                 .long("--ocr")
                 .help(
                     "OCR text from images using the ocrs engine. For .docx/.pptx, \

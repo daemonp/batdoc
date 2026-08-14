@@ -6,7 +6,7 @@
 //! with `--ocr`. When stdout is a terminal the output is pretty-printed as
 //! syntax-highlighted markdown via `bat`; when piped, plain text is emitted.
 
-use batdoc_core::BatdocError;
+use batdoc_core::{BatdocError, Format};
 
 use bat::{Input, PrettyPrinter};
 use is_terminal::IsTerminal;
@@ -24,7 +24,7 @@ Options:
   -p, --plain       Force plain text output (no colors, no decorations)
   -m, --markdown    Output as markdown (default when terminal detected)
   -i, --images      Embed images as inline base64 data URIs in markdown
-  -o, --ocr         OCR text from images (embedded doc images, textless PDF pages)
+      --ocr         OCR text from images (embedded doc images, textless PDF pages)
   -h, --help        Show this help
 
 When stdout is a terminal, output is pretty-printed as syntax-highlighted
@@ -78,7 +78,7 @@ fn main() {
             "-p" | "--plain" => mode = Mode::Plain,
             "-m" | "--markdown" => mode = Mode::Markdown,
             "-i" | "--images" => images = true,
-            "-o" | "--ocr" => ocr = true,
+            "--ocr" => ocr = true,
             "-" => files.push("-".to_string()),
             s if s.starts_with('-') => {
                 eprintln!("batdoc: unknown option: {s}");
@@ -158,6 +158,18 @@ fn run(
 
     let opts = ExtractOptions { images, ocr };
 
+    // OCR input (flagged, or image input which is always OCR'd) downloads
+    // models on first use; say so once per process, before it happens.
+    if (ocr || format == Format::Image) && !batdoc_core::models_present() {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!(
+                "batdoc: OCR models not cached; downloading on first use \
+                 (set BATDOC_MODELS_DIR to override the cache location)"
+            );
+        });
+    }
+
     match mode {
         Mode::Plain => {
             let text = batdoc_core::extract_plain_with(data, format, opts)?;
@@ -165,14 +177,14 @@ fn run(
         }
         Mode::Markdown => {
             let md = batdoc_core::extract_markdown_with(data, format, opts)?;
-            if is_tty {
+            if is_tty && format != Format::Image {
                 pretty_print(&md, filename)?;
             } else {
                 io::stdout().write_all(md.as_bytes())?;
             }
         }
         Mode::Auto => {
-            if is_tty {
+            if is_tty && format != Format::Image {
                 let md = batdoc_core::extract_markdown_with(data, format, opts)?;
                 pretty_print(&md, filename)?;
             } else {
