@@ -8,7 +8,8 @@ use crate::error::{BatdocError, Result};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Detection model (text regions). 2.4 MB.
 const DETECTION_MODEL_URL: &str =
@@ -18,6 +19,11 @@ const RECOGNITION_MODEL_URL: &str =
     "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten";
 const DETECTION_MODEL_FILE: &str = "text-detection.rten";
 const RECOGNITION_MODEL_FILE: &str = "text-recognition.rten";
+
+/// Network timeout for model downloads.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
+/// Age after which leftover `*.tmp.<pid>` download files are swept.
+const STALE_TMP_AGE: Duration = Duration::from_hours(1);
 
 /// Resolve the model cache directory, in priority order. Injectable for testing.
 fn cache_dir_from(get_env: impl Fn(&str) -> Option<String>) -> PathBuf {
@@ -50,10 +56,6 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    eprintln!(
-        "batdoc: downloading OCR model to {} (first use; set BATDOC_MODELS_DIR to override)",
-        path.display()
-    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             BatdocError::Document(format!(
@@ -64,12 +66,15 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     }
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model");
     let tmp = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
-    let response = ureq::get(url).call().map_err(|e| {
-        BatdocError::Document(format!(
-            "failed to download OCR model from {url}: {e}\n\
+    let response = ureq::get(url)
+        .timeout(DOWNLOAD_TIMEOUT)
+        .call()
+        .map_err(|e| {
+            BatdocError::Document(format!(
+                "failed to download OCR model from {url}: {e}\n\
              (set BATDOC_MODELS_DIR to a directory containing the model files)"
-        ))
-    })?;
+            ))
+        })?;
     let mut buf = Vec::new();
     response
         .into_reader()
@@ -91,6 +96,33 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove stale `*.tmp.<pid>` download leftovers in `dir` (from interrupted
+/// runs). Only files older than [`STALE_TMP_AGE`] are touched, so an active
+/// concurrent download is never disturbed. Best-effort: errors ignored.
+fn sweep_stale_tmp_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+        if is_stale_tmp_file(name, modified) {
+            std::fs::remove_file(&path).ok();
+        }
+    }
+}
+
+/// `true` for `*.tmp.<pid>` download leftovers older than [`STALE_TMP_AGE`].
+fn is_stale_tmp_file(name: &str, modified: Option<std::time::SystemTime>) -> bool {
+    name.contains(".tmp.")
+        && modified
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > STALE_TMP_AGE)
+}
+
 /// Paths of the two OCR model files once present locally.
 struct ModelPaths {
     detection: PathBuf,
@@ -100,6 +132,7 @@ struct ModelPaths {
 /// Ensure both model files exist locally, downloading when needed.
 fn ensure_models() -> Result<ModelPaths> {
     let dir = cache_dir();
+    sweep_stale_tmp_files(&dir);
     let detection = dir.join(DETECTION_MODEL_FILE);
     let recognition = dir.join(RECOGNITION_MODEL_FILE);
     ensure_file(&detection, DETECTION_MODEL_URL)?;
@@ -110,9 +143,7 @@ fn ensure_models() -> Result<ModelPaths> {
     })
 }
 
-type EngineResult = std::result::Result<OcrEngine, String>;
-
-fn build_engine() -> EngineResult {
+fn build_engine() -> std::result::Result<OcrEngine, String> {
     let paths = ensure_models().map_err(|e| e.to_string())?;
     let detection_model = rten::Model::load_file(&paths.detection)
         .map_err(|e| format!("failed to load OCR detection model: {e}"))?;
@@ -127,12 +158,30 @@ fn build_engine() -> EngineResult {
 }
 
 /// Process-wide OCR engine, built once on first use.
+///
+/// Failures are NOT cached: a transient error (e.g. a network failure
+/// during the first model download) is returned to the caller, and a later
+/// call retries. In a concurrent first-build race the loser discards its
+/// engine and shares the stored one.
 fn engine() -> Result<&'static OcrEngine> {
-    static ENGINE: LazyLock<EngineResult> = LazyLock::new(build_engine);
-    match &*ENGINE {
-        Ok(engine) => Ok(engine),
-        Err(message) => Err(BatdocError::Document(message.clone())),
+    static ENGINE: OnceLock<OcrEngine> = OnceLock::new();
+    if let Some(engine) = ENGINE.get() {
+        return Ok(engine);
     }
+    let built = build_engine().map_err(BatdocError::Document)?;
+    Ok(ENGINE.get_or_init(|| built))
+}
+
+/// `true` when both OCR model files already exist in the cache directory
+/// (i.e. OCR will not trigger a download). Used by the CLI to print a
+/// first-use download notice.
+#[must_use]
+pub fn models_present() -> bool {
+    models_present_in(&cache_dir())
+}
+
+fn models_present_in(dir: &Path) -> bool {
+    dir.join(DETECTION_MODEL_FILE).exists() && dir.join(RECOGNITION_MODEL_FILE).exists()
 }
 
 /// OCR an already-decoded RGB image. `None` when no text was detected.
@@ -247,5 +296,39 @@ mod tests {
     fn extract_image_plain_undecodable_errors() {
         let err = extract_image_plain(b"garbage").unwrap_err().to_string();
         assert!(err.contains("no text found in image"));
+    }
+
+    #[test]
+    fn stale_tmp_file_detection() {
+        use std::time::SystemTime;
+        // Fresh download in progress: recent mtime → keep.
+        assert!(!is_stale_tmp_file(
+            "text-detection.rten.tmp.123",
+            Some(SystemTime::now())
+        ));
+        // Old leftover from a crashed run → sweep.
+        assert!(is_stale_tmp_file(
+            "text-detection.rten.tmp.123",
+            Some(SystemTime::now() - 2 * STALE_TMP_AGE)
+        ));
+        // Not a tmp file → never sweep, however old.
+        assert!(!is_stale_tmp_file(
+            "text-detection.rten",
+            Some(SystemTime::now() - 2 * STALE_TMP_AGE)
+        ));
+        // Unknown mtime → leave it alone.
+        assert!(!is_stale_tmp_file("x.tmp.1", None));
+    }
+
+    #[test]
+    fn models_present_in_requires_both_files() {
+        let tmp = std::env::temp_dir().join(format!("batdoc-ocr-t2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(!models_present_in(&tmp));
+        std::fs::write(tmp.join(DETECTION_MODEL_FILE), b"x").unwrap();
+        assert!(!models_present_in(&tmp));
+        std::fs::write(tmp.join(RECOGNITION_MODEL_FILE), b"x").unwrap();
+        assert!(models_present_in(&tmp));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
