@@ -13,7 +13,9 @@ makedepends="
 	"
 subpackages="$pkgname-doc"
 source="https://github.com/daemonp/batdoc/archive/v$pkgver/batdoc-$pkgver.tar.gz"
-options="net"
+# !lto: abuild injects -flto=auto into CFLAGS; ring's C objects become GCC
+# LTO bitcode that rust-lld cannot link (undefined ring_core_* symbols).
+options="net !lto"
 
 export CARGO_PROFILE_RELEASE_OPT_LEVEL="z"
 

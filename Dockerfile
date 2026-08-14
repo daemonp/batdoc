@@ -119,6 +119,7 @@ pkgdesc="cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- re
 url="https://github.com/daemonp/batdoc"\n\
 arch="x86_64"\n\
 license="MIT"\n\
+options="!lto"\n\
 makedepends=""\n\
 source="batdoc-$pkgver.tar.gz"\n\
 \n\

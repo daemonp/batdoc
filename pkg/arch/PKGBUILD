@@ -9,6 +9,9 @@ url='https://github.com/daemonp/batdoc'
 license=('MIT')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
+# Disable makepkg's -flto=auto injection: ring's C objects become GCC LTO
+# bitcode that rust-lld cannot link (undefined ring_core_* symbols).
+options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 b2sums=('SKIP')
 
