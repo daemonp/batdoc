@@ -148,8 +148,9 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
 pub struct ExtractOptions {
     /// Include embedded images as base64 markdown (markdown mode only).
     pub images: bool,
-    /// OCR embedded images (DOCX/PPTX) and textless PDF pages. Has no effect
-    /// on `Format::Image` — image input is always OCR'd.
+    /// OCR embedded images (DOCX/PPTX). Textless PDF pages are OCR'd
+    /// automatically as a fallback regardless of this flag. Has no effect on
+    /// `Format::Image` — image input is always OCR'd.
     pub ocr: bool,
 }
 
@@ -165,9 +166,10 @@ pub fn extract_plain(data: &[u8], format: Format) -> Result<String> {
 
 /// Extract plain text with explicit options.
 ///
-/// `opts.ocr` enables OCR for DOCX/PPTX embedded images and textless PDF
-/// pages; the `images` option is ignored in plain mode. `Format::Image`
-/// input is always OCR'd regardless of options and returns plain OCR text.
+/// `opts.ocr` enables OCR for DOCX/PPTX embedded images; the `images` option
+/// is ignored in plain mode. Textless PDF pages are OCR'd automatically as
+/// a fallback, with or without `opts.ocr`. `Format::Image` input is always
+/// OCR'd regardless of options and returns plain OCR text.
 ///
 /// # Errors
 ///
@@ -202,9 +204,10 @@ pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<Str
 /// Extract Markdown with explicit options.
 ///
 /// `opts.images` embeds DOCX/XLSX/PPTX images as base64 markdown;
-/// `opts.ocr` OCRs DOCX/PPTX embedded images and textless PDF pages,
-/// rendered as blockquotes. `Format::Image` input is always OCR'd
-/// regardless of options and returns plain OCR text (no markdown).
+/// `opts.ocr` OCRs DOCX/PPTX embedded images, rendered as blockquotes.
+/// Textless PDF pages are OCR'd automatically as a fallback. `Format::Image`
+/// input is always OCR'd regardless of options and returns plain OCR text
+/// (no markdown).
 ///
 /// # Errors
 ///

@@ -134,6 +134,23 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Extract per-page text, transparently falling back to OCR when the user did
+/// not pass `--ocr` but the document has no text layer at all.
+///
+/// Returns the per-page text and whether OCR was actually performed (which
+/// drives the wording of the no-text error if OCR also finds nothing).
+fn extract_pages_with_fallback(data: &[u8], ocr: bool) -> Result<(Vec<String>, bool)> {
+    let pages = extract_pages_with_ocr(data, ocr)?;
+    if ocr || pages.iter().any(|p| !p.is_empty()) {
+        return Ok((pages, ocr));
+    }
+    // Every page is textless and OCR wasn't requested: this is a scan, so
+    // retry with OCR. A textless-but-empty document (no images) costs only a
+    // re-parse here; `ocr_page` finds nothing and reports it at the call site.
+    let ocr_pages = extract_pages_with_ocr(data, true)?;
+    Ok((ocr_pages, true))
+}
+
 /// OCR the embedded images of one page (0-based index into `page_ids`).
 /// `None` when the page has no OCR-able images or no text was detected.
 ///
@@ -170,7 +187,10 @@ fn ocr_page(
 
 /// Decode a `lopdf::PdfImage` into an RGB image usable by the OCR engine.
 ///
-/// Handles `DCTDecode` (JPEG bytes) and raw/`FlateDecode` 8-bit `DeviceGray`/`DeviceRGB`.
+/// Handles `DCTDecode` (JPEG bytes) and raw/`FlateDecode` 8-bit `DeviceGray`/`DeviceRGB`,
+/// plus ICC-based spaces whose `ColorSpace` is an indirect reference (which lopdf
+/// leaves as `None`) or `ICCBased` — component count is read from the decoded
+/// buffer length.
 /// Returns `None` for other encodings (`CCITT`, `JPX`, `JBIG2`, `Indexed`, `CMYK`).
 fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
     let filters: Vec<&str> = img.filters.iter().flatten().map(String::as_str).collect();
@@ -194,16 +214,24 @@ fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
     };
     // Validate the exact buffer length so `ImageSource::from_bytes` never
     // receives a mis-sized buffer (it errors on non-exact lengths).
-    let channels: u64 = match (
-        img.color_space.as_deref(),
-        img.bits_per_component.unwrap_or(8),
-    ) {
+    let area = u64::from(width) * u64::from(height);
+    let len = u64::try_from(content.len()).unwrap_or(0);
+    let bpc = img.bits_per_component.unwrap_or(8);
+    let channels: u64 = match (img.color_space.as_deref(), bpc) {
         (Some("DeviceRGB"), 8) => 3,
         (Some("DeviceGray"), 8) => 1,
+        // Indirect / ICCBased color spaces surface as `None` (a `/ColorSpace N 0 R`
+        // reference is never dereferenced by lopdf) or `"ICCBased"`; there is no
+        // channel count on `PdfImage`, so the decoded buffer length disambiguates.
+        (Some("ICCBased"), 8) | (None, 8) if area > 0 && len != 0 && len % area == 0 => {
+            match len / area {
+                1 | 3 => len / area,
+                _ => return None,
+            }
+        }
         _ => return None,
     };
-    let expected = u64::from(width) * u64::from(height) * channels;
-    if u64::try_from(content.len()).ok() != Some(expected) {
+    if len != area * channels {
         return None;
     }
     if channels == 3 {
@@ -225,7 +253,7 @@ fn no_text_error(ocr: bool) -> BatdocError {
 
 /// Extract plain text from a PDF.
 pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> Result<String> {
-    let pages = extract_pages_with_ocr(data, opts.ocr)?;
+    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
     let nonempty: Vec<&str> = pages
         .iter()
         .map(String::as_str)
@@ -233,7 +261,7 @@ pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> Result<String>
         .collect();
 
     if nonempty.is_empty() {
-        return Err(no_text_error(opts.ocr));
+        return Err(no_text_error(ocr_attempted));
     }
 
     Ok(nonempty.join("\n"))
@@ -244,7 +272,7 @@ pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> Result<String>
 /// Each page gets a `## Page N` heading. Single-page documents omit the
 /// heading since it would be redundant.
 pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<String> {
-    let pages = extract_pages_with_ocr(data, opts.ocr)?;
+    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
     let nonempty: Vec<(usize, &str)> = pages
         .iter()
         .enumerate()
@@ -258,7 +286,7 @@ pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<Stri
         .collect();
 
     if nonempty.is_empty() {
-        return Err(no_text_error(opts.ocr));
+        return Err(no_text_error(ocr_attempted));
     }
 
     let mut out = String::new();
@@ -335,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_plain_ocr_flag_errors_differ() {
+    fn extract_plain_textless_pdf_auto_ocrs_and_reports() {
         // A structurally valid PDF with no page tree (so text extraction succeeds
         // but yields zero pages); large enough for `%%EOF`/`startxref` detection.
         let data = b"%PDF-1.4\n\
@@ -355,21 +383,19 @@ trailer\n\
 startxref\n\
 110\n\
 %%EOF\n";
-        let plain_err = extract_plain(data, crate::ExtractOptions::default())
-            .unwrap_err()
-            .to_string();
-        assert!(plain_err.contains("scanned/image-only"));
-        assert!(!plain_err.contains("OCR"));
-        let ocr_err = extract_plain(
-            data,
+        // The PDF falls back to OCR even without --ocr, so a textless-but-empty
+        // document reports the OCR-failed message in both the explicit and the
+        // implicit (auto-fallback) OCR cases.
+        for opts in [
+            crate::ExtractOptions::default(),
             crate::ExtractOptions {
                 ocr: true,
                 ..crate::ExtractOptions::default()
             },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(ocr_err.contains("OCR found nothing"));
+        ] {
+            let err = extract_plain(data, opts).unwrap_err().to_string();
+            assert!(err.contains("OCR found nothing"), "got: {err}");
+        }
     }
 
     #[test]
@@ -454,6 +480,53 @@ startxref\n\
         assert_eq!(rgb.dimensions(), (2, 2));
         assert_eq!(rgb.get_pixel(1, 0), &image::Rgb([255, 255, 255])); // Luma 255
         assert_eq!(rgb.get_pixel(0, 1), &image::Rgb([128, 128, 128])); // Luma 128
+    }
+
+    #[test]
+    fn decode_pdf_image_indirect_iccbased_gray() {
+        let mut origin = lopdf::Dictionary::new();
+        origin.set("Width", 2);
+        origin.set("Height", 2);
+        origin.set("BitsPerComponent", 8);
+        origin.set("Filter", lopdf::Object::Name(b"FlateDecode".to_vec()));
+        // The `/ColorSpace` here is an indirect reference to an ICCBased array,
+        // so lopdf reports `color_space = None` (reference never dereferenced).
+        let compressed = [
+            0x78, 0x9C, 0x01, 0x04, 0x00, 0xFB, 0xFF, 0x00, 0xFF, 0x80, 0x40, 0x04, 0x41, 0x01,
+            0xC0,
+        ];
+        let img = PdfImage {
+            id: (1, 0),
+            width: 2,
+            height: 2,
+            color_space: None,
+            filters: Some(vec!["FlateDecode".to_string()]),
+            bits_per_component: Some(8),
+            content: &compressed,
+            origin_dict: &origin,
+        };
+        let rgb = decode_pdf_image(&img).unwrap();
+        assert_eq!(rgb.dimensions(), (2, 2));
+        assert_eq!(rgb.get_pixel(1, 0), &image::Rgb([255, 255, 255])); // Luma 255
+        assert_eq!(rgb.get_pixel(0, 1), &image::Rgb([128, 128, 128])); // Luma 128
+    }
+
+    #[test]
+    fn decode_pdf_image_no_color_space_non_byte_multiple_skipped() {
+        let mut dict = lopdf::Dictionary::new();
+        dict.set("Subtype", lopdf::Object::Name(b"Image".to_vec()));
+        dict.set("Filter", lopdf::Object::Name(b"FlateDecode".to_vec()));
+        let img = PdfImage {
+            id: (1, 0),
+            width: 2,
+            height: 2,
+            color_space: None,
+            filters: Some(vec!["FlateDecode".to_string()]),
+            bits_per_component: Some(1), // packed bits: length not a multiple of area
+            content: &[0xFF],
+            origin_dict: &dict,
+        };
+        assert!(decode_pdf_image(&img).is_none());
     }
 
     #[test]

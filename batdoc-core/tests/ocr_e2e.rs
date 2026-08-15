@@ -278,12 +278,11 @@ fn ocr_docx_embedded_image_markdown() {
 #[ignore = "requires OCR models (downloaded on first use)"]
 fn ocr_pdf_embedded_image_page() {
     let pdf = build_pdf_with_image(&render_test_image());
-    // Today's behavior: no --ocr → clean error.
-    let err = batdoc_core::extract_plain_with(&pdf, Format::Pdf, ExtractOptions::default())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("scanned/image-only"), "got: {err}");
-    // With --ocr → OCR'd text.
+    // A textless PDF auto-falls back to OCR even without --ocr…
+    let auto = batdoc_core::extract_plain_with(&pdf, Format::Pdf, ExtractOptions::default())
+        .unwrap();
+    assert!(auto.contains("123"), "auto OCR text missing: {auto:?}");
+    // …and an explicit --ocr behaves identically.
     let text = batdoc_core::extract_plain_with(
         &pdf,
         Format::Pdf,

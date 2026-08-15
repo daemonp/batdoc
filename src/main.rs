@@ -2,7 +2,8 @@
 //!
 //! Reads legacy OLE2 `.doc` and `.xls`, modern OOXML `.docx`, `.xlsx`, and
 //! `.pptx`, PDF, and raster image files and dumps their text to stdout. Image
-//! files are always OCR'd; embedded images and textless PDF pages are OCR'd
+//! files are always OCR'd; textless PDF pages are OCR'd automatically as a
+//! fallback (a textless PDF is a scan). Embedded images in DOCX/PPTX are OCR'd
 //! with `--ocr`. When stdout is a terminal the output is pretty-printed as
 //! syntax-highlighted markdown via `bat`; when piped, plain text is emitted.
 
@@ -24,7 +25,7 @@ Options:
   -p, --plain       Force plain text output (no colors, no decorations)
   -m, --markdown    Output as markdown (default when terminal detected)
   -i, --images      Embed images as inline base64 data URIs in markdown
-      --ocr         OCR text from images (embedded doc images, textless PDF pages)
+      --ocr         OCR embedded images (docx/pptx); textless PDFs already auto-OCR
   -h, --help        Show this help
 
 When stdout is a terminal, output is pretty-printed as syntax-highlighted
@@ -37,8 +38,9 @@ Ignored in plain text mode and for formats without image support (.doc, .xls, .p
 
 --ocr uses the ocrs engine (models downloaded on first use to
 $BATDOC_MODELS_DIR, $XDG_CACHE_HOME/batdoc/models, or ~/.cache/batdoc/models).
-For .docx/.pptx, embedded images are OCR'd; for .pdf, pages without a text
-layer are OCR'd from their embedded images. Image files (.png/.jpg/.gif/
+For .docx/.pptx, embedded images are OCR'd. PDFs need no flag: any page
+without a text layer is OCR'd automatically from its embedded images as a
+fallback (a textless PDF is a scan). Image files (.png/.jpg/.gif/
 .webp/.bmp) are always OCR'd, with or without --ocr.
 
 Multiple files can be specified and will be processed in order.
