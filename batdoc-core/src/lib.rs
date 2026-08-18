@@ -274,6 +274,7 @@ fn write_plain(
         Format::Xlsx => xlsx::extract_plain_to(data, sink),
         Format::Xls => xls::extract_plain_to(data, sink),
         Format::Docx => docx::extract_plain_to(data, opts, sink),
+        Format::Pptx => pptx::extract_plain_to(data, opts, sink),
         _ => {
             let text = extract_plain_with(data, format, opts)?;
             sink.write_str(&text)
@@ -315,6 +316,7 @@ fn write_markdown(
         Format::Xlsx => xlsx::extract_markdown_to(data, opts.images, sink),
         Format::Xls => xls::extract_markdown_to(data, sink),
         Format::Docx => docx::extract_markdown_to(data, opts, sink),
+        Format::Pptx => pptx::extract_markdown_to(data, opts, sink),
         _ => {
             let text = extract_markdown_with(data, format, opts)?;
             sink.write_str(&text)
