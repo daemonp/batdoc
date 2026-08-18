@@ -178,15 +178,16 @@ fn run(
 
     match mode {
         Mode::Plain => {
-            let text = batdoc_core::extract_plain_with(data, format, opts)?;
-            io::stdout().write_all(text.as_bytes())?;
+            let mut sink = batdoc_core::IoSink(io::stdout());
+            batdoc_core::extract_plain_to(data, format, opts, &mut sink)?;
         }
         Mode::Markdown => {
-            let md = batdoc_core::extract_markdown_with(data, format, opts)?;
             if is_tty && format != Format::Image {
+                let md = batdoc_core::extract_markdown_with(data, format, opts)?;
                 pretty_print(&md, filename)?;
             } else {
-                io::stdout().write_all(md.as_bytes())?;
+                let mut sink = batdoc_core::IoSink(io::stdout());
+                batdoc_core::extract_markdown_to(data, format, opts, &mut sink)?;
             }
         }
         Mode::Auto => {
@@ -194,8 +195,8 @@ fn run(
                 let md = batdoc_core::extract_markdown_with(data, format, opts)?;
                 pretty_print(&md, filename)?;
             } else {
-                let text = batdoc_core::extract_plain_with(data, format, opts)?;
-                io::stdout().write_all(text.as_bytes())?;
+                let mut sink = batdoc_core::IoSink(io::stdout());
+                batdoc_core::extract_plain_to(data, format, opts, &mut sink)?;
             }
         }
     }
