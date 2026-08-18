@@ -13,7 +13,11 @@ use zip::ZipArchive;
 
 use crate::arena::StringArena;
 use crate::dateconv;
-use crate::sheet::Sheet;
+use crate::error::BatdocError;
+use crate::sheet::{
+    write_markdown_data_row, write_markdown_header, write_markdown_separator, write_plain_row,
+    TableShape, MAX_COLS,
+};
 use crate::xml_util::{self, get_attr, Rels};
 use crate::ExtractSink;
 
@@ -65,64 +69,74 @@ pub(crate) fn extract_plain_to(
 /// When `images` is true, embedded images from drawings are extracted
 /// and appended as reference-style base64 images with definitions at the end.
 pub(crate) fn extract_markdown(data: &[u8], images: bool) -> crate::error::Result<String> {
-    let sheets = parse_xlsx(data)?;
-    let mut md = crate::sheet::render_markdown(&sheets);
-
-    if images {
-        let cursor = Cursor::new(data);
-        let mut archive = ZipArchive::new(cursor)?;
-        let sheet_info = discover_sheets(&mut archive)?;
-        append_sheet_images(&mut md, &sheet_info, &mut archive);
-    }
-
-    Ok(md)
+    let mut out = String::new();
+    extract_markdown_to(data, images, &mut out)?;
+    Ok(out)
 }
 
-// ── Parsing ────────────────────────────────────────────────────────
-
-/// Parse the xlsx archive into a list of sheets.
-fn parse_xlsx(data: &[u8]) -> crate::error::Result<Vec<Sheet>> {
+/// Stream markdown from an .xlsx file into `sink`.
+pub(crate) fn extract_markdown_to(
+    data: &[u8],
+    images: bool,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
     let cursor = Cursor::new(data);
     let mut archive = ZipArchive::new(cursor)?;
 
-    // 1. Load shared strings table (optional — some files use inline strings)
-    let shared_strings = parse_shared_strings(&mut archive);
-
-    // 2. Load styles (for date format detection)
+    let shared_strings = parse_shared_strings_arena(&mut archive);
     let styles = parse_styles(&mut archive);
-
-    // 3. Discover sheets: name + file path
     let sheet_info = discover_sheets(&mut archive)?;
 
-    // 4. Parse each sheet
-    let mut sheets = Vec::new();
-    for (name, path) in &sheet_info {
-        let mut xml = String::new();
-        match archive.by_name(path) {
-            Ok(mut entry) => {
-                entry.read_to_string(&mut xml)?;
-            }
-            Err(_) => continue,
-        }
+    let mut shapes = Vec::with_capacity(sheet_info.len());
+    for (_, path) in &sheet_info {
+        shapes.push(scan_sheet_shape(
+            &mut archive,
+            path,
+            &shared_strings,
+            &styles,
+        )?);
+    }
+    let multiple = shapes.iter().filter(|s| s.is_some()).count() > 1;
 
-        // Load hyperlink relationships for this sheet
+    for ((name, path), shape) in sheet_info.iter().zip(shapes.iter()) {
+        let Some(shape) = shape else {
+            continue;
+        };
         let sheet_rels_path = xml_util::rels_path(path);
         let rels = xml_util::load_rels(&mut archive, &sheet_rels_path);
-
-        let mut rows = parse_sheet_xml(&xml, &shared_strings, &styles);
-
-        // Apply hyperlinks: parse <hyperlinks> from sheet XML and
-        // resolve URLs from the rels map
-        apply_hyperlinks(&xml, &rels, &mut rows);
-
-        sheets.push(Sheet {
-            name: name.clone(),
-            rows,
-        });
+        let hyperlinks = if rels.is_empty() {
+            HashMap::new()
+        } else {
+            load_sheet_hyperlinks(&mut archive, path, &rels)
+        };
+        if multiple {
+            sink.write_str("## ")?;
+            sink.write_str(name)?;
+            sink.write_str("\n\n")?;
+        }
+        emit_sheet_markdown(
+            &mut archive,
+            path,
+            shape,
+            &shared_strings,
+            &styles,
+            &hyperlinks,
+            sink,
+        )?;
     }
 
-    Ok(sheets)
+    if images {
+        let mut extra = String::new();
+        append_sheet_images(&mut extra, &sheet_info, &mut archive);
+        if !extra.is_empty() {
+            sink.write_str(&extra)?;
+        }
+    }
+
+    Ok(())
 }
+
+// ── Parsing ────────────────────────────────────────────────────────
 
 fn parse_shared_strings_arena(archive: &mut ZipArchive<Cursor<&[u8]>>) -> StringArena {
     let mut arena = StringArena::new();
@@ -228,8 +242,10 @@ fn emit_sheet_plain(
         buf.clear();
         match kind {
             1 => {
-                let cells = parse_row_arena(&mut reader, &mut buf, shared_strings, styles);
-                let line = format_plain_row(&cells, hyperlinks);
+                let cells = parse_row_arena(&mut reader, &mut buf, shared_strings, styles)?;
+                let dense = densify_plain_row(&cells, hyperlinks);
+                let mut line = String::new();
+                write_plain_row(&mut line, dense.iter().map(String::as_str))?;
                 if !line.is_empty() {
                     if !wrote_header {
                         if *emitted_any {
@@ -241,7 +257,6 @@ fn emit_sheet_plain(
                         *emitted_any = true;
                     }
                     sink.write_str(&line)?;
-                    sink.write_str("\n")?;
                 }
             }
             2 => break,
@@ -252,28 +267,162 @@ fn emit_sheet_plain(
     Ok(())
 }
 
-fn format_plain_row(
+fn densify_plain_row(
     cells: &[(usize, String, String)],
     hyperlinks: &HashMap<String, String>,
-) -> String {
+) -> Vec<String> {
     let Some(max_col) = cells.iter().map(|(col, _, _)| *col).max() else {
-        return String::new();
+        return Vec::new();
     };
     let mut dense = vec![String::new(); max_col + 1];
     for (col, value, cell_ref) in cells {
         if *col >= dense.len() {
             continue;
         }
-        dense[*col] = if !value.is_empty() {
-            match hyperlinks.get(cell_ref) {
-                Some(url) => format!("[{value}]({url})"),
-                None => value.clone(),
-            }
-        } else {
-            String::new()
-        };
+        dense[*col] = apply_cell_hyperlink(value, cell_ref, hyperlinks);
     }
-    dense.join("\t").trim_end().to_string()
+    dense
+}
+
+fn apply_cell_hyperlink(
+    value: &str,
+    cell_ref: &str,
+    hyperlinks: &HashMap<String, String>,
+) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    match hyperlinks.get(cell_ref) {
+        Some(url) => format!("[{value}]({url})"),
+        None => value.to_string(),
+    }
+}
+
+fn check_col(col: usize) -> crate::error::Result<()> {
+    if col >= MAX_COLS {
+        Err(BatdocError::Document("sheet exceeds 512 columns".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn scan_sheet_shape(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+    shared_strings: &StringArena,
+    styles: &Styles,
+) -> crate::error::Result<Option<TableShape>> {
+    let Ok(mut reader) = xml_util::open_xml(archive, path) else {
+        return Ok(None);
+    };
+    let mut buf = Vec::new();
+    let mut used = vec![false; MAX_COLS];
+    let mut last_nonempty_row = None;
+    let mut row_idx = 0usize;
+
+    loop {
+        let kind = match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"row" => 1u8,
+            Ok(Event::Eof) | Err(_) => 2,
+            _ => 0,
+        };
+        buf.clear();
+        match kind {
+            1 => {
+                let cells = parse_row_arena(&mut reader, &mut buf, shared_strings, styles)?;
+                let mut nonempty = false;
+                for (col, value, _) in &cells {
+                    if !value.trim().is_empty() {
+                        used[*col] = true;
+                        nonempty = true;
+                    }
+                }
+                if nonempty {
+                    last_nonempty_row = Some(row_idx);
+                }
+                row_idx += 1;
+            }
+            2 => break,
+            _ => {}
+        }
+    }
+
+    let Some(last_row) = last_nonempty_row else {
+        return Ok(None);
+    };
+    let Some(first_col) = used.iter().position(|&u| u) else {
+        return Ok(None);
+    };
+    let last_col = used.iter().rposition(|&u| u).unwrap_or(first_col);
+    Ok(Some(TableShape {
+        first_col,
+        last_col,
+        last_row,
+    }))
+}
+
+fn emit_sheet_markdown(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+    shape: &TableShape,
+    shared_strings: &StringArena,
+    styles: &Styles,
+    hyperlinks: &HashMap<String, String>,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let Ok(mut reader) = xml_util::open_xml(archive, path) else {
+        return Ok(());
+    };
+    let mut buf = Vec::new();
+    let mut row_idx = 0usize;
+    let mut is_header = true;
+    let ncols = shape.last_col - shape.first_col + 1;
+
+    loop {
+        let kind = match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"row" => 1u8,
+            Ok(Event::Eof) | Err(_) => 2,
+            _ => 0,
+        };
+        buf.clear();
+        match kind {
+            1 => {
+                if row_idx > shape.last_row {
+                    break;
+                }
+                let cells = parse_row_arena(&mut reader, &mut buf, shared_strings, styles)?;
+                let slice = densify_markdown_row(&cells, shape, hyperlinks);
+                if is_header {
+                    write_markdown_header(sink, &slice)?;
+                    write_markdown_separator(sink, ncols)?;
+                    is_header = false;
+                } else {
+                    write_markdown_data_row(sink, &slice)?;
+                }
+                row_idx += 1;
+            }
+            2 => break,
+            _ => {}
+        }
+    }
+
+    sink.write_str("\n")
+}
+
+fn densify_markdown_row(
+    cells: &[(usize, String, String)],
+    shape: &TableShape,
+    hyperlinks: &HashMap<String, String>,
+) -> Vec<String> {
+    let ncols = shape.last_col - shape.first_col + 1;
+    let mut dense = vec![String::new(); ncols];
+    for (col, value, cell_ref) in cells {
+        if *col < shape.first_col || *col > shape.last_col {
+            continue;
+        }
+        dense[*col - shape.first_col] = apply_cell_hyperlink(value, cell_ref, hyperlinks);
+    }
+    dense
 }
 
 fn parse_row_arena<R: BufRead>(
@@ -281,7 +430,7 @@ fn parse_row_arena<R: BufRead>(
     buf: &mut Vec<u8>,
     shared_strings: &StringArena,
     styles: &Styles,
-) -> Vec<(usize, String, String)> {
+) -> crate::error::Result<Vec<(usize, String, String)>> {
     let mut cells: Vec<(usize, String, String)> = Vec::new();
     buf.clear();
 
@@ -296,6 +445,7 @@ fn parse_row_arena<R: BufRead>(
                 } else {
                     col_ref_to_index(&cell_ref)
                 };
+                check_col(col_idx)?;
                 let cell_type = get_attr(e, b"t").unwrap_or_default();
                 let style_idx: usize = get_attr(e, b"s").and_then(|s| s.parse().ok()).unwrap_or(0);
                 start_cell = Some((col_idx, cell_ref, cell_type, style_idx));
@@ -307,6 +457,7 @@ fn parse_row_arena<R: BufRead>(
                 } else {
                     col_ref_to_index(&cell_ref)
                 };
+                check_col(col_idx)?;
                 empty_cell = Some((col_idx, cell_ref));
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == b"row" => break,
@@ -323,7 +474,7 @@ fn parse_row_arena<R: BufRead>(
         }
     }
 
-    cells
+    Ok(cells)
 }
 
 fn parse_cell_arena<R: BufRead>(
@@ -496,6 +647,7 @@ fn fill_styles<R: BufRead>(reader: &mut Reader<R>, buf: &mut Vec<u8>) -> Styles 
 /// Each `<hyperlink ref="A1" r:id="rId1"/>` maps a cell reference to
 /// a relationship ID. We resolve the rId to a URL and wrap the existing
 /// cell value as `[value](url)`.
+#[cfg(test)]
 fn apply_hyperlinks(xml: &str, rels: &Rels, rows: &mut [Vec<String>]) {
     if rels.is_empty() {
         return;
@@ -687,6 +839,7 @@ fn normalize_dotdot(path: &str) -> String {
 }
 
 /// Extract the 0-based row number from a cell reference like "B3" → 2.
+#[cfg(test)]
 fn cell_ref_to_row(cell_ref: &str) -> usize {
     let digits: String = cell_ref
         .chars()
@@ -695,28 +848,11 @@ fn cell_ref_to_row(cell_ref: &str) -> usize {
     digits.parse::<usize>().unwrap_or(1).saturating_sub(1)
 }
 
-/// Parse `xl/sharedStrings.xml` into a lookup table.
-///
-/// Each `<si>` element contributes one string at its positional index.
-/// Strings may be plain `<t>` text or rich text with multiple `<r><t>` runs.
-fn parse_shared_strings(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Vec<String> {
-    let mut xml = String::new();
-    match archive.by_name("xl/sharedStrings.xml") {
-        Ok(mut entry) => {
-            if entry.read_to_string(&mut xml).is_err() {
-                return Vec::new();
-            }
-        }
-        Err(_) => return Vec::new(),
-    }
-
-    parse_shared_strings_xml(&xml)
-}
-
 /// Parse shared string table XML into a list of strings.
 ///
 /// Separated from `parse_shared_strings` for testability (avoids needing
 /// a ZIP archive in tests).
+#[cfg(test)]
 fn parse_shared_strings_xml(xml: &str) -> Vec<String> {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
@@ -803,6 +939,7 @@ fn discover_sheets(
 /// - Otherwise: raw value from `<v>` (numbers, dates, formulas with cached values)
 ///
 /// Numeric cells whose style maps to a date format are converted to ISO dates.
+#[cfg(test)]
 fn parse_sheet_xml(xml: &str, shared_strings: &[String], styles: &Styles) -> Vec<Vec<String>> {
     let mut reader = Reader::from_str(xml);
     let mut sparse_rows: Vec<Vec<(usize, String)>> = Vec::new();
@@ -840,6 +977,7 @@ fn parse_sheet_xml(xml: &str, shared_strings: &[String], styles: &Styles) -> Vec
 }
 
 /// Parse a `<row>` element, returning `(column_index, value)` pairs.
+#[cfg(test)]
 fn parse_row(
     reader: &mut Reader<&[u8]>,
     shared_strings: &[String],
@@ -879,6 +1017,7 @@ fn parse_row(
 /// For numeric cells (no `t` attribute or `t="n"`), checks the style
 /// to see if the number format is a date — if so, converts the serial
 /// number to an ISO date string.
+#[cfg(test)]
 fn parse_cell(
     reader: &mut Reader<&[u8]>,
     cell_type: &str,
@@ -943,6 +1082,7 @@ fn maybe_convert_date(value: &str, style_idx: usize, styles: &Styles) -> String 
 }
 
 /// Parse an `<is>` inline string element, collecting all `<t>` text.
+#[cfg(test)]
 fn parse_inline_string(reader: &mut Reader<&[u8]>) -> String {
     let mut text = String::new();
 
@@ -1527,5 +1667,186 @@ mod tests {
         ]);
         let text = crate::extract_plain(&data, crate::Format::Xlsx).unwrap();
         assert_eq!(text, "[Click here](https://example.com)\n");
+    }
+
+    fn xlsx_with_cell_at(cell_ref: &str) -> Vec<u8> {
+        let body =
+            format!(r#"<row r="1"><c r="{cell_ref}" t="inlineStr"><is><t>X</t></is></c></row>"#);
+        zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", &sheet_xml(&body)),
+        ])
+    }
+
+    #[test]
+    fn xlsx_markdown_rejects_col_513() {
+        let data = xlsx_with_cell_at("SS1");
+        let err = crate::extract_markdown(&data, crate::Format::Xlsx, false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "sheet exceeds 512 columns");
+    }
+
+    #[test]
+    fn xlsx_markdown_accepts_col_ja() {
+        let data = xlsx_with_cell_at("JA1");
+        let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
+        assert_eq!(md, "| X |\n| --- |\n\n");
+    }
+
+    #[test]
+    fn xlsx_markdown_two_rows_locked() {
+        let data = minimal_xlsx_two_rows();
+        let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
+        assert_eq!(md, "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n\n");
+    }
+
+    #[test]
+    fn xlsx_markdown_to_respects_max_output_bytes() {
+        let data = minimal_xlsx_two_rows();
+        let mut out = String::new();
+        let err = crate::extract_markdown_to(
+            &data,
+            crate::Format::Xlsx,
+            crate::ExtractOptions {
+                max_output_bytes: Some(16),
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "output exceeded 16 bytes");
+        assert!(out.len() <= 16);
+    }
+
+    #[test]
+    fn xlsx_markdown_skips_empty_sheet_and_omits_single_sheet_heading() {
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            ("xl/workbook.xml", workbook_two_sheets()),
+            ("xl/_rels/workbook.xml.rels", workbook_two_sheet_rels()),
+            (
+                "xl/worksheets/sheet1.xml",
+                &sheet_xml(r#"<row r="1"><c r="A1"><v></v></c></row>"#),
+            ),
+            (
+                "xl/worksheets/sheet2.xml",
+                &sheet_xml(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>NYC</t></is></c></row>"#),
+            ),
+        ]);
+        let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
+        assert_eq!(md, "| NYC |\n| --- |\n\n");
+    }
+
+    #[test]
+    fn xlsx_markdown_multi_sheet_headings() {
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            ("xl/workbook.xml", workbook_two_sheets()),
+            ("xl/_rels/workbook.xml.rels", workbook_two_sheet_rels()),
+            (
+                "xl/worksheets/sheet1.xml",
+                &sheet_xml(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>Alice</t></is></c></row>"#),
+            ),
+            (
+                "xl/worksheets/sheet2.xml",
+                &sheet_xml(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>NYC</t></is></c></row>"#),
+            ),
+        ]);
+        let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
+        assert_eq!(
+            md,
+            "## People\n\n| Alice |\n| --- |\n\n## Places\n\n| NYC |\n| --- |\n\n"
+        );
+    }
+
+    #[test]
+    fn xlsx_markdown_strips_leading_empty_col_and_trailing_empty_row() {
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                &sheet_xml(
+                    r#"<row r="1"><c r="B1" t="inlineStr"><is><t>Name</t></is></c></row><row r="2"><c r="B2" t="inlineStr"><is><t>Alice</t></is></c></row><row r="3"><c r="B3" t="inlineStr"><is><t>  </t></is></c></row>"#,
+                ),
+            ),
+        ]);
+        let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
+        assert_eq!(md, "| Name |\n| --- |\n| Alice |\n\n");
+    }
+
+    #[test]
+    fn xlsx_markdown_hyperlink_wraps_cell() {
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>Click here</t></is></c></row>
+  </sheetData>
+  <hyperlinks>
+    <hyperlink ref="A1" r:id="rId1"/>
+  </hyperlinks>
+</worksheet>"#,
+            ),
+        ]);
+        let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
+        assert_eq!(md, "| [Click here](https://example.com) |\n| --- |\n\n");
     }
 }

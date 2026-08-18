@@ -24,6 +24,7 @@ impl StringArena {
         Some(std::str::from_utf8(bytes).unwrap_or(""))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.spans.len()
     }

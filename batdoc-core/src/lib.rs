@@ -309,8 +309,13 @@ fn write_markdown(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
-    let text = extract_markdown_with(data, format, opts)?;
-    sink.write_str(&text)
+    match format {
+        Format::Xlsx => xlsx::extract_markdown_to(data, opts.images, sink),
+        _ => {
+            let text = extract_markdown_with(data, format, opts)?;
+            sink.write_str(&text)
+        }
+    }
 }
 
 /// Convenience: detect format and extract plain text in one call.
