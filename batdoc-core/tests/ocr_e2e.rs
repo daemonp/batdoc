@@ -253,6 +253,7 @@ fn ocr_docx_embedded_image_markdown() {
         ExtractOptions {
             images: true,
             ocr: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -267,6 +268,7 @@ fn ocr_docx_embedded_image_markdown() {
         ExtractOptions {
             images: true,
             ocr: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -279,8 +281,8 @@ fn ocr_docx_embedded_image_markdown() {
 fn ocr_pdf_embedded_image_page() {
     let pdf = build_pdf_with_image(&render_test_image());
     // A textless PDF auto-falls back to OCR even without --ocr…
-    let auto = batdoc_core::extract_plain_with(&pdf, Format::Pdf, ExtractOptions::default())
-        .unwrap();
+    let auto =
+        batdoc_core::extract_plain_with(&pdf, Format::Pdf, ExtractOptions::default()).unwrap();
     assert!(auto.contains("123"), "auto OCR text missing: {auto:?}");
     // …and an explicit --ocr behaves identically.
     let text = batdoc_core::extract_plain_with(
@@ -289,6 +291,7 @@ fn ocr_pdf_embedded_image_page() {
         ExtractOptions {
             ocr: true,
             images: false,
+            ..Default::default()
         },
     )
     .unwrap();

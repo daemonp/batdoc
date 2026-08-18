@@ -36,6 +36,14 @@ pub fn to_plain(data: &[u8]) -> Result<String, String> {
 #[wasm_bindgen]
 pub fn to_markdown(data: &[u8], images: bool, ocr: bool) -> Result<String, String> {
     let format = detect_format(data).map_err(|e| e.to_string())?;
-    extract_markdown_with(data, format, ExtractOptions { images, ocr })
-        .map_err(|e| e.to_string())
+    extract_markdown_with(
+        data,
+        format,
+        ExtractOptions {
+            images,
+            ocr,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())
 }

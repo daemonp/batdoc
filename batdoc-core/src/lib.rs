@@ -18,14 +18,16 @@ mod ocr;
 mod pdf;
 mod pptx;
 mod sheet;
+mod sink;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 mod xls;
 mod xlsx;
 mod xml_util;
-#[cfg(target_arch = "wasm32")]
-mod wasm;
 
 pub use error::{BatdocError, Result};
 pub use ocr::models_present;
+pub use sink::{BudgetSink, ExtractSink, IoSink};
 
 use std::io::Cursor;
 
@@ -154,6 +156,8 @@ pub struct ExtractOptions {
     /// automatically as a fallback regardless of this flag. Has no effect on
     /// `Format::Image` — image input is always OCR'd.
     pub ocr: bool,
+    /// Stop writing after this many output bytes. `None` means unlimited.
+    pub max_output_bytes: Option<u64>,
 }
 
 /// Extract plain text from a document.
@@ -200,7 +204,15 @@ pub fn extract_plain_with(data: &[u8], format: Format, opts: ExtractOptions) -> 
 /// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
 /// document is malformed, encrypted, or cannot be parsed.
 pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<String> {
-    extract_markdown_with(data, format, ExtractOptions { images, ocr: false })
+    extract_markdown_with(
+        data,
+        format,
+        ExtractOptions {
+            images,
+            ocr: false,
+            ..Default::default()
+        },
+    )
 }
 
 /// Extract Markdown with explicit options.
@@ -225,6 +237,74 @@ pub fn extract_markdown_with(data: &[u8], format: Format, opts: ExtractOptions) 
         Format::Pdf => pdf::extract_markdown(data, opts),
         Format::Image => ocr::extract_image_plain(data),
     }
+}
+
+/// Extract plain text into a sink.
+///
+/// When `opts.max_output_bytes` is `Some`, writing stops with
+/// [`BatdocError::Document`] once that many bytes would be exceeded.
+///
+/// # Errors
+///
+/// Returns any error from [`extract_plain_with`], or
+/// [`BatdocError::Document`] if the output budget is exceeded.
+pub fn extract_plain_to(
+    data: &[u8],
+    format: Format,
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> Result<()> {
+    match opts.max_output_bytes {
+        Some(max) => {
+            let mut limited = BudgetSink::new(sink, max);
+            write_plain(data, format, opts, &mut limited)
+        }
+        None => write_plain(data, format, opts, sink),
+    }
+}
+
+fn write_plain(
+    data: &[u8],
+    format: Format,
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> Result<()> {
+    let text = extract_plain_with(data, format, opts)?;
+    sink.write_str(&text)
+}
+
+/// Extract Markdown into a sink.
+///
+/// When `opts.max_output_bytes` is `Some`, writing stops with
+/// [`BatdocError::Document`] once that many bytes would be exceeded.
+///
+/// # Errors
+///
+/// Returns any error from [`extract_markdown_with`], or
+/// [`BatdocError::Document`] if the output budget is exceeded.
+pub fn extract_markdown_to(
+    data: &[u8],
+    format: Format,
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> Result<()> {
+    match opts.max_output_bytes {
+        Some(max) => {
+            let mut limited = BudgetSink::new(sink, max);
+            write_markdown(data, format, opts, &mut limited)
+        }
+        None => write_markdown(data, format, opts, sink),
+    }
+}
+
+fn write_markdown(
+    data: &[u8],
+    format: Format,
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> Result<()> {
+    let text = extract_markdown_with(data, format, opts)?;
+    sink.write_str(&text)
 }
 
 /// Convenience: detect format and extract plain text in one call.
@@ -298,5 +378,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no text found in image"));
+    }
+
+    #[test]
+    fn extract_plain_to_equals_extract_plain_on_image_garbage() {
+        let data = b"garbage";
+        let format = Format::Image;
+        let opts = ExtractOptions::default();
+        let a = extract_plain_with(data, format, opts)
+            .unwrap_err()
+            .to_string();
+        let mut out = String::new();
+        let b = extract_plain_to(data, format, opts, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(a, b);
+        assert!(out.is_empty());
     }
 }

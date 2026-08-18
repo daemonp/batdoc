@@ -158,7 +158,11 @@ fn run(
         io::stdout().write_all(b"\n")?;
     }
 
-    let opts = ExtractOptions { images, ocr };
+    let opts = ExtractOptions {
+        images,
+        ocr,
+        ..Default::default()
+    };
 
     // OCR input (flagged, or image input which is always OCR'd) downloads
     // models on first use; say so once per process, before it happens.
