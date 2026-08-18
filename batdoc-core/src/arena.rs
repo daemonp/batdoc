@@ -1,10 +1,8 @@
-#[allow(dead_code)]
 pub(crate) struct StringArena {
     buf: Vec<u8>,
     spans: Vec<(u32, u32)>,
 }
 
-#[allow(dead_code)]
 impl StringArena {
     pub(crate) fn new() -> Self {
         Self {

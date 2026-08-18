@@ -201,15 +201,13 @@ fn normalize_zip_path(path: &str) -> String {
     parts.join("/")
 }
 
-#[allow(dead_code)]
 pub(crate) type XmlReader<'a> = Reader<std::io::BufReader<zip::read::ZipFile<'a>>>;
 
 /// Open a ZIP entry as a streaming `quick_xml` reader.
-#[allow(dead_code)]
-pub(crate) fn open_xml<'a>(
-    archive: &'a mut ZipArchive<Cursor<&'a [u8]>>,
+pub(crate) fn open_xml<'arc>(
+    archive: &'arc mut ZipArchive<Cursor<&[u8]>>,
     path: &str,
-) -> crate::error::Result<XmlReader<'a>> {
+) -> crate::error::Result<XmlReader<'arc>> {
     let entry = archive.by_name(path)?;
     Ok(Reader::from_reader(std::io::BufReader::new(entry)))
 }

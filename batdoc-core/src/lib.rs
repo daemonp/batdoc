@@ -270,8 +270,13 @@ fn write_plain(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
-    let text = extract_plain_with(data, format, opts)?;
-    sink.write_str(&text)
+    match format {
+        Format::Xlsx => xlsx::extract_plain_to(data, sink),
+        _ => {
+            let text = extract_plain_with(data, format, opts)?;
+            sink.write_str(&text)
+        }
+    }
 }
 
 /// Extract Markdown into a sink.
