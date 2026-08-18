@@ -134,6 +134,28 @@ Ordered so each step is independently shippable and keeps the native CLI intact.
   `--no-default-features` (or wasm, which needs it) opts out. The `getrandom`
   `wasm_js` feature is enabled on the wasm target only, so native is untouched.
 
+### Memory (streaming extract)
+
+Non-OCR extract now streams through `ExtractSink` (`extract_*_to`); the old
+`extract_*` functions are collecting wrappers. Measured on a synthetic
+13.45 MB XLSX (300,000 rows × 8 cols = 2,400,000 cells, 20,000 shared strings,
+deflate-9) with `resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`:
+
+| file size | cells | plain RSS (old → new) | markdown RSS (old → new) |
+|-----------|-------|------------------------|--------------------------|
+| 13.45 MB  | 2.4 M | 326.5 → 109.8 MiB      | 694.1 → 114.9 MiB        |
+
+The 64 MiB goal is **not yet met**: peak RSS is still ~110 MiB because the CLI
+writes output via the buffered `String` API, so the ~70 MB of extracted text
+is materialized in full before hitting stdout. A follow-up is to wire
+`src/main.rs` to `extract_*_to(..., &mut IoSink(stdout))`, which drops the
+output copy and should bring peak RSS under 64 MiB.
+
+For Workers (128 MiB default memory limit), a 15 MB XLSX is currently
+borderline through the `String` API. Prefer `extract_*_to` with an
+incremental sink, and set `ExtractOptions.max_output_bytes` to bound output
+(the budget error is `"output exceeded {n} bytes"`).
+
 ## Demo
 
 The browser demo lives in `web/`. It builds `batdoc-core` as a wasm cdylib,
