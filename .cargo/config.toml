@@ -1,0 +1,5 @@
+# getrandom 0.3 (via lopdf → rand) requires an explicit backend opt-in for
+# wasm32-unknown-unknown. This cfg matches the `wasm_js` feature enabled on
+# the getrandom dependency in batdoc-core/Cargo.toml.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]

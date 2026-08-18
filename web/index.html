@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>batdoc — wasm demo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+    #output { white-space: pre-wrap; word-break: break-word; background: #f6f6f6; border: 1px solid #ddd; border-radius: 6px; padding: 1rem; min-height: 6rem; }
+    #status { color: #444; font-size: 0.9rem; }
+    code { background: #eee; padding: 0 0.3em; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>batdoc — wasm demo</h1>
+  <p>Pick a document (or click a sample) and it is converted to markdown/plain text
+  entirely in the browser via <code>batdoc-core</code> compiled to WebAssembly.</p>
+
+  <p>
+    <label for="file">File:</label>
+    <input type="file" id="file" accept=".doc,.docx,.xls,.xlsx,.pptx,.pdf,.png,.jpg,.gif,.webp,.bmp">
+  </p>
+  <p>
+    Mode:
+    <select id="mode">
+      <option value="markdown">markdown</option>
+      <option value="plain">plain</option>
+    </select>
+    <label><input type="checkbox" id="images"> embed images</label>
+    <label><input type="checkbox" id="ocr"> ocr</label>
+    <small>(ocr needs model files; this demo build has <code>net</code> disabled)</small>
+  </p>
+  <p>
+    Samples:
+    <a href="#" data-sample="samples/sample.docx">sample.docx</a> ·
+    <a href="#" data-sample="samples/sample.pdf">sample.pdf</a>
+  </p>
+
+  <p id="status">Loading wasm module…</p>
+  <pre id="output"></pre>
+
+  <script type="module" src="demo.js"></script>
+</body>
+</html>

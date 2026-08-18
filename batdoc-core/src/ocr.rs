@@ -6,9 +6,11 @@
 
 use crate::error::{BatdocError, Result};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
+#[cfg(feature = "net")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(feature = "net")]
 use std::time::Duration;
 
 /// Detection model (text regions). 2.4 MB.
@@ -21,11 +23,14 @@ const DETECTION_MODEL_FILE: &str = "text-detection.rten";
 const RECOGNITION_MODEL_FILE: &str = "text-recognition.rten";
 
 /// Network timeout for model downloads.
+#[cfg(feature = "net")]
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
 /// Maximum accepted model download size (the real models are 2.4 MB and
 /// 9.3 MB; a larger response means a compromised/redirected URL).
+#[cfg(feature = "net")]
 const MAX_MODEL_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Age after which leftover `*.tmp.<pid>` download files are swept.
+#[cfg(feature = "net")]
 const STALE_TMP_AGE: Duration = Duration::from_hours(1);
 
 /// Resolve the model cache directory, in priority order. Injectable for testing.
@@ -55,6 +60,7 @@ fn cache_dir() -> PathBuf {
 ///
 /// Writes to a `.tmp` sibling and renames, so concurrent processes cannot
 /// observe a partially written model.
+#[cfg(feature = "net")]
 fn ensure_file(path: &Path, url: &str) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -107,9 +113,25 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Without network support (no `net` feature), model files must already be
+/// present locally — e.g. pre-seeded via `$BATDOC_MODELS_DIR` or embedded by
+/// the caller. Loading and inference still work; only acquisition is gated.
+#[cfg(not(feature = "net"))]
+fn ensure_file(path: &Path, _url: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    Err(BatdocError::Document(format!(
+        "OCR model {} not found; this build has no network support — \
+         seed it via BATDOC_MODELS_DIR or embed it before use",
+        path.display()
+    )))
+}
+
 /// Remove stale `*.tmp.<pid>` download leftovers in `dir` (from interrupted
 /// runs). Only files older than [`STALE_TMP_AGE`] are touched, so an active
 /// concurrent download is never disturbed. Best-effort: errors ignored.
+#[cfg(feature = "net")]
 fn sweep_stale_tmp_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -127,6 +149,7 @@ fn sweep_stale_tmp_files(dir: &Path) {
 }
 
 /// `true` for `*.tmp.<pid>` download leftovers older than [`STALE_TMP_AGE`].
+#[cfg(feature = "net")]
 fn is_stale_tmp_file(name: &str, modified: Option<std::time::SystemTime>) -> bool {
     name.contains(".tmp.")
         && modified
@@ -143,6 +166,7 @@ struct ModelPaths {
 /// Ensure both model files exist locally, downloading when needed.
 fn ensure_models() -> Result<ModelPaths> {
     let dir = cache_dir();
+    #[cfg(feature = "net")]
     sweep_stale_tmp_files(&dir);
     let detection = dir.join(DETECTION_MODEL_FILE);
     let recognition = dir.join(RECOGNITION_MODEL_FILE);
@@ -332,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "net")]
     fn stale_tmp_file_detection() {
         use std::time::SystemTime;
         // Fresh download in progress: recent mtime → keep.

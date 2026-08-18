@@ -21,6 +21,8 @@ mod sheet;
 mod xls;
 mod xlsx;
 mod xml_util;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
 pub use error::{BatdocError, Result};
 pub use ocr::models_present;
