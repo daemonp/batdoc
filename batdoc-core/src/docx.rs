@@ -658,7 +658,70 @@ fn emit_table<R: BufRead, S: ExtractSink>(
     markdown: bool,
     out: &mut StreamOut<'_, S>,
 ) -> crate::error::Result<()> {
-    let mut ncols: Option<usize> = None;
+    if markdown {
+        // Buffer just this table's rows (a table is a bounded unit), compute
+        // the maximum width, then emit all rows padded to that width — the
+        // same shape the buffered `render_block_markdown` produces for ragged
+        // tables (later rows wider than the header).
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        loop {
+            let mut start_tr = false;
+            let mut done = false;
+            match reader.read_event_into(buf) {
+                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tr" => start_tr = true,
+                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tbl" => done = true,
+                Ok(Event::Eof) | Err(_) => done = true,
+                _ => {}
+            }
+            buf.clear();
+            if done {
+                break;
+            }
+            if start_tr {
+                rows.push(parse_table_row_text(
+                    reader, buf, rels, footnotes, endnotes, markdown,
+                ));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if ncols == 0 {
+            return Ok(());
+        }
+
+        let mut md_rows: Vec<Vec<String>> = Vec::new();
+        for row in rows {
+            let mut md_row: Vec<String> =
+                row.into_iter().map(|cell| cell.replace('|', "\\|")).collect();
+            while md_row.len() < ncols {
+                md_row.push(String::new());
+            }
+            md_rows.push(md_row);
+        }
+
+        if let Some(header) = md_rows.first() {
+            out.write_str("| ")?;
+            out.write_str(&header.join(" | "))?;
+            out.write_str(" |\n")?;
+
+            out.write_str("|")?;
+            for _ in 0..ncols {
+                out.write_str(" --- |")?;
+            }
+            out.write_str("\n")?;
+
+            for row in md_rows.iter().skip(1) {
+                out.write_str("| ")?;
+                out.write_str(&row.join(" | "))?;
+                out.write_str(" |\n")?;
+            }
+            out.write_str("\n")?;
+        }
+        return Ok(());
+    }
+
     loop {
         let mut start_tr = false;
         let mut done = false;
@@ -674,65 +737,25 @@ fn emit_table<R: BufRead, S: ExtractSink>(
         }
         if start_tr {
             let cells = parse_table_row_text(reader, buf, rels, footnotes, endnotes, markdown);
-            emit_table_row(&cells, markdown, &mut ncols, out)?;
+            emit_table_row(&cells, out)?;
         }
-    }
-    if markdown && ncols.is_some() {
-        out.write_str("\n")?;
     }
     Ok(())
 }
 
 fn emit_table_row<S: ExtractSink>(
     cells: &[String],
-    markdown: bool,
-    ncols: &mut Option<usize>,
     out: &mut StreamOut<'_, S>,
 ) -> crate::error::Result<()> {
-    if markdown {
-        let n = match *ncols {
-            Some(n) => n,
-            None => {
-                if cells.is_empty() {
-                    return Ok(());
-                }
-                let n = cells.len();
-                *ncols = Some(n);
-                out.write_str("| ")?;
-                for (i, cell) in cells.iter().enumerate() {
-                    if i > 0 {
-                        out.write_str(" | ")?;
-                    }
-                    out.write_str(&cell.replace('|', "\\|"))?;
-                }
-                out.write_str(" |\n|")?;
-                for _ in 0..n {
-                    out.write_str(" --- |")?;
-                }
-                out.write_str("\n")?;
-                return Ok(());
-            }
-        };
-        out.write_str("| ")?;
-        for i in 0..n {
-            if i > 0 {
-                out.write_str(" | ")?;
-            }
-            let cell = cells.get(i).map(String::as_str).unwrap_or("");
-            out.write_str(&cell.replace('|', "\\|"))?;
-        }
-        out.write_str(" |\n")?;
-    } else {
-        let line = cells.join("\t");
-        let line = line.trim_end();
-        if !line.is_empty() {
-            if !out.plain_first {
-                out.write_str("\n")?;
-            }
-            out.write_str(line)?;
+    let line = cells.join("\t");
+    let line = line.trim_end();
+    if !line.is_empty() {
+        if !out.plain_first {
             out.write_str("\n")?;
-            out.plain_first = false;
         }
+        out.write_str(line)?;
+        out.write_str("\n")?;
+        out.plain_first = false;
     }
     Ok(())
 }
@@ -3432,6 +3455,62 @@ mod tests {
             !md.contains("[^1]: |"),
             "inline form used for table-only note: {md}"
         );
+    }
+
+    #[test]
+    fn extract_markdown_ragged_table_matches_block_renderer() {
+        // A ragged table (a later row has more cells than the header) must
+        // match the buffered block renderer byte-for-byte: `ncols` is the max
+        // row width and every row (including the header) is padded with empty
+        // cells instead of the streaming path truncating to the first row.
+        let body_tbl = r#"
+<w:tbl>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>Age</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>Alice</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>30</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>Extra</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>"#;
+
+        let data = minimal_docx(&[("word/document.xml", &document_xml(body_tbl))]);
+
+        let table = Block::Table {
+            rows: vec![
+                vec![
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Name", false, false)],
+                    }],
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Age", false, false)],
+                    }],
+                ],
+                vec![
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Alice", false, false)],
+                    }],
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("30", false, false)],
+                    }],
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Extra", false, false)],
+                    }],
+                ],
+            ],
+        };
+        let mut reference = String::new();
+        render_block_markdown(&table, &mut reference);
+
+        let streamed = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert_eq!(streamed, reference);
     }
 
     #[test]
