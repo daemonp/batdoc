@@ -8,8 +8,8 @@
 use crate::error::{BatdocError, Result};
 use crate::ocr::MAX_OCR_IMAGE_DIM;
 use crate::ExtractOptions;
+use crate::ExtractSink;
 use lopdf::xobject::PdfImage;
-use std::fmt::Write as _;
 use std::io::Cursor;
 use std::panic::{self, AssertUnwindSafe};
 
@@ -18,9 +18,8 @@ use std::panic::{self, AssertUnwindSafe};
 ///
 /// Panics from the underlying library are caught and converted to errors.
 fn extract_pages(data: &[u8]) -> Result<Vec<String>> {
-    let data = data.to_vec(); // owned copy for the unwind boundary
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        pdf_extract::extract_text_from_mem_by_pages(&data)
+        pdf_extract::extract_text_from_mem_by_pages(data)
     }));
     match result {
         Ok(Ok(pages)) => Ok(pages),
@@ -253,18 +252,40 @@ fn no_text_error(ocr: bool) -> BatdocError {
 
 /// Extract plain text from a PDF.
 pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> Result<String> {
-    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
-    let nonempty: Vec<&str> = pages
-        .iter()
-        .map(String::as_str)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut out = String::new();
+    extract_plain_to(data, opts, &mut out)?;
+    Ok(out)
+}
 
-    if nonempty.is_empty() {
-        return Err(no_text_error(ocr_attempted));
+/// Stream plain text from a PDF into `sink`, one cleaned page at a time.
+///
+/// Non-empty pages are joined with `\n` (no trailing newline); if no page has
+/// text, [`no_text_error`] is returned with the OCR-attempt wording.
+pub(crate) fn extract_plain_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> Result<()> {
+    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
+
+    let mut first = true;
+    let mut wrote = false;
+    for page in pages {
+        if page.is_empty() {
+            continue;
+        }
+        if !first {
+            sink.write_str("\n")?;
+        }
+        sink.write_str(&page)?;
+        first = false;
+        wrote = true;
     }
 
-    Ok(nonempty.join("\n"))
+    if !wrote {
+        return Err(no_text_error(ocr_attempted));
+    }
+    Ok(())
 }
 
 /// Extract markdown from a PDF.
@@ -272,6 +293,22 @@ pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> Result<String>
 /// Each page gets a `## Page N` heading. Single-page documents omit the
 /// heading since it would be redundant.
 pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<String> {
+    let mut out = String::new();
+    extract_markdown_to(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// Stream markdown from a PDF into `sink`, one cleaned page at a time.
+///
+/// Single non-empty page: emit just the page text (no heading). Multiple:
+/// each page gets a `## Page N\n\n` heading (1-based on the ORIGINAL page
+/// index, not the filtered index) with `\n` between pages. If no page has
+/// text, [`no_text_error`] is returned with the OCR-attempt wording.
+pub(crate) fn extract_markdown_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> Result<()> {
     let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
     let nonempty: Vec<(usize, &str)> = pages
         .iter()
@@ -289,22 +326,20 @@ pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<Stri
         return Err(no_text_error(ocr_attempted));
     }
 
-    let mut out = String::new();
-
     if nonempty.len() == 1 {
         // Single page — no heading needed
-        out.push_str(nonempty[0].1);
+        sink.write_str(nonempty[0].1)?;
     } else {
         for (i, (page_num, text)) in nonempty.iter().enumerate() {
             if i > 0 {
-                out.push('\n');
+                sink.write_str("\n")?;
             }
-            let _ = write!(out, "## Page {page_num}\n\n");
-            out.push_str(text);
+            sink.write_str(&format!("## Page {page_num}\n\n"))?;
+            sink.write_str(text)?;
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,6 +431,125 @@ startxref\n\
             let err = extract_plain(data, opts).unwrap_err().to_string();
             assert!(err.contains("OCR found nothing"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn pdf_extract_pages_does_not_require_owned_copy() {
+        // Behavior lock: empty/malformed PDF error wording unchanged.
+        let err = crate::extract_plain(b"%PDF-not-really", crate::Format::Pdf)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("PDF")
+                || err.contains("extract")
+                || err.contains("malformed")
+                || err.contains("no extractable"),
+            "unexpected error wording: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_plain_to_matches_extract_plain_error() {
+        for data in [&b"not a pdf at all"[..], &b"%PDF-1.4\n%%EOF\n"[..]] {
+            let expected = extract_plain(data, crate::ExtractOptions::default())
+                .unwrap_err()
+                .to_string();
+            let mut out = String::new();
+            let actual =
+                extract_plain_to(data, crate::ExtractOptions::default(), &mut out)
+                    .unwrap_err()
+                    .to_string();
+            assert_eq!(actual, expected);
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn extract_markdown_to_matches_extract_markdown_error() {
+        for data in [&b"not a pdf at all"[..], &b"%PDF-1.4\n%%EOF\n"[..]] {
+            let expected = extract_markdown(data, crate::ExtractOptions::default())
+                .unwrap_err()
+                .to_string();
+            let mut out = String::new();
+            let actual = extract_markdown_to(data, crate::ExtractOptions::default(), &mut out)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(actual, expected);
+            assert!(out.is_empty());
+        }
+    }
+
+    /// Build a minimal one-or-more page PDF with a WinAnsi Helvetica text layer,
+    /// so `pdf_extract` returns non-empty per-page text.
+    fn build_text_pdf(page_texts: &[&str]) -> Vec<u8> {
+        use lopdf::{dictionary, Document as LopdfDoc, Object, Stream};
+
+        let mut doc = LopdfDoc::with_version("1.4");
+        let pages_id = doc.new_object_id();
+
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+
+        let mut kids = Vec::new();
+        for text in page_texts {
+            let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+            let content_id =
+                doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            });
+            kids.push(Object::Reference(page_id));
+        }
+
+        let pages = dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => page_texts.len() as i64,
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn extract_plain_to_matches_extract_plain_multipage() {
+        let data = build_text_pdf(&["PageOne", "PageTwo"]);
+        let expected = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(expected.contains("PageOne"), "no extracted text: {expected:?}");
+        let mut out = String::new();
+        extract_plain_to(&data, crate::ExtractOptions::default(), &mut out).unwrap();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn extract_markdown_to_matches_extract_markdown_multipage() {
+        let data = build_text_pdf(&["PageOne", "", "PageThree"]);
+        let expected = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(
+            expected.contains("## Page 1") && expected.contains("## Page 3"),
+            "unexpected markdown: {expected:?}"
+        );
+        let mut out = String::new();
+        extract_markdown_to(&data, crate::ExtractOptions::default(), &mut out).unwrap();
+        assert_eq!(out, expected);
     }
 
     #[test]
