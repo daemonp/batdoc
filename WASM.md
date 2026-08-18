@@ -156,6 +156,16 @@ borderline through the `String` API. Prefer `extract_*_to` with an
 incremental sink, and set `ExtractOptions.max_output_bytes` to bound output
 (the budget error is `"output exceeded {n} bytes"`).
 
+Known streaming behavior changes (vs. the buffered path, both non-OCR only):
+
+- A present-but-corrupt primary XML part (`word/document.xml`, a slide, or a
+  sheet) now truncates silently to the text read so far instead of erroring —
+  the pull parser treats a decompression/parse error as end-of-stream.
+  Unreachable on valid files; error *wording* for other failures is unchanged.
+- With an `IoSink`, a late error (e.g. a later sheet exceeding `MAX_COLS` or
+  the output budget) leaves earlier output already written. Invisible on the
+  `String`/`extract_*` wrapper path, which discards the buffer on error.
+
 ## Demo
 
 The browser demo lives in `web/`. It builds `batdoc-core` as a wasm cdylib,
