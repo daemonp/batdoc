@@ -272,6 +272,7 @@ fn write_plain(
 ) -> Result<()> {
     match format {
         Format::Xlsx => xlsx::extract_plain_to(data, sink),
+        Format::Xls => xls::extract_plain_to(data, sink),
         _ => {
             let text = extract_plain_with(data, format, opts)?;
             sink.write_str(&text)
@@ -311,6 +312,7 @@ fn write_markdown(
 ) -> Result<()> {
     match format {
         Format::Xlsx => xlsx::extract_markdown_to(data, opts.images, sink),
+        Format::Xls => xls::extract_markdown_to(data, sink),
         _ => {
             let text = extract_markdown_with(data, format, opts)?;
             sink.write_str(&text)
