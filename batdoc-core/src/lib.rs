@@ -7,6 +7,7 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
+mod arena;
 mod codepage;
 mod dateconv;
 mod doc;
