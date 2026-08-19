@@ -301,8 +301,22 @@ fn page_height(doc: &lopdf::Document, page_id: ObjectId) -> Option<f64> {
     Some(media_box[3] - media_box[1])
 }
 
+const MAX_MEDIABOX_PARENT_DEPTH: u32 = 32;
+
 /// Resolve the effective `MediaBox` array for a dictionary, walking `/Parent`.
 fn media_box_for_dict(doc: &lopdf::Document, dict: &Dictionary) -> Option<[f64; 4]> {
+    media_box_for_dict_inner(doc, dict, 0)
+}
+
+fn media_box_for_dict_inner(
+    doc: &lopdf::Document,
+    dict: &Dictionary,
+    depth: u32,
+) -> Option<[f64; 4]> {
+    if depth > MAX_MEDIABOX_PARENT_DEPTH {
+        // Cyclic or absurdly deep parent chain: fall back to the default.
+        return Some([0.0, 0.0, 612.0, 792.0]);
+    }
     if let Ok(obj) = dict.get(b"MediaBox") {
         if let Ok(rect) = rect_array(doc, obj) {
             return Some(rect);
@@ -311,7 +325,7 @@ fn media_box_for_dict(doc: &lopdf::Document, dict: &Dictionary) -> Option<[f64; 
     if let Ok(parent) = dict.get(b"Parent") {
         let parent_id = parent.as_reference().ok()?;
         let parent_dict = doc.get_dictionary(parent_id).ok()?;
-        return media_box_for_dict(doc, parent_dict);
+        return media_box_for_dict_inner(doc, parent_dict, depth + 1);
     }
     // PDF spec default: US Letter.
     Some([0.0, 0.0, 612.0, 792.0])
@@ -413,6 +427,37 @@ mod tests {
         assert!(a.intersects_expanded(&b, 2.0));
     }
 
+    #[test]
+    fn cyclic_parent_chain_does_not_stack_overflow() {
+        // A cyclic /Parent chain must not hang or crash. get_page_resources
+        // detects the cycle and returns Err, so placed_images returns empty.
+        // The key property is that the call terminates without a stack overflow.
+        let (doc, page_id) = image_pdf_cyclic_parent("q 200 0 0 50 72 600 cm /Im0 Do Q");
+        let placed = placed_images(&doc, page_id);
+        assert!(placed.is_empty());
+    }
+
+    #[test]
+    fn media_box_for_dict_guards_against_cyclic_parent() {
+        // Directly exercise media_box_for_dict with a Pages node whose Parent
+        // is itself. Without the depth cap it would recurse until stack overflow.
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let pages_dict = dictionary! {
+            "Type" => "Pages",
+            "Kids" => Vec::<Object>::new(),
+            "Count" => 0_i64,
+            "Parent" => pages_id,
+        };
+        doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+        let pages_dict = doc
+            .get_dictionary(pages_id)
+            .expect("pages dict we just inserted");
+        let rect = media_box_for_dict(&doc, pages_dict);
+        // Falls back to the PDF default US-Letter MediaBox.
+        assert_eq!(rect, Some([0.0, 0.0, 612.0, 792.0]));
+    }
+
     /// Build a one-page PDF with an image XObject in resources and a
     /// caller-supplied content stream.
     fn image_pdf(content: &str) -> (Document, ObjectId) {
@@ -477,6 +522,49 @@ mod tests {
                 "Kids" => vec![Object::Reference(page_id)],
                 "Count" => 1_i64,
                 "Resources" => resources_id,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        let loaded = Document::load_mem(&buf).unwrap();
+        (loaded, page_id)
+    }
+
+    /// Build a one-page PDF with a cyclic /Parent chain. The page has direct
+    /// /Resources so resource lookup succeeds, but it has no /MediaBox and the
+    /// Pages node's /Parent points to itself, so media_box_for_dict must guard
+    /// against infinite recursion.
+    fn image_pdf_cyclic_parent(content: &str) -> (Document, ObjectId) {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+
+        let image_id = doc.add_object(image_stream());
+        let resources_id = doc.add_object(dictionary! {
+            "XObject" => dictionary! { "Im0" => image_id },
+        });
+        let content_id =
+            doc.add_object(Stream::new(Dictionary::new(), content.as_bytes().to_vec()));
+        // Page intentionally omits /MediaBox so the parent walk is exercised.
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+        });
+        // Cyclic Pages node: its /Parent points to itself and it has no /MediaBox.
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1_i64,
+                "Parent" => pages_id,
             }),
         );
         let catalog_id = doc.add_object(dictionary! {
