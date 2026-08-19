@@ -43,9 +43,11 @@ pub(crate) struct Word {
 #[derive(Clone, Debug)]
 pub(crate) struct Line {
     pub text: String,
-    /// Per-word x-extents: read by the layout unit tests today and by the
-    /// table/list classifiers (Tasks 14–16).
-    #[allow(dead_code)]
+    /// Per-word x-extents in the line's ASSEMBLY frame (see the module
+    /// docs): the table detector (Task 14) clusters word x0s across lines
+    /// of a run — all canonical-group lines share one frame, so that is
+    /// safe — but a word's x0/x1 must never be compared against its own
+    /// line's page-space `rect`.
     pub words: Vec<Word>,
     pub rect: PtRect,
     /// Median transformed font size of the line's chars.
@@ -525,12 +527,18 @@ pub(crate) struct DocSignalsBuilder {
     last_counts: std::collections::HashMap<String, usize>,
 }
 
-/// A classified block of body content. Table and List variants arrive in
-/// Tasks 14–16.
+/// A classified block of body content. The List variant arrives in
+/// Tasks 15–16.
 #[derive(Debug)]
 pub(crate) enum Block {
-    Heading { level: u8, text: String },
+    Heading {
+        level: u8,
+        text: String,
+    },
     Paragraph(String),
+    /// Borderless table (Task 14): rows of cells, empty string = no word
+    /// landed in that column for that row.
+    Table(Vec<Vec<String>>),
 }
 
 impl DocSignalsBuilder {
@@ -646,6 +654,101 @@ fn normalize_signature(text: &str) -> String {
     out
 }
 
+/// Open paragraph under construction: text plus the last line's font
+/// size and top edge (the gap rule needs both).
+struct Para {
+    text: String,
+    font_size: f64,
+    y0: f64,
+}
+
+/// Incremental heading/paragraph classifier: [`detect_tables`] feeds it
+/// the non-table lines interleaved with detected table blocks, so the
+/// paragraph state must survive across calls. [`classify`] is the thin
+/// all-lines wrapper; the heading/paragraph rules live here exactly once.
+struct Classifier<'a> {
+    signals: &'a DocSignals,
+    blocks: Vec<Block>,
+    para: Option<Para>,
+}
+
+impl Classifier<'_> {
+    const fn new(signals: &DocSignals) -> Classifier<'_> {
+        Classifier {
+            signals,
+            blocks: Vec::new(),
+            para: None,
+        }
+    }
+
+    fn flush(&mut self) {
+        if let Some(p) = self.para.take() {
+            self.blocks.push(Block::Paragraph(p.text));
+        }
+    }
+
+    /// Fold one line into the block stream: header/footer drop, heading
+    /// gate, then paragraph merge/split — see [`classify`] for the rules.
+    fn feed(&mut self, line: &Line) {
+        let text = line.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let sig = normalize_signature(text);
+        if self.signals.headers.contains(&sig) || self.signals.footers.contains(&sig) {
+            self.flush();
+            return;
+        }
+        let ratio = if self.signals.body_size > 0.0 {
+            line.font_size / self.signals.body_size
+        } else {
+            0.0
+        };
+        if ratio >= HEADING_MIN_RATIO {
+            self.flush();
+            let level = if ratio >= HEADING_H1_RATIO {
+                1
+            } else if ratio >= HEADING_H2_RATIO {
+                2
+            } else if ratio >= HEADING_H3_RATIO {
+                3
+            } else {
+                4
+            };
+            self.blocks.push(Block::Heading {
+                level,
+                text: text.to_string(),
+            });
+            return;
+        }
+        match self.para.as_mut() {
+            Some(p) if line.rect.y0 - p.y0 <= PARAGRAPH_GAP_RATIO * p.font_size => {
+                if p.text.ends_with('-') {
+                    p.text.pop();
+                } else {
+                    p.text.push(' ');
+                }
+                p.text.push_str(text);
+                p.font_size = line.font_size;
+                p.y0 = line.rect.y0;
+            }
+            _ => {
+                self.flush();
+                self.para = Some(Para {
+                    text: text.to_string(),
+                    font_size: line.font_size,
+                    y0: line.rect.y0,
+                });
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<Block> {
+        self.flush();
+        self.blocks
+    }
+}
+
 /// Classify reading-ordered `lines` (native + OCR merged — OCR lines
 /// participate exactly like native ones) into blocks:
 ///
@@ -660,76 +763,232 @@ fn normalize_signature(text: &str) -> String {
 ///
 /// Whitespace-only lines (all-space clusters) are dropped, never emitted
 /// as empty paragraphs.
+// Pass-by-value is the established Task 13 signature (mirrors the driver,
+// which hands over the owned line vec); the lines are only borrowed now
+// that classification is incremental.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn classify(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
-    /// Open paragraph: text plus the last line's font size and top edge
-    /// (the gap rule needs both).
-    struct Para {
-        text: String,
-        font_size: f64,
-        y0: f64,
+    let mut c = Classifier::new(signals);
+    for line in &lines {
+        c.feed(line);
     }
-    let flush = |blocks: &mut Vec<Block>, para: &mut Option<Para>| {
-        if let Some(p) = para.take() {
-            blocks.push(Block::Paragraph(p.text));
-        }
-    };
-    let mut blocks = Vec::new();
-    let mut para: Option<Para> = None;
-    for line in lines {
-        let text = line.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let sig = normalize_signature(text);
-        if signals.headers.contains(&sig) || signals.footers.contains(&sig) {
-            flush(&mut blocks, &mut para);
-            continue;
-        }
-        let ratio = if signals.body_size > 0.0 {
-            line.font_size / signals.body_size
+    c.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Borderless table detection (spec §7 v1.5; liteparse `try_detect_table*`,
+// adapted: no ruled-line graphics, words rebuilt from advance gaps, word x0s
+// clustered across the run instead of PDFium span pieces).
+// ---------------------------------------------------------------------------
+
+/// A table needs at least this many consecutive candidate lines.
+const TABLE_MIN_ROWS: usize = 3;
+/// …and each candidate line needs at least this many words (single-word
+/// lines break runs — they carry no column signal).
+const TABLE_MIN_WORDS: usize = 2;
+/// Candidate lines sit within this fraction of the body size (heading-size
+/// lines break runs).
+const TABLE_BODY_SIZE_TOLERANCE: f64 = 0.2;
+/// Run continuity: the bottom-to-top vertical gap between consecutive
+/// candidate lines stays within this many times the previous line's font
+/// size (liteparse `table_rows_adjacent`, restated in `Line` geometry).
+const TABLE_ROW_GAP_RATIO: f64 = 2.5;
+/// Column anchors: word x0s within this many times the run's font size
+/// belong to the same column.
+const TABLE_COL_TOLERANCE_RATIO: f64 = 0.5;
+/// Gutter check: between consecutive anchor columns a line occupies, the
+/// whitespace gap must reach this many times the line's font size. Prose
+/// word spacing (~0.25em) fails; table gutters pass.
+const TABLE_GUTTER_RATIO: f64 = 0.75;
+/// Occupancy (liteparse `count_text_table_runs` criterion): ≥60% of a
+/// line's words start at an anchor, and each anchor column is occupied by
+/// ≥60% of the run's lines. Exact 3/5 comparisons, so a 2/3 sparse row
+/// (67%) passes.
+const TABLE_OCCUPANCY_NUM: usize = 3;
+const TABLE_OCCUPANCY_DEN: usize = 5;
+/// Fewer than two columns is a definition list, not a table.
+const TABLE_MIN_COLUMNS: usize = 2;
+
+/// Detect borderless tables in reading-ordered `lines` and classify the
+/// rest: a run of [`TABLE_MIN_ROWS`]+ consecutive body-size lines whose
+/// word x0s cluster into ≥ [`TABLE_MIN_COLUMNS`] anchor columns — with a
+/// real gutter between occupied column pairs and 60% line/column
+/// occupancy — becomes [`Block::Table`]; every other line goes through the
+/// same heading/paragraph rules as [`classify`]. Runs classification
+/// internally and replaces the bare `classify` call in the driver
+/// (Task 15 wires it in).
+///
+/// OCR-source lines carry no word geometry (`words` is empty), so they
+/// fail the word-count gate and never join a run.
+// Pass-by-value is the binding Task 14 signature (mirrors `classify`);
+// dead until Task 15 wires the driver over from `classify`.
+#[allow(dead_code, clippy::needless_pass_by_value)]
+pub(crate) fn detect_tables(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
+    let mut c = Classifier::new(signals);
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some((rows, end)) = try_table_run(&lines, i, signals) {
+            c.flush();
+            c.blocks.push(Block::Table(rows));
+            i = end;
         } else {
-            0.0
-        };
-        if ratio >= HEADING_MIN_RATIO {
-            flush(&mut blocks, &mut para);
-            let level = if ratio >= HEADING_H1_RATIO {
-                1
-            } else if ratio >= HEADING_H2_RATIO {
-                2
-            } else if ratio >= HEADING_H3_RATIO {
-                3
-            } else {
-                4
-            };
-            blocks.push(Block::Heading {
-                level,
-                text: text.to_string(),
-            });
-            continue;
+            c.feed(&lines[i]);
+            i += 1;
         }
-        match para.as_mut() {
-            Some(p) if line.rect.y0 - p.y0 <= PARAGRAPH_GAP_RATIO * p.font_size => {
-                if p.text.ends_with('-') {
-                    p.text.pop();
-                } else {
-                    p.text.push(' ');
-                }
-                p.text.push_str(text);
-                p.font_size = line.font_size;
-                p.y0 = line.rect.y0;
-            }
-            _ => {
-                flush(&mut blocks, &mut para);
-                para = Some(Para {
-                    text: text.to_string(),
-                    font_size: line.font_size,
-                    y0: line.rect.y0,
-                });
+    }
+    c.finish()
+}
+
+/// If a table run starts at `lines[start]`, return its rows of cells and
+/// the index one past the run's last line; `None` falls through to normal
+/// classification of that one line (the walk retries at `start + 1`, so a
+/// table whose run begins deeper inside a candidate band is still found).
+fn try_table_run(
+    lines: &[Line],
+    start: usize,
+    signals: &DocSignals,
+) -> Option<(Vec<Vec<String>>, usize)> {
+    if !table_candidate(&lines[start], signals) {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < lines.len()
+        && table_candidate(&lines[end], signals)
+        && lines[end].rect.y0 - lines[end - 1].rect.y1
+            <= TABLE_ROW_GAP_RATIO * lines[end - 1].font_size
+    {
+        end += 1;
+    }
+    let run = &lines[start..end];
+    if run.len() < TABLE_MIN_ROWS {
+        return None;
+    }
+    // All run lines are within 20% of the body size, so the first line's
+    // size is a representative scale for the anchor tolerance.
+    let tol = TABLE_COL_TOLERANCE_RATIO * run[0].font_size;
+    let anchors = column_anchors(run, tol);
+    if anchors.len() < TABLE_MIN_COLUMNS {
+        return None;
+    }
+    // Word → column assignment: nearest anchor within tolerance; words
+    // landing between columns (unassigned) count against line occupancy.
+    let assign = |line: &Line| -> Vec<Option<usize>> {
+        line.words
+            .iter()
+            .map(|w| {
+                anchors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| (w.x0 - *a).abs() <= tol)
+                    .min_by(|(ai, a), (bi, b)| {
+                        (w.x0 - *a)
+                            .abs()
+                            .total_cmp(&(w.x0 - *b).abs())
+                            .then_with(|| ai.cmp(bi))
+                    })
+                    .map(|(i, _)| i)
+            })
+            .collect()
+    };
+    let assigned: Vec<Vec<Option<usize>>> = run.iter().map(assign).collect();
+    // Gutter check: for every pair of consecutive anchor columns a line
+    // occupies, the whitespace between the right edge of the left cell's
+    // last word and the left edge of the right cell's first word must be
+    // a real gutter, not a prose word space.
+    for (line, cols) in run.iter().zip(&assigned) {
+        let gutter = TABLE_GUTTER_RATIO * line.font_size;
+        for pair in 0..anchors.len() - 1 {
+            let left = line
+                .words
+                .iter()
+                .zip(cols)
+                .filter(|(_, c)| **c == Some(pair))
+                .map(|(w, _)| w.x1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let right = line
+                .words
+                .iter()
+                .zip(cols)
+                .filter(|(_, c)| **c == Some(pair + 1))
+                .map(|(w, _)| w.x0)
+                .fold(f64::INFINITY, f64::min);
+            if left.is_finite() && right.is_finite() && right - left < gutter {
+                return None;
             }
         }
     }
-    flush(&mut blocks, &mut para);
-    blocks
+    // Line occupancy: ≥60% of the line's words start at an anchor.
+    for (line, cols) in run.iter().zip(&assigned) {
+        let on_anchor = cols.iter().filter(|c| c.is_some()).count();
+        if on_anchor * TABLE_OCCUPANCY_DEN < line.words.len() * TABLE_OCCUPANCY_NUM {
+            return None;
+        }
+    }
+    // Column occupancy: each anchor is used by ≥60% of the run's lines.
+    for col in 0..anchors.len() {
+        let occupied = assigned
+            .iter()
+            .filter(|cols| cols.contains(&Some(col)))
+            .count();
+        if occupied * TABLE_OCCUPANCY_DEN < run.len() * TABLE_OCCUPANCY_NUM {
+            return None;
+        }
+    }
+    // Cell text: words assigned to a column join with spaces; a column
+    // with no word in a line yields an empty cell.
+    let rows = run
+        .iter()
+        .zip(&assigned)
+        .map(|(line, cols)| {
+            let mut cells = vec![String::new(); anchors.len()];
+            for (w, c) in line.words.iter().zip(cols) {
+                if let Some(col) = c {
+                    if !cells[*col].is_empty() {
+                        cells[*col].push(' ');
+                    }
+                    cells[*col].push_str(&w.text);
+                }
+            }
+            cells
+        })
+        .collect();
+    Some((rows, end))
+}
+
+/// A line that can join a table run: enough words to carry column signal
+/// (OCR lines have none and are excluded here) and a font size within
+/// [`TABLE_BODY_SIZE_TOLERANCE`] of the body size.
+fn table_candidate(line: &Line, signals: &DocSignals) -> bool {
+    if line.words.len() < TABLE_MIN_WORDS {
+        return false;
+    }
+    signals.body_size > 0.0
+        && (line.font_size - signals.body_size).abs()
+            <= TABLE_BODY_SIZE_TOLERANCE * signals.body_size
+}
+
+/// Cluster the run's word x0 positions into sorted column anchors:
+/// positions within `tol` of a cluster's running mean merge into it (the
+/// mean keeps the anchor centered as left/right-aligned cells drift in).
+#[allow(clippy::cast_precision_loss)] // cluster sizes are tiny; exact in f64
+fn column_anchors(run: &[Line], tol: f64) -> Vec<f64> {
+    let mut xs: Vec<f64> = run
+        .iter()
+        .flat_map(|l| l.words.iter().map(|w| w.x0))
+        .collect();
+    xs.sort_by(f64::total_cmp);
+    // (sum, count) per open cluster; anchors are the final means.
+    let mut clusters: Vec<(f64, usize)> = Vec::new();
+    for x in xs {
+        match clusters.last_mut() {
+            Some((sum, n)) if (x - *sum / *n as f64).abs() <= tol => {
+                *sum += x;
+                *n += 1;
+            }
+            _ => clusters.push((x, 1)),
+        }
+    }
+    clusters.iter().map(|(sum, n)| sum / *n as f64).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +1015,15 @@ pub(crate) fn render(
             Block::Paragraph(text) => {
                 sink.write_str(text)?;
                 sink.write_str("\n")?;
+            }
+            // Interim plain-lines rendering so Task 14 stays compile-safe
+            // and testable; Task 15 replaces this arm with markdown
+            // pipe-table output.
+            Block::Table(rows) => {
+                for row in rows {
+                    sink.write_str(&row.join(" | "))?;
+                    sink.write_str("\n")?;
+                }
             }
         }
     }
@@ -1097,6 +1365,112 @@ mod tests {
         let blocks = classify(lines, &sig);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "real text"));
+    }
+
+    /// Build a word-ful Line (detect_tables reads words, not just text).
+    #[allow(clippy::cast_precision_loss)] // tiny synthetic word lengths; exact in f64
+    fn wline(words: &[&str], x0s: &[f64], y0: f64) -> Line {
+        assert_eq!(words.len(), x0s.len());
+        let words_v: Vec<Word> = words
+            .iter()
+            .zip(x0s)
+            .map(|(t, x)| Word {
+                text: t.to_string(),
+                x0: *x,
+                x1: *x + t.len() as f64 * 6.0,
+            })
+            .collect();
+        let text = words.join(" ");
+        Line {
+            text,
+            rect: PtRect {
+                x0: x0s[0],
+                y0,
+                x1: 400.0,
+                y1: y0 + 12.0,
+            },
+            font_size: 12.0,
+            source: LineSource::Native,
+            words: words_v,
+        }
+    }
+
+    #[test]
+    fn detects_simple_grid() {
+        let lines = vec![
+            wline(&["Name", "Age", "City"], &[72.0, 200.0, 300.0], 100.0),
+            wline(&["Alice", "30", "NYC"], &[72.0, 200.0, 300.0], 114.0),
+            wline(&["Bob", "25", "LA"], &[72.0, 200.0, 300.0], 128.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Table(rows) => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0], vec!["Name", "Age", "City"]);
+                assert_eq!(rows[2], vec!["Bob", "25", "LA"]);
+            }
+            other => panic!("expected table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prose_is_not_a_table() {
+        // Realistic prose spacing (6pt/char, ~3pt word gaps at 12pt):
+        // aligned-looking x0s but gutters of 3pt < 0.75*12=9pt → rejected
+        // by the gutter check.
+        let lines = vec![
+            wline(&["The", "quick", "brown"], &[72.0, 93.0, 126.0], 100.0),
+            wline(&["fox", "jumps", "over"], &[72.0, 93.0, 126.0], 114.0),
+            wline(&["the", "lazy", "dog"], &[72.0, 93.0, 126.0], 128.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        assert!(blocks.iter().all(|b| matches!(b, Block::Paragraph(_))));
+    }
+
+    #[test]
+    fn short_run_is_not_a_table() {
+        // Only 2 aligned rows — below the 3-line minimum.
+        let lines = vec![
+            wline(&["a", "b"], &[72.0, 200.0], 100.0),
+            wline(&["c", "d"], &[72.0, 200.0], 114.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        assert!(blocks.iter().all(|b| matches!(b, Block::Paragraph(_))));
+    }
+
+    #[test]
+    fn missing_cell_yields_empty_string() {
+        let lines = vec![
+            wline(&["Name", "Age", "City"], &[72.0, 200.0, 300.0], 100.0),
+            wline(&["Alice", "NYC"], &[72.0, 300.0], 114.0), // no Age cell
+            wline(&["Bob", "25", "LA"], &[72.0, 200.0, 300.0], 128.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        match &blocks[0] {
+            Block::Table(rows) => assert_eq!(rows[1], vec!["Alice", "", "NYC"]),
+            other => panic!("expected table, got {other:?}"),
+        }
     }
 
     #[test]
