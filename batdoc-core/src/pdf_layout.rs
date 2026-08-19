@@ -21,8 +21,6 @@ use crate::pdf_text::{PositionedChar, PositionedPage};
 /// Where a line's text came from. `Ocr` lines are synthesized by the
 /// region-aware merge (later phase) rather than from native PDF glyphs.
 ///
-/// Consumed by Tasks 10–13 — allow dead code until those land.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LineSource {
     Native,
@@ -32,8 +30,6 @@ pub(crate) enum LineSource {
 /// A word with its x-extent, rebuilt from per-char advance gaps (spec §7 —
 /// NOT naive space splitting).
 ///
-/// Consumed by Tasks 10–13 — allow dead code until those land.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Word {
     pub text: String,
@@ -44,11 +40,12 @@ pub(crate) struct Word {
 /// A baseline cluster of chars assembled into text, with the union of its
 /// char boxes in top-down page space.
 ///
-/// Consumed by Tasks 10–13 — allow dead code until those land.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct Line {
     pub text: String,
+    /// Per-word x-extents: read by the layout unit tests today and by the
+    /// table/list classifiers (Tasks 14–16).
+    #[allow(dead_code)]
     pub words: Vec<Word>,
     pub rect: PtRect,
     /// Median transformed font size of the line's chars.
@@ -82,8 +79,6 @@ const R360: u16 = 360;
 
 /// Assemble one page of positioned chars into lines (words, rects, sizes).
 ///
-/// Consumed by Tasks 10–13 — allow dead code until those land.
-#[allow(dead_code)]
 pub(crate) fn assemble(page: &PositionedPage) -> Vec<Line> {
     if page.chars.is_empty() {
         return Vec::new();
@@ -365,9 +360,7 @@ struct Cut {
 }
 
 /// Order `lines` for reading: recursive XY-cut, columns left→right inside
-/// bands top→bottom. Consumed by the Task 13 driver on the merged
-/// (native + OCR) line set — allow dead code until it lands.
-#[allow(dead_code)]
+/// bands top→bottom. Runs on the merged (native + OCR) line set.
 pub(crate) fn reading_order(lines: Vec<Line>) -> Vec<Line> {
     let mut out = Vec::with_capacity(lines.len());
     let median = median_font_size(&lines);
@@ -510,9 +503,6 @@ const HEADER_FOOTER_PAGE_DIV: usize = 3;
 
 /// Document-wide aggregates collected in driver pass 1 (tiny — no pages
 /// retained, spec §4.2/§11).
-///
-/// Consumed by Task 13 — allow dead code until it lands.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct DocSignals {
     /// Modal font size across the document (quarter-point buckets) — the
@@ -525,9 +515,6 @@ pub(crate) struct DocSignals {
 }
 
 /// Pass-1 accumulator for [`DocSignals`].
-///
-/// Consumed by Task 13 — allow dead code until it lands.
-#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct DocSignalsBuilder {
     /// Quarter-point bucket key → summed text length at that size.
@@ -540,16 +527,12 @@ pub(crate) struct DocSignalsBuilder {
 
 /// A classified block of body content. Table and List variants arrive in
 /// Tasks 14–16.
-///
-/// Consumed by Task 13 — allow dead code until it lands.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum Block {
     Heading { level: u8, text: String },
     Paragraph(String),
 }
 
-#[allow(dead_code)] // consumed by Task 13
 impl DocSignalsBuilder {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -677,9 +660,6 @@ fn normalize_signature(text: &str) -> String {
 ///
 /// Whitespace-only lines (all-space clusters) are dropped, never emitted
 /// as empty paragraphs.
-///
-/// Consumed by Task 13 — allow dead code until it lands.
-#[allow(dead_code)]
 pub(crate) fn classify(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
     /// Open paragraph: text plus the last line's font size and top edge
     /// (the gap rule needs both).
@@ -750,6 +730,36 @@ pub(crate) fn classify(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
     }
     flush(&mut blocks, &mut para);
     blocks
+}
+
+// ---------------------------------------------------------------------------
+// Markdown render (Task 13 driver output).
+// ---------------------------------------------------------------------------
+
+/// Render classified blocks to markdown: blocks separated by exactly one
+/// blank line, document ends with a single trailing newline.
+pub(crate) fn render(
+    blocks: &[Block],
+    sink: &mut impl crate::ExtractSink,
+) -> crate::error::Result<()> {
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            sink.write_str("\n")?;
+        }
+        match block {
+            Block::Heading { level, text } => {
+                sink.write_str(&"#".repeat(usize::from(*level)))?;
+                sink.write_str(" ")?;
+                sink.write_str(text)?;
+                sink.write_str("\n")?;
+            }
+            Block::Paragraph(text) => {
+                sink.write_str(text)?;
+                sink.write_str("\n")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

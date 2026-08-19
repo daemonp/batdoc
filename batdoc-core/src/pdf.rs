@@ -186,56 +186,168 @@ pub(crate) fn extract_plain_to(
 
 /// Extract markdown from a PDF.
 ///
-/// Each page gets a `## Page N` heading. Single-page documents omit the
-/// heading since it would be redundant.
+/// Positioned layout pipeline: pages are classified into headings and
+/// paragraphs (see [`extract_markdown_to`]). Multiple emitted pages get a
+/// `## Page N` heading; a single emitted page omits it as redundant.
 pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<String> {
     let mut out = String::new();
     extract_markdown_to(data, opts, &mut out)?;
     Ok(out)
 }
 
-/// Stream markdown from a PDF into `sink`, one cleaned page at a time.
+/// Stream markdown from a PDF into `sink` via the two-pass positioned-layout
+/// driver (spec §4.2):
 ///
-/// Single non-empty page: emit just the page text (no heading). Multiple:
-/// each page gets a `## Page N\n\n` heading (1-based on the ORIGINAL page
-/// index, not the filtered index) with `\n` between pages. If no page has
-/// text, [`no_text_error`] is returned with the OCR-attempt wording.
+/// - **Pass 1** collects document-wide signals (modal body size, repeated
+///   first/last-line signatures); each page is dropped immediately.
+/// - **Pass 2** keeps one positioned page in memory at a time: assemble →
+///   garbled-page detection → OCR merge (region-aware when the image has a
+///   placement, page-end append otherwise) → reading order → classify →
+///   render into a page-local buffer.
+///
+/// Pages whose rendered text is empty/whitespace are skipped. A single
+/// emitted page is written bare; multiple pages each get a
+/// `## Page N\n\n` heading (N = ORIGINAL 1-based page number, not the
+/// filtered index) with `\n` between pages. If nothing is emitted,
+/// [`no_text_error`] is returned with the OCR-attempt wording.
 pub(crate) fn extract_markdown_to(
     data: &[u8],
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
-    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
-    let nonempty: Vec<(usize, &str)> = pages
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| {
-            if s.is_empty() {
-                None
-            } else {
-                Some((i + 1, s.as_str()))
+    let mut doc = match lopdf::Document::load_mem(data) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(BatdocError::Document(format!("PDF extraction failed: {e}")));
+        }
+    };
+    if doc.is_encrypted() {
+        // Mirror pdf-extract's `maybe_decrypt`: empty-password attempt,
+        // and the same error string the plain path produces on failure.
+        if let Err(e) = doc.decrypt("") {
+            use lopdf::encryption::DecryptionError;
+            if matches!(
+                e,
+                lopdf::Error::Decryption(DecryptionError::IncorrectPassword)
+            ) {
+                return Err(BatdocError::Document(format!(
+                    "PDF extraction failed: {}",
+                    pdf_extract::OutputError::PdfError(e)
+                )));
             }
-        })
-        .collect();
+            // Other decrypt failures: log-and-continue, per the plan ruling.
+        }
+    }
+    let page_ids: Vec<lopdf::ObjectId> = doc.get_pages().into_values().collect();
+    // Absurd-page-count guard: > u32::MAX pages cannot be numbered anyway.
+    let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
 
-    if nonempty.is_empty() {
-        return Err(no_text_error(ocr_attempted));
+    // Pass 1: doc-level signals (tiny aggregates; pages dropped immediately).
+    let mut sig_builder = crate::pdf_layout::DocSignalsBuilder::new();
+    for page_num in 1..=page_count {
+        let page = crate::pdf_text::extract_positioned_page(&doc, page_num)?;
+        sig_builder.add_lines(&crate::pdf_layout::assemble(&page));
+    }
+    let signals = sig_builder.finish(page_ids.len());
+
+    // Pass 2: one positioned page in memory at a time. Rendered per-page
+    // markdown is buffered (bounded by output size, same memory profile as
+    // today's Vec<String> of all page text; the single-page heading rule
+    // requires not emitting page 1 before knowing whether page 2 exists).
+    let mut emitted: Vec<(u32, String)> = Vec::new();
+    let mut ocr_attempted = opts.ocr;
+    for (page_num, page_id) in (1..=page_count).zip(&page_ids) {
+        let page = crate::pdf_text::extract_positioned_page(&doc, page_num)?;
+        let garbled = page_looks_garbled(&page);
+        let mut native = crate::pdf_layout::assemble(&page);
+        if garbled {
+            native.clear(); // garbage native layer: OCR replaces it
+        }
+        // OCR when asked, when the page assembled no non-empty lines
+        // (auto-fallback, mirroring `extract_pages_with_fallback`), or when
+        // the native layer is garbage.
+        let need_ocr = opts.ocr || garbled || native.iter().all(|l| l.text.trim().is_empty());
+        let mut ocr_lines = Vec::new();
+        let mut unplaced_text = String::new();
+        if need_ocr {
+            ocr_attempted = true;
+            let placed = crate::pdf_geometry::placed_images(&doc, *page_id);
+            if let Ok(images) = doc.get_page_images(*page_id) {
+                for img in crate::pdf_ocr::ocr_candidates(&images) {
+                    let Some(rgb) = crate::pdf_ocr::decode_pdf_image(img) else {
+                        continue;
+                    };
+                    let lines = crate::ocr::ocr_rgb_image_lines(&rgb)?;
+                    if lines.is_empty() {
+                        continue;
+                    }
+                    match placed.iter().find(|p| p.object_id == img.id) {
+                        Some(p) => ocr_lines.extend(crate::pdf_ocr::map_ocr_lines(
+                            p,
+                            rgb.width(),
+                            rgb.height(),
+                            &lines,
+                        )),
+                        None => {
+                            // Inline (BI/EI) or otherwise unplaceable image:
+                            // page-end append (today's fallback, spec §4.1).
+                            for l in &lines {
+                                unplaced_text.push_str(&l.text);
+                                unplaced_text.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let merged = crate::pdf_ocr::merge(native, ocr_lines);
+        let ordered = crate::pdf_layout::reading_order(merged);
+        let blocks = crate::pdf_layout::classify(ordered, &signals);
+        let mut page_md = String::new();
+        crate::pdf_layout::render(&blocks, &mut page_md)?;
+        if !unplaced_text.trim().is_empty() {
+            if !page_md.is_empty() {
+                page_md.push('\n');
+            }
+            page_md.push_str(unplaced_text.trim_end());
+            page_md.push('\n');
+        }
+        if !page_md.trim().is_empty() {
+            emitted.push((page_num, page_md));
+        }
     }
 
-    if nonempty.len() == 1 {
+    if emitted.is_empty() {
+        return Err(no_text_error(ocr_attempted));
+    }
+    if emitted.len() == 1 {
         // Single page — no heading needed
-        sink.write_str(nonempty[0].1)?;
+        sink.write_str(&emitted[0].1)?;
     } else {
-        for (i, (page_num, text)) in nonempty.iter().enumerate() {
+        for (i, (page_num, page_md)) in emitted.iter().enumerate() {
             if i > 0 {
                 sink.write_str("\n")?;
             }
             sink.write_str(&format!("## Page {page_num}\n\n"))?;
-            sink.write_str(text)?;
+            sink.write_str(page_md)?;
         }
     }
-
     Ok(())
+}
+
+/// ≥10% replacement/PUA chars means the native text layer is garbage
+/// (matches the fork's recovery-flip threshold, spec §5).
+fn page_looks_garbled(page: &crate::pdf_text::PositionedPage) -> bool {
+    let total = page.chars.len();
+    if total == 0 {
+        return false;
+    }
+    let bad = page
+        .chars
+        .iter()
+        .filter(|c| c.ch == '\u{FFFD}' || ('\u{E000}'..='\u{F8FF}').contains(&c.ch))
+        .count();
+    bad * 10 >= total
 }
 
 #[cfg(test)]
@@ -372,6 +484,98 @@ startxref\n\
             assert_eq!(actual, expected);
             assert!(out.is_empty());
         }
+    }
+
+    #[test]
+    fn render_blocks_blank_line_separated() {
+        let blocks = vec![
+            crate::pdf_layout::Block::Heading {
+                level: 2,
+                text: "Title".into(),
+            },
+            crate::pdf_layout::Block::Paragraph("Body text.".into()),
+        ];
+        let mut out = String::new();
+        crate::pdf_layout::render(&blocks, &mut out).unwrap();
+        assert_eq!(out, "## Title\n\nBody text.\n");
+    }
+
+    #[test]
+    fn page_looks_garbled_threshold() {
+        use crate::pdf_text::{PositionedChar, PositionedPage};
+        let mk = |bad: usize, total: usize| {
+            let chars = (0..total)
+                .map(|i| PositionedChar {
+                    ch: if i < bad { '\u{FFFD}' } else { 'a' },
+                    x: 0.0,
+                    y: 0.0,
+                    font_size: 12.0,
+                    advance: 6.0,
+                    rotation: 0,
+                })
+                .collect();
+            PositionedPage {
+                page_num: 1,
+                media_box: (0.0, 0.0, 612.0, 792.0),
+                chars,
+            }
+        };
+        assert!(page_looks_garbled(&mk(2, 10))); // 20% bad ≥ 10%
+        assert!(!page_looks_garbled(&mk(1, 20))); // 5% bad
+        assert!(!page_looks_garbled(&mk(0, 0))); // empty page is not garbled
+    }
+
+    #[test]
+    fn markdown_single_page_omits_page_heading() {
+        let data = build_text_pdf(&["Hello World"]);
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert_eq!(md, "Hello World\n");
+        assert!(!md.contains("## Page"));
+    }
+
+    #[test]
+    fn markdown_multi_page_keeps_page_headings() {
+        let data = build_text_pdf(&["PageOne", "", "PageThree"]);
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(
+            md.contains("## Page 1") && md.contains("## Page 3") && !md.contains("## Page 2"),
+            "unexpected markdown: {md:?}"
+        );
+        assert!(md.contains("PageOne") && md.contains("PageThree"));
+    }
+
+    #[test]
+    fn markdown_textless_pdf_reports_ocr_wording() {
+        // The no-page-tree PDF from extract_plain_textless_pdf_auto_ocrs_and_reports:
+        // markdown path must surface the same no-text error wording.
+        let data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\nxref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n110\n%%EOF\n";
+        let err = extract_markdown(data, crate::ExtractOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no extractable text"), "got: {err}");
+    }
+
+    #[test]
+    fn markdown_heading_from_font_size_e2e() {
+        // 24pt title (short) then 12pt body (longer, so the modal size is
+        // 12 and 24/12 = 2.0 → H1) — from a real PDF, end to end.
+        let data = build_text_pdf_content(
+            "BT /F1 24 Tf 72 700 Td (Big) Tj ET\nBT /F1 12 Tf 72 660 Td (some body text goes here) Tj ET",
+        );
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert_eq!(md, "# Big\n\nsome body text goes here\n", "got: {md:?}");
+    }
+
+    #[test]
+    fn markdown_two_column_reading_order_e2e() {
+        let data = build_text_pdf_content(
+            "BT /F1 12 Tf 72 700 Td (L1) Tj ET\nBT /F1 12 Tf 320 700 Td (R1) Tj ET\nBT /F1 12 Tf 72 680 Td (L2) Tj ET",
+        );
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        let l1 = md.find("L1").unwrap();
+        let l2 = md.find("L2").unwrap();
+        let r1 = md.find("R1").unwrap();
+        assert!(l1 < l2 && l2 < r1, "reading order wrong: {md:?}");
     }
 
     /// Build a minimal one-or-more page PDF with a WinAnsi Helvetica text layer,
