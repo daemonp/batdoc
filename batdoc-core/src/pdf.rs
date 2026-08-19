@@ -195,6 +195,96 @@ pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> Result<Stri
     Ok(out)
 }
 
+/// Result of rendering all pages with a given set of document signals.
+struct RenderedPages {
+    emitted: Vec<(u32, String)>,
+    ocr_attempted: bool,
+    had_native_lines: bool,
+}
+
+/// Render every page into a markdown buffer using the supplied `signals`.
+/// Returns the emitted pages, whether OCR was attempted, and whether any
+/// page had non-empty native assembled lines (the safety-net trigger).
+fn render_pages(
+    doc: &lopdf::Document,
+    page_ids: &[lopdf::ObjectId],
+    page_count: u32,
+    signals: &crate::pdf_layout::DocSignals,
+    opts: ExtractOptions,
+) -> Result<RenderedPages> {
+    let mut emitted: Vec<(u32, String)> = Vec::new();
+    let mut ocr_attempted = opts.ocr;
+    let mut had_native_lines = false;
+    for (page_num, page_id) in (1..=page_count).zip(page_ids) {
+        let page = crate::pdf_text::extract_positioned_page(doc, page_num)?;
+        let garbled = page_looks_garbled(&page);
+        let mut native = crate::pdf_layout::assemble(&page);
+        if !native.is_empty() {
+            had_native_lines = true;
+        }
+        if garbled {
+            native.clear(); // garbage native layer: OCR replaces it
+        }
+        // OCR when asked, when the page assembled no non-empty lines
+        // (auto-fallback, mirroring `extract_pages_with_fallback`), or when
+        // the native layer is garbage.
+        let need_ocr = opts.ocr || garbled || native.iter().all(|l| l.text.trim().is_empty());
+        let mut ocr_lines = Vec::new();
+        let mut unplaced_text = String::new();
+        if need_ocr {
+            ocr_attempted = true;
+            let placed = crate::pdf_geometry::placed_images(doc, *page_id);
+            if let Ok(images) = doc.get_page_images(*page_id) {
+                for img in crate::pdf_ocr::ocr_candidates(&images) {
+                    let Some(rgb) = crate::pdf_ocr::decode_pdf_image(img) else {
+                        continue;
+                    };
+                    let lines = crate::ocr::ocr_rgb_image_lines(&rgb)?;
+                    if lines.is_empty() {
+                        continue;
+                    }
+                    match placed.iter().find(|p| p.object_id == img.id) {
+                        Some(p) => ocr_lines.extend(crate::pdf_ocr::map_ocr_lines(
+                            p,
+                            rgb.width(),
+                            rgb.height(),
+                            &lines,
+                        )),
+                        None => {
+                            // Inline (BI/EI) or otherwise unplaceable image:
+                            // page-end append (today's fallback, spec §4.1).
+                            for l in &lines {
+                                unplaced_text.push_str(&l.text);
+                                unplaced_text.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let merged = crate::pdf_ocr::merge(native, ocr_lines);
+        let ordered = crate::pdf_layout::reading_order(merged);
+        let blocks = crate::pdf_layout::detect_tables(ordered, signals);
+        let mut page_md = String::new();
+        crate::pdf_layout::render(&blocks, &mut page_md)?;
+        if !unplaced_text.trim().is_empty() {
+            if !page_md.is_empty() {
+                page_md.push('\n');
+            }
+            page_md.push_str(unplaced_text.trim_end());
+            page_md.push('\n');
+        }
+        if !page_md.trim().is_empty() {
+            emitted.push((page.page_num, page_md));
+        }
+    }
+    Ok(RenderedPages {
+        emitted,
+        ocr_attempted,
+        had_native_lines,
+    })
+}
+
 /// Stream markdown from a PDF into `sink` via the two-pass positioned-layout
 /// driver (spec §4.2):
 ///
@@ -254,71 +344,26 @@ pub(crate) fn extract_markdown_to(
     // markdown is buffered (bounded by output size, same memory profile as
     // today's Vec<String> of all page text; the single-page heading rule
     // requires not emitting page 1 before knowing whether page 2 exists).
-    let mut emitted: Vec<(u32, String)> = Vec::new();
-    let mut ocr_attempted = opts.ocr;
-    for (page_num, page_id) in (1..=page_count).zip(&page_ids) {
-        let page = crate::pdf_text::extract_positioned_page(&doc, page_num)?;
-        let garbled = page_looks_garbled(&page);
-        let mut native = crate::pdf_layout::assemble(&page);
-        if garbled {
-            native.clear(); // garbage native layer: OCR replaces it
-        }
-        // OCR when asked, when the page assembled no non-empty lines
-        // (auto-fallback, mirroring `extract_pages_with_fallback`), or when
-        // the native layer is garbage.
-        let need_ocr = opts.ocr || garbled || native.iter().all(|l| l.text.trim().is_empty());
-        let mut ocr_lines = Vec::new();
-        let mut unplaced_text = String::new();
-        if need_ocr {
-            ocr_attempted = true;
-            let placed = crate::pdf_geometry::placed_images(&doc, *page_id);
-            if let Ok(images) = doc.get_page_images(*page_id) {
-                for img in crate::pdf_ocr::ocr_candidates(&images) {
-                    let Some(rgb) = crate::pdf_ocr::decode_pdf_image(img) else {
-                        continue;
-                    };
-                    let lines = crate::ocr::ocr_rgb_image_lines(&rgb)?;
-                    if lines.is_empty() {
-                        continue;
-                    }
-                    match placed.iter().find(|p| p.object_id == img.id) {
-                        Some(p) => ocr_lines.extend(crate::pdf_ocr::map_ocr_lines(
-                            p,
-                            rgb.width(),
-                            rgb.height(),
-                            &lines,
-                        )),
-                        None => {
-                            // Inline (BI/EI) or otherwise unplaceable image:
-                            // page-end append (today's fallback, spec §4.1).
-                            for l in &lines {
-                                unplaced_text.push_str(&l.text);
-                                unplaced_text.push('\n');
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let merged = crate::pdf_ocr::merge(native, ocr_lines);
-        let ordered = crate::pdf_layout::reading_order(merged);
-        let blocks = crate::pdf_layout::detect_tables(ordered, &signals);
-        let mut page_md = String::new();
-        crate::pdf_layout::render(&blocks, &mut page_md)?;
-        if !unplaced_text.trim().is_empty() {
-            if !page_md.is_empty() {
-                page_md.push('\n');
-            }
-            page_md.push_str(unplaced_text.trim_end());
-            page_md.push('\n');
-        }
-        if !page_md.trim().is_empty() {
-            emitted.push((page_num, page_md));
+    let rendered = render_pages(&doc, &page_ids, page_count, &signals, opts)?;
+    let mut emitted = rendered.emitted;
+
+    // Safety net: if furniture stripping dropped every native line, re-run
+    // pass 2 with empty header/footer sets (body_size preserved) so real
+    // documents whose only text was misclassified as furniture still emit.
+    if emitted.is_empty() && rendered.had_native_lines {
+        let fallback_signals = crate::pdf_layout::DocSignals {
+            body_size: signals.body_size,
+            headers: std::collections::HashSet::new(),
+            footers: std::collections::HashSet::new(),
+        };
+        let fallback = render_pages(&doc, &page_ids, page_count, &fallback_signals, opts)?;
+        if !fallback.emitted.is_empty() {
+            emitted = fallback.emitted;
         }
     }
 
     if emitted.is_empty() {
-        return Err(no_text_error(ocr_attempted));
+        return Err(no_text_error(rendered.ocr_attempted));
     }
     if emitted.len() == 1 {
         // Single page — no heading needed
@@ -579,13 +624,14 @@ startxref\n\
     }
 
     #[test]
-    #[ignore = "characterization: documents v1 fused-gutter behavior; Phase 6 regression target"]
     fn narrow_gutter_same_baseline_fuses_into_one_line() {
+        // Characterization test for documents v1 fused-gutter behavior. Runs in
+        // CI; it will fail loudly when the Phase 6 gutter-decoupling task fixes
+        // the bug, which is the intended signal to update the assertion.
         // Two-column PDF with a 3em (36pt) gutter. Left column at x=72,
         // right column at x=180. At this narrow gap the v1 assembly pass
         // treats the same-baseline fragments as one line and emits them
-        // interleaved. This test documents the known-bad behavior the Phase 6
-        // gutter-decoupling task must fix.
+        // fused with a single space.
         let data = build_text_pdf_content(
             "BT /F1 12 Tf 72 700 Td (Left) Tj ET\nBT /F1 12 Tf 180 700 Td (Right) Tj ET",
         );
@@ -594,6 +640,20 @@ startxref\n\
         // single space between them (gap 36pt < LINE_SPLIT_RATIO·12). This is
         // the v1 known-bad output the Phase 6 gutter-decoupling task must fix.
         assert_eq!(md, "Left Right\n", "unexpected v1 fused output: {md:?}");
+    }
+
+    #[test]
+    fn furniture_stripping_safety_net_keeps_body_text() {
+        // Without the safety net, the repeated first line is a header and the
+        // repeated last line is a footer, so both are stripped and the output
+        // is empty ("no extractable text"). The net re-runs with empty
+        // header/footer sets and emits the body text.
+        let content =
+            "BT /F1 12 Tf 72 720 Td (Report page) Tj ET\nBT /F1 12 Tf 72 700 Td (Body text here) Tj ET";
+        let data = build_text_pdf_pages(&[content, content]);
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(md.contains("Body text here"), "safety net failed: {md:?}");
+        assert!(md.contains("Report page"), "safety net failed: {md:?}");
     }
 
     /// Build a minimal one-or-more page PDF with a WinAnsi Helvetica text layer,
@@ -747,6 +807,54 @@ startxref\n\
         buf
     }
 
+    /// Like `build_text_pdf_content`, but one caller-supplied content stream
+    /// per page (for multi-page fixtures with custom layout per page).
+    fn build_text_pdf_pages(contents: &[&str]) -> Vec<u8> {
+        use lopdf::{dictionary, Document as LopdfDoc, Object, Stream};
+        let mut doc = LopdfDoc::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let mut kids = Vec::new();
+        for content in contents {
+            let content_id = doc.add_object(Stream::new(
+                lopdf::Dictionary::new(),
+                content.as_bytes().to_vec(),
+            ));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => contents.len() as i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
     #[test]
     fn markdown_table_e2e() {
         // Three aligned rows at fixed x positions → pipe table in output.
@@ -768,6 +876,125 @@ startxref\n\
     #[ignore = "benchmark fixture generator — writes /tmp/batdoc-bench.pdf"]
     fn make_benchmark_pdf() {
         use lopdf::{dictionary, Document as LopdfDoc, Object, Stream};
+        // 100+ words; the first/last line on each page rotates through this
+        // list so no single normalized signature repeats enough times to be
+        // classified as a header/footer (digits would normalize away, so we
+        // use letter words).
+        let words: &[&str] = &[
+            "alpha",
+            "bravo",
+            "charlie",
+            "delta",
+            "echo",
+            "foxtrot",
+            "golf",
+            "hotel",
+            "india",
+            "juliett",
+            "kilo",
+            "lima",
+            "mike",
+            "november",
+            "oscar",
+            "papa",
+            "quebec",
+            "romeo",
+            "sierra",
+            "tango",
+            "uniform",
+            "victor",
+            "whiskey",
+            "xray",
+            "yankee",
+            "zulu",
+            "apple",
+            "banana",
+            "cherry",
+            "date",
+            "elderberry",
+            "fig",
+            "grape",
+            "honeydew",
+            "kiwi",
+            "lemon",
+            "mango",
+            "nectarine",
+            "orange",
+            "papaya",
+            "quince",
+            "raspberry",
+            "strawberry",
+            "tangerine",
+            "ugli",
+            "vanilla",
+            "watermelon",
+            "xigua",
+            "yam",
+            "zucchini",
+            "amber",
+            "blue",
+            "crimson",
+            "emerald",
+            "fuchsia",
+            "gold",
+            "indigo",
+            "jade",
+            "khaki",
+            "lavender",
+            "magenta",
+            "navy",
+            "olive",
+            "purple",
+            "rose",
+            "silver",
+            "teal",
+            "umber",
+            "violet",
+            "wheat",
+            "azure",
+            "beige",
+            "coral",
+            "denim",
+            "ebony",
+            "ivory",
+            "jet",
+            "lime",
+            "maroon",
+            "mustard",
+            "ochre",
+            "peach",
+            "plum",
+            "rust",
+            "sage",
+            "tan",
+            "turquoise",
+            "wine",
+            "ash",
+            "birch",
+            "cedar",
+            "dogwood",
+            "elm",
+            "fir",
+            "ginkgo",
+            "hickory",
+            "ironwood",
+            "juniper",
+            "koa",
+            "larch",
+            "maple",
+            "oak",
+            "pine",
+            "redwood",
+            "spruce",
+            "teak",
+            "walnut",
+            "yew",
+            "zebrawood",
+        ];
+        assert!(
+            words.len() >= 100,
+            "word list too small to avoid header/footer folding"
+        );
         let mut doc = LopdfDoc::with_version("1.4");
         let pages_id = doc.new_object_id();
         let font_id = doc.add_object(dictionary! {
@@ -781,9 +1008,12 @@ startxref\n\
         });
         let mut kids = Vec::new();
         for i in 0..200 {
+            let word = words[i % words.len()];
             let body = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(3);
             let content = format!(
-                "BT /F1 18 Tf 72 720 Td (Section {i}) Tj ET\nBT /F1 11 Tf 72 690 Td ({body}) Tj ET"
+                "BT /F1 18 Tf 72 720 Td (Topic {word} overview) Tj ET\n\
+                 BT /F1 11 Tf 72 690 Td ({body}) Tj ET\n\
+                 BT /F1 11 Tf 72 660 Td (End {word} summary) Tj ET"
             );
             let content_id =
                 doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));

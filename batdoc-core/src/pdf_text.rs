@@ -14,10 +14,6 @@ use std::panic::{self, AssertUnwindSafe};
 
 /// One decoded glyph in top-down page coordinates (y = distance from the
 /// top of the page, matching markdown reading intuition).
-///
-/// Consumed by `pdf_layout` (assembly/reading order) and `pdf_ocr`
-/// (region merge) in later phases — allow dead code until those land.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PositionedChar {
     /// The decoded character.
@@ -39,10 +35,6 @@ pub(crate) struct PositionedChar {
 /// All positioned characters of a single page. No all-pages `Vec` is ever
 /// materialized (spec §4.1 / §11): one of these at a time, dropped after
 /// emit.
-///
-/// Consumed by `pdf_layout`/the markdown driver in later phases — allow
-/// dead code until those land.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct PositionedPage {
     /// 1-based, matching `doc.get_pages()` keys.
@@ -61,7 +53,6 @@ pub(crate) struct PositionedPage {
 /// `post_transform` definition this reduces element-wise to
 /// `x = trm.m31`, `y = (ury - lly) - trm.m32` — see the plan's Task 6
 /// notes (verified against euclid 0.20.14 source).
-#[allow(dead_code)] // constructed by extract_positioned_page once pdf_layout uses it
 struct PositionedOutputDev {
     media_box: (f64, f64, f64, f64),
     chars: Vec<PositionedChar>,
@@ -131,7 +122,6 @@ impl OutputDev for PositionedOutputDev {
 }
 
 /// Snap the text matrix's rotation to 0/90/180/270.
-#[allow(dead_code)]
 fn quantize_rotation(trm: &Transform) -> u16 {
     let deg = trm.m12.atan2(trm.m11).to_degrees();
     // `.rem_euclid(4.0)` bounds the snapped quarter to [0, 4) before the
