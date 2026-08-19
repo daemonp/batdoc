@@ -736,4 +736,79 @@ startxref\n\
         let wide = encode(MAX_OCR_IMAGE_DIM + 1, 2);
         assert!(decode_jpeg_bounded(&wide).is_none());
     }
+
+    /// Golden byte-stability corpus (spec D2): plain output for these
+    /// synthetic clean documents must never change, across the pdf-extract
+    /// fork and all later PDF work. Garbled-document output may change;
+    /// clean-document output may not.
+    #[test]
+    fn golden_plain_output_clean_pdfs() {
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (build_text_pdf(&["PageOne"]), "PageOne\n"),
+            (
+                build_text_pdf(&["PageOne", "PageTwo"]),
+                "PageOne\n\nPageTwo\n",
+            ),
+            (
+                build_text_pdf(&["Hello World", "", "PageThree"]),
+                "Hello World\n\nPageThree\n",
+            ),
+            (
+                build_text_pdf_content("BT /F1 12 Tf 72 720 Td (caf\\351) Tj ET"),
+                "café\n",
+            ),
+            (
+                build_text_pdf_content("BT /F1 12 Tf 72 720 Td [(A) -120 (B)] TJ ET"),
+                "A B\n",
+            ),
+        ];
+        for (data, expected) in cases {
+            let actual = crate::extract_plain(&data, crate::Format::Pdf).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    /// Like `build_text_pdf`, but with a caller-supplied content stream
+    /// (for escapes/TJ arrays the simple builder can't express).
+    fn build_text_pdf_content(content: &str) -> Vec<u8> {
+        use lopdf::{dictionary, Document as LopdfDoc, Object, Stream};
+        let mut doc = LopdfDoc::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let content_id = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            content.as_bytes().to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1_i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
 }

@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "batdoc-core"]
+members = [".", "batdoc-core", "crates/pdf-extract"]
+
+# Local fork of pdf-extract (spec D1/D6): local builds get panic-free decode
+# + glyph recovery; downstream crates-io consumers of batdoc-core resolve
+# upstream pdf-extract 0.10 (a documented, safe degradation).
+[patch.crates-io]
+pdf-extract = { path = "crates/pdf-extract" }
 
 [package]
 name = "batdoc"
