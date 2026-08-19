@@ -72,10 +72,9 @@ const BAND_DOWN: f64 = 0.2;
 /// whole page is canonicalized to it.
 const CANONICAL_SHARE_PCT: usize = 70;
 
-// Rotation math runs in `u16`, not the `PositionedChar.rotation` `u8`:
-// 270 does not fit in a `u8`, and the module must model the full
-// 0/90/180/270 set (spec-pinned transforms) even though pdf_text today only
-// quantizes to values that survive the cast.
+// Rotation math runs in `u16` (`PositionedChar.rotation` is u16 degrees),
+// and the module must model the full 0/90/180/270 set (spec-pinned
+// transforms).
 const R90: u16 = 90;
 const R180: u16 = 180;
 const R270: u16 = 270;
@@ -100,7 +99,7 @@ pub(crate) fn assemble(page: &PositionedPage) -> Vec<Line> {
     // field's u8) and never written back into a `PositionedChar`.
     let mut groups: [Vec<PositionedChar>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for c in chars {
-        let rel = (u16::from(c.rotation) + R360 - page_rot) % R360;
+        let rel = (c.rotation + R360 - page_rot) % R360;
         groups[rot_index(rel)].push(c);
     }
 
@@ -148,7 +147,7 @@ pub(crate) fn assemble(page: &PositionedPage) -> Vec<Line> {
 fn canonicalize(chars: &[PositionedChar], w: f64, h: f64) -> (Vec<PositionedChar>, u16) {
     let mut counts = [0usize; 4];
     for c in chars {
-        counts[rot_index(u16::from(c.rotation))] += 1;
+        counts[rot_index(c.rotation)] += 1;
     }
     let mut best: u16 = 0;
     let mut best_count = 0;
