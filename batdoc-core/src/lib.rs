@@ -18,6 +18,7 @@ mod markup;
 mod ocr;
 mod pdf;
 mod pdf_geometry;
+mod pdf_layout;
 mod pdf_text;
 mod pptx;
 mod sheet;
