@@ -31,8 +31,9 @@ pub(crate) struct PositionedChar {
     /// Horizontal advance: `width * font_size + spacing`, the same quantity
     /// pdf-extract's `PlainTextOutput` tracks for its space threshold.
     pub advance: f64,
-    /// Glyph rotation quantized to 0/90/180/270 degrees.
-    pub rotation: u8,
+    /// Glyph rotation quantized to 0/90/180/270 degrees. `u16`, not `u8`:
+    /// 270° > `u8::MAX` and would overflow.
+    pub rotation: u16,
 }
 
 /// All positioned characters of a single page. No all-pages `Vec` is ever
@@ -131,12 +132,13 @@ impl OutputDev for PositionedOutputDev {
 
 /// Snap the text matrix's rotation to 0/90/180/270.
 #[allow(dead_code)]
-fn quantize_rotation(trm: &Transform) -> u8 {
+fn quantize_rotation(trm: &Transform) -> u16 {
     let deg = trm.m12.atan2(trm.m11).to_degrees();
     // `.rem_euclid(4.0)` bounds the snapped quarter to [0, 4) before the
-    // narrowing casts, so neither cast can truncate a real value.
+    // narrowing cast, so no real value can truncate or lose sign. The
+    // multiplication is in u16: quarter=3 (270°) must not overflow.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let quarter = (deg / 90.0).round().rem_euclid(4.0) as u8;
+    let quarter = (deg / 90.0).round().rem_euclid(4.0) as u16;
     quarter * 90
 }
 
@@ -208,6 +210,15 @@ mod tests {
         // Tm with a 90° rotation: 0 1 -1 0 x y.
         let page = positioned("BT /F1 12 Tf 0 1 -1 0 100 700 Tm (R) Tj ET");
         assert_eq!(page.chars[0].rotation, 90);
+    }
+
+    #[test]
+    fn captures_rotation_270() {
+        // Tm with a 270° rotation: 0 -1 1 0 x y. atan2(m12, m11) =
+        // atan2(-1, 0) = -90° → quarter 3 → 270°. 270 does not fit a u8
+        // (overflow panics in debug), so the field must be u16.
+        let page = positioned("BT /F1 12 Tf 0 -1 1 0 100 700 Tm (R) Tj ET");
+        assert_eq!(page.chars[0].rotation, 270);
     }
 
     #[test]
