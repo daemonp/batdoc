@@ -369,10 +369,6 @@ fn maybe_get_array<'a>(
 /// FontFile2/FontFile3 streams are reachable) and consulted by
 /// `decode_char`. Stored in a `RefCell` because `decode_char` takes
 /// `&self`.
-///
-/// Inert until Task 5 wires `decode_char` through it: construction fills
-/// the reverse cmap, but nothing reads the state yet.
-#[allow(dead_code)] // consulted by decode_char in Task 5
 #[derive(Clone)]
 struct FontRecovery {
     /// Inverted cmap from the embedded font program, if one is embedded.
@@ -400,7 +396,6 @@ impl FontRecovery {
     /// Record one decoded string; flip `recovering` once the garbage ratio
     /// crosses 10% with at least 20 decoded chars (avoids flapping on tiny
     /// samples). Latched: clean chars never flip it back.
-    #[allow(dead_code)] // called by decode_char in Task 5
     fn observe(&mut self, s: &str) {
         self.decoded += 1;
         let garbage = s.is_empty()
@@ -412,6 +407,64 @@ impl FontRecovery {
         }
         if self.decoded >= 20 && self.suspicious * 10 >= self.decoded {
             self.recovering = true;
+        }
+    }
+}
+
+/// Expand Unicode alphabetic presentation forms U+FB00..=U+FB06 to their
+/// ASCII decompositions. Applied ONLY to recovered glyphs (recovery
+/// paths), never to clean /ToUnicode output (batdoc D2 byte-stability).
+fn expand_ligatures(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Decode one character code with glyph recovery (batdoc spec §5.2 order):
+///
+/// 1. Healthy /ToUnicode hit (font not flipped to recovery): returned
+///    verbatim after feeding the garbage prescan (D2 byte-stability).
+/// 2. Otherwise — garbage /ToUnicode (flipped) or a miss — consult the
+///    reverse cmap from the embedded font program. The raw code is only a
+///    valid lookup key for CID fonts (code == glyph id under Identity-H);
+///    simple fonts must not route raw codes here (their char codes are
+///    encoding-table indices, not glyph ids).
+/// 3. Ligatures/presentation forms in the recovered glyph are expanded.
+/// 4. Recovery produced nothing: return "" and let the caller apply its
+///    existing miss behavior (CID: empty string; simple fonts: encoding
+///    table).
+fn decode_char_with(
+    to_unicode_hit: Option<String>,
+    recovery: &mut FontRecovery,
+    code: u32,
+) -> String {
+    match to_unicode_hit {
+        Some(hit) if !recovery.recovering => {
+            recovery.observe(&hit);
+            hit
+        }
+        hit => {
+            // A miss counts as a suspicious decode for the prescan; a hit
+            // on a flipped font was already judged garbage and is dropped.
+            if hit.is_none() {
+                recovery.observe("");
+            }
+            if let Some(ref rc) = recovery.reverse_cmap {
+                if let Some(c) = rc.lookup(code) {
+                    return expand_ligatures(&c.to_string());
+                }
+            }
+            String::new()
         }
     }
 }
@@ -443,8 +496,7 @@ struct PdfSimpleFont<'a> {
     unicode_map: Option<HashMap<u32, String>>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
     missing_width: f64,
-    /// Glyph-recovery state; consulted by `decode_char` (Task 5).
-    #[allow(dead_code)]
+    /// Glyph-recovery state; consulted by `decode_char`.
     recovery: std::cell::RefCell<FontRecovery>,
 }
 
@@ -1149,9 +1201,27 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
     }
     fn decode_char(&self, char: CharCode) -> String {
         let slice = [char as u8];
+        let encoding = self
+            .encoding
+            .as_ref()
+            .map(|x| &x[..])
+            .unwrap_or(&PDFDocEncoding);
         if let Some(ref unicode_map) = self.unicode_map {
-            let s = unicode_map.get(&char);
-            let s = match s {
+            if self.recovery.borrow().recovering {
+                // Flipped: the /ToUnicode is garbage — recover via the
+                // glyph-name-derived encoding table (spec §5.2b), with
+                // ligature expansion on the recovered text. A raw
+                // simple-font char code is NOT a glyph id, so the CID
+                // reverse cmap is not consulted here.
+                return expand_ligatures(&to_utf8(encoding, &slice));
+            }
+            let hit = unicode_map.get(&char).cloned();
+            return match hit {
+                // Healthy path (D2): verbatim, feeding the prescan.
+                Some(s) => {
+                    self.recovery.borrow_mut().observe(&s);
+                    s
+                }
                 None => {
                     debug!(
                         "missing char {:?} in unicode map {:?} for {:?}",
@@ -1161,24 +1231,15 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
                     // entries in the encoding.
                     // Fork: fall back to PDFDocEncoding instead of
                     // panicking when both are missing.
-                    let encoding = self
-                        .encoding
-                        .as_ref()
-                        .map(|x| &x[..])
-                        .unwrap_or(PDFDocEncoding);
+                    // A miss also counts as a suspicious decode for the
+                    // garbage prescan.
+                    self.recovery.borrow_mut().observe("");
                     let s = to_utf8(encoding, &slice);
                     debug!("falling back to encoding {} -> {:?}", char, s);
                     s
                 }
-                Some(s) => s.clone(),
             };
-            return s;
         }
-        let encoding = self
-            .encoding
-            .as_ref()
-            .map(|x| &x[..])
-            .unwrap_or(&PDFDocEncoding);
         //dlog!("char_code {:?} {:?}", char, self.encoding);
         let s = to_utf8(encoding, &slice);
         s
@@ -1263,8 +1324,7 @@ struct PdfCIDFont<'a> {
     to_unicode: Option<HashMap<u32, String>>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
     default_width: Option<f64>, // only used for CID fonts and we should probably brake out the different font types
-    /// Glyph-recovery state; consulted by `decode_char` (Task 5).
-    #[allow(dead_code)]
+    /// Glyph-recovery state; consulted by `decode_char`.
     recovery: std::cell::RefCell<FontRecovery>,
 }
 
@@ -1498,18 +1558,19 @@ impl<'a> PdfFont for PdfCIDFont<'a> {
         None
     }
     fn decode_char(&self, char: CharCode) -> String {
-        let s = self.to_unicode.as_ref().and_then(|x| x.get(&char));
-        if let Some(s) = s {
-            s.clone()
-        } else {
+        let hit = self.to_unicode.as_ref().and_then(|x| x.get(&char)).cloned();
+        // Thin adapter over the shared recovery state machine; valid for
+        // CID fonts because the char code is the glyph id (Identity-H).
+        let out = decode_char_with(hit, &mut self.recovery.borrow_mut(), char);
+        if out.is_empty() {
             dlog!(
                 "Unknown character {:?} in {:?} {:?}",
                 char,
                 self.font,
                 self.to_unicode
             );
-            "".to_string()
         }
+        out
     }
 }
 
@@ -3164,7 +3225,90 @@ fn output_doc_inner<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::FontRecovery;
+    use super::font_cmap::ReverseCmap;
+    use super::{decode_char_with, expand_ligatures, FontRecovery};
+
+    #[test]
+    fn expand_ligatures_expands_alphabetic_forms() {
+        assert_eq!(expand_ligatures("\u{FB00}"), "ff");
+        assert_eq!(expand_ligatures("\u{FB01}"), "fi");
+        assert_eq!(expand_ligatures("\u{FB02}"), "fl");
+        assert_eq!(expand_ligatures("\u{FB03}"), "ffi");
+        assert_eq!(expand_ligatures("\u{FB04}"), "ffl");
+        assert_eq!(expand_ligatures("\u{FB05}"), "st");
+        assert_eq!(expand_ligatures("\u{FB06}"), "st");
+        // Brief said o+FB01+ce == "office"; that's a plan typo — FB01 is
+        // "fi", so o+fi+ce = "ofice". "office" needs the ffi ligature.
+        assert_eq!(expand_ligatures("o\u{FB01}ce"), "ofice");
+        assert_eq!(expand_ligatures("o\u{FB03}ce"), "office");
+        assert_eq!(expand_ligatures("plain"), "plain");
+    }
+
+    #[test]
+    fn decode_char_prefers_to_unicode_when_healthy() {
+        // Healthy font: the /ToUnicode hit wins verbatim even when a
+        // reverse cmap disagrees (D2 byte-stability).
+        let rc = ReverseCmap::from_pairs_for_test(&[(65, 'X')]);
+        let mut r = FontRecovery::new(Some(rc));
+        assert_eq!(decode_char_with(Some("A".into()), &mut r, 65), "A");
+        assert!(!r.recovering);
+    }
+
+    #[test]
+    fn decode_char_recovers_via_reverse_cmap_when_flipped() {
+        let rc = ReverseCmap::from_pairs_for_test(&[(1, 'A')]);
+        let mut r = FontRecovery::new(Some(rc));
+        r.recovering = true;
+        // Flipped: the (garbage) /ToUnicode hit is not trusted.
+        assert_eq!(decode_char_with(Some("\u{E001}".into()), &mut r, 1), "A");
+        // Miss with flipped font also recovers.
+        assert_eq!(decode_char_with(None, &mut r, 1), "A");
+    }
+
+    #[test]
+    fn decode_char_miss_recovers_via_reverse_cmap_without_flip() {
+        // No /ToUnicode entry (or none at all): the reverse cmap is
+        // consulted even before the prescan flips.
+        let rc = ReverseCmap::from_pairs_for_test(&[(7, 'q')]);
+        let mut r = FontRecovery::new(Some(rc));
+        assert_eq!(decode_char_with(None, &mut r, 7), "q");
+    }
+
+    #[test]
+    fn decode_char_expands_ligatures_only_on_recovery_paths() {
+        // Healthy /ToUnicode hit of U+FB01 stays U+FB01 (D2).
+        let rc = ReverseCmap::from_pairs_for_test(&[(7, '\u{FB01}')]);
+        let mut healthy = FontRecovery::new(Some(rc.clone()));
+        assert_eq!(
+            decode_char_with(Some("\u{FB01}".into()), &mut healthy, 7),
+            "\u{FB01}"
+        );
+        // Recovered U+FB01 expands to "fi".
+        let mut recovering = FontRecovery::new(Some(rc));
+        assert_eq!(decode_char_with(None, &mut recovering, 7), "fi");
+    }
+
+    #[test]
+    fn decode_char_recovery_failure_returns_empty_for_miss_behavior() {
+        // No reverse cmap, miss: "" — callers apply their existing miss
+        // behavior (CID: empty string; simple font: encoding table).
+        let mut r = FontRecovery::new(None);
+        assert_eq!(decode_char_with(None, &mut r, 42), "");
+        // Flipped with a hit but no recovery source: "" too — the garbage
+        // hit is not passed through.
+        r.recovering = true;
+        assert_eq!(decode_char_with(Some("\u{E000}".into()), &mut r, 42), "");
+    }
+
+    #[test]
+    fn decode_char_miss_feeds_prescan() {
+        // Every miss counts as a suspicious decode: 20/20 garbage flips.
+        let mut r = FontRecovery::new(None);
+        for _ in 0..20 {
+            let _ = decode_char_with(None, &mut r, 999);
+        }
+        assert!(r.recovering);
+    }
 
     #[test]
     fn recovery_flips_at_ten_percent_garbage() {

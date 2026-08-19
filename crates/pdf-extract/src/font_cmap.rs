@@ -61,6 +61,16 @@ impl ReverseCmap {
     pub(crate) fn lookup(&self, glyph_id: u32) -> Option<char> {
         self.map.get(&glyph_id).copied()
     }
+
+    /// Build a ReverseCmap directly from glyph→char pairs. Test-only:
+    /// lib.rs's `decode_char_with` tests need a known mapping without
+    /// plumbing a synthetic sfnt through the font-decode tests too.
+    #[cfg(test)]
+    pub(crate) fn from_pairs_for_test(pairs: &[(u32, char)]) -> ReverseCmap {
+        ReverseCmap {
+            map: pairs.iter().copied().collect(),
+        }
+    }
 }
 
 #[cfg(test)]
