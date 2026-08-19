@@ -17,6 +17,7 @@ mod heuristic;
 mod markup;
 mod ocr;
 mod pdf;
+mod pdf_text;
 mod pptx;
 mod sheet;
 mod sink;
