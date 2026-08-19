@@ -37,6 +37,7 @@ use std::str;
 use unicode_normalization::UnicodeNormalization;
 mod core_fonts;
 mod encodings;
+mod font_cmap;
 mod glyphnames;
 mod zapfglyphnames;
 
@@ -364,6 +365,76 @@ fn maybe_get_array<'a>(
     maybe_get_obj(doc, dict, key).and_then(|n| n.as_array().ok())
 }
 
+/// Glyph-recovery state for one font, built at font construction (where
+/// FontFile2/FontFile3 streams are reachable) and consulted by
+/// `decode_char`. Stored in a `RefCell` because `decode_char` takes
+/// `&self`.
+///
+/// Inert until Task 5 wires `decode_char` through it: construction fills
+/// the reverse cmap, but nothing reads the state yet.
+#[allow(dead_code)] // consulted by decode_char in Task 5
+#[derive(Clone)]
+struct FontRecovery {
+    /// Inverted cmap from the embedded font program, if one is embedded.
+    reverse_cmap: Option<font_cmap::ReverseCmap>,
+    /// Chars decoded so far via /ToUnicode.
+    decoded: u32,
+    /// Decoded chars that look like garbage (control chars, PUA,
+    /// unmapped/empty).
+    suspicious: u32,
+    /// Latched: true once suspicious >= 10% of decoded (liteparse
+    /// extract.rs criterion) — the font's /ToUnicode is garbage.
+    recovering: bool,
+}
+
+impl FontRecovery {
+    fn new(reverse_cmap: Option<font_cmap::ReverseCmap>) -> Self {
+        FontRecovery {
+            reverse_cmap,
+            decoded: 0,
+            suspicious: 0,
+            recovering: false,
+        }
+    }
+
+    /// Record one decoded string; flip `recovering` once the garbage ratio
+    /// crosses 10% with at least 20 decoded chars (avoids flapping on tiny
+    /// samples). Latched: clean chars never flip it back.
+    #[allow(dead_code)] // called by decode_char in Task 5
+    fn observe(&mut self, s: &str) {
+        self.decoded += 1;
+        let garbage = s.is_empty()
+            || s.chars().any(|c| {
+                c.is_control() || ('\u{E000}'..='\u{F8FF}').contains(&c) || c == '\u{FFFD}'
+            });
+        if garbage {
+            self.suspicious += 1;
+        }
+        if self.decoded >= 20 && self.suspicious * 10 >= self.decoded {
+            self.recovering = true;
+        }
+    }
+}
+
+/// Build a reverse cmap from a font descriptor's embedded font program
+/// (`FontFile2` TrueType or `FontFile3` sfnt-wrapped OpenType), if one is
+/// embedded and parseable. Bare CFF programs (`Type1C`/`CIDFontType0C`)
+/// are not sfnt and yield `None`; recovery then relies on the glyph-name
+/// fallback (Task 5).
+fn reverse_cmap_from_descriptor(
+    doc: &Document,
+    descriptor: &Dictionary,
+) -> Option<font_cmap::ReverseCmap> {
+    for key in [&b"FontFile2"[..], &b"FontFile3"[..]] {
+        if let Some(&Object::Stream(ref s)) = maybe_get_obj(doc, descriptor, key) {
+            if let Some(rc) = font_cmap::ReverseCmap::from_font_program(&get_contents(s)) {
+                return Some(rc);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct PdfSimpleFont<'a> {
     font: &'a Dictionary,
@@ -372,6 +443,9 @@ struct PdfSimpleFont<'a> {
     unicode_map: Option<HashMap<u32, String>>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
     missing_width: f64,
+    /// Glyph-recovery state; consulted by `decode_char` (Task 5).
+    #[allow(dead_code)]
+    recovery: std::cell::RefCell<FontRecovery>,
 }
 
 #[derive(Clone)]
@@ -468,8 +542,10 @@ impl<'a> PdfSimpleFont<'a> {
         let descriptor: Option<&Dictionary> = get(doc, font, b"FontDescriptor");
         let mut type1_encoding = None;
         let mut unicode_map = None;
+        let mut reverse_cmap = None;
         if let Some(descriptor) = descriptor {
             dlog!("descriptor {:?}", descriptor);
+            reverse_cmap = reverse_cmap_from_descriptor(doc, descriptor);
             if subtype == "Type1" {
                 let file = maybe_get_obj(doc, descriptor, b"FontFile");
                 match file {
@@ -852,6 +928,7 @@ impl<'a> PdfSimpleFont<'a> {
             encoding: encoding_table,
             missing_width,
             unicode_map,
+            recovery: std::cell::RefCell::new(FontRecovery::new(reverse_cmap)),
         }
     }
 
@@ -1186,6 +1263,9 @@ struct PdfCIDFont<'a> {
     to_unicode: Option<HashMap<u32, String>>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
     default_width: Option<f64>, // only used for CID fonts and we should probably brake out the different font types
+    /// Glyph-recovery state; consulted by `decode_char` (Task 5).
+    #[allow(dead_code)]
+    recovery: std::cell::RefCell<FontRecovery>,
 }
 
 fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMap<u32, String>> {
@@ -1311,10 +1391,14 @@ impl<'a> PdfCIDFont<'a> {
 
         dlog!("descendents {:?} {:?}", descendants, ciddict);
 
-        // Fork: a missing FontDescriptor is logged, not panicked on (the
-        // value was only type-checked upstream, never actually used).
+        // Fork: a missing FontDescriptor is logged, not panicked on.
+        // When present, its embedded font program (FontFile2/FontFile3)
+        // seeds the reverse cmap used for glyph recovery.
         let font_dict = maybe_get_obj(doc, ciddict, b"FontDescriptor");
         dlog!("{:?}", font_dict);
+        let reverse_cmap = font_dict
+            .and_then(|o| o.as_dict().ok())
+            .and_then(|desc| reverse_cmap_from_descriptor(doc, desc));
         let default_width = get::<Option<i64>>(doc, ciddict, b"DW").unwrap_or(1000);
         let w: Option<Vec<&Object>> = get(doc, ciddict, b"W");
         dlog!("widths {:?}", w);
@@ -1365,6 +1449,7 @@ impl<'a> PdfCIDFont<'a> {
             to_unicode: unicode_map,
             encoding,
             default_width: Some(default_width as f64),
+            recovery: std::cell::RefCell::new(FontRecovery::new(reverse_cmap)),
         })
     }
 }
@@ -3075,4 +3160,53 @@ fn output_doc_inner<'a>(
     )?;
     output.end_page()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FontRecovery;
+
+    #[test]
+    fn recovery_flips_at_ten_percent_garbage() {
+        let mut r = FontRecovery::new(None);
+        for _ in 0..19 {
+            r.observe("a");
+        }
+        r.observe("\u{E001}"); // 1/20 = 5% — not yet
+        assert!(!r.recovering);
+        r.observe("\u{E002}"); // 2/21 ≈ 9.5% — not yet
+        assert!(!r.recovering);
+        r.observe("\u{E003}"); // 3/22 ≈ 13.6% — flip
+        assert!(r.recovering);
+        // latched: clean chars never flip it back
+        for _ in 0..100 {
+            r.observe("b");
+        }
+        assert!(r.recovering);
+    }
+
+    #[test]
+    fn recovery_never_flips_on_clean_text() {
+        let mut r = FontRecovery::new(None);
+        for _ in 0..1000 {
+            r.observe("x");
+        }
+        assert!(!r.recovering);
+    }
+
+    #[test]
+    fn recovery_counts_empty_and_control_and_replacement_as_suspicious() {
+        // 20 clean, then one of each garbage class. Flip math: after the
+        // third garbage char, 3/23 decoded → 3*10=30 >= 23 → recovering.
+        let mut r = FontRecovery::new(None);
+        for _ in 0..20 {
+            r.observe("ok");
+        }
+        assert!(!r.recovering);
+        r.observe(""); // unmapped code
+        r.observe("\u{0007}"); // control char
+        assert!(!r.recovering); // 2/22 ≈ 9.1% — just under
+        r.observe("\u{FFFD}"); // replacement char
+        assert!(r.recovering); // 3/23 ≈ 13% — over
+    }
 }
