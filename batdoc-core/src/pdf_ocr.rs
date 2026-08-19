@@ -117,7 +117,6 @@ pub(crate) fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
 
 /// Map OCR pixel-space lines for one embedded image into top-down page
 /// points via its placement (spec §6: `page_pt_per_pixel` = placed / pixels).
-#[allow(dead_code)] // consumed by the driver's OCR merge pass in a later task.
 pub(crate) fn map_ocr_lines(
     placed: &PlacedImage,
     img_width_px: u32,
@@ -151,7 +150,6 @@ pub(crate) fn map_ocr_lines(
 /// Drop OCR lines that overlap native text (2.0 pt tolerance, spec §6) and
 /// return the rest, concatenated after `native` (unordered — the driver's
 /// reading-order pass sorts everything together).
-#[allow(dead_code)] // consumed by the driver's OCR merge pass in a later task.
 pub(crate) fn merge(native: Vec<Line>, ocr: Vec<Line>) -> Vec<Line> {
     let mut out = native;
     for ocr_line in ocr {

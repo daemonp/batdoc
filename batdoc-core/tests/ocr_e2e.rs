@@ -303,7 +303,9 @@ fn ocr_pdf_embedded_image_page() {
 fn ocr_pdf_markdown_mode_region_merge() {
     let pdf = build_pdf_with_image(&render_test_image());
     // Markdown mode on a textless PDF must also run OCR and include the
-    // recognized text (region merge path is shared with plain mode).
+    // recognized text via the region-merge path. (Note this is *not* shared
+    // with plain mode: `extract_plain` textless pages fall back to the
+    // page-end `ocr_page` append instead.)
     let md = batdoc_core::extract_markdown(&pdf, Format::Pdf, false).unwrap();
     assert!(md.contains("123"), "OCR text missing in markdown: {md:?}");
     assert!(

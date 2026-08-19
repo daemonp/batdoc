@@ -382,6 +382,14 @@ pub(crate) fn extract_markdown_to(
 
 /// ≥10% replacement/PUA chars means the native text layer is garbage
 /// (matches the fork's recovery-flip threshold, spec §5).
+/// Driver-level garble check: a page is garbled when ≥10% of its chars are
+/// U+FFFD or PUA (U+E000–U+F8FF).
+///
+/// Deliberately has no 20-character minimum sample floor, unlike the fork's
+/// font-level prescan (`FontRecovery::observe` flips only after ≥20 decoded
+/// chars): a very short page of pure garbage must still trip the check and
+/// fall back to OCR. The flip side — partial-page garble goes undetected —
+/// is a documented v1 limitation (plan ruling #6).
 fn page_looks_garbled(page: &crate::pdf_text::PositionedPage) -> bool {
     let total = page.chars.len();
     if total == 0 {

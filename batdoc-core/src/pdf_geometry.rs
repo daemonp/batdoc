@@ -16,8 +16,6 @@
 //!
 //! Malformed streams are skipped; the function never panics on bad input.
 
-#![allow(dead_code)] // PtRect, PlacedImage, placed_images are consumed by Tasks 10/13.
-
 use lopdf::content::Content;
 use lopdf::{Dictionary, Object, ObjectId, Stream};
 

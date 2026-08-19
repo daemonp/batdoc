@@ -240,7 +240,6 @@ pub(crate) fn ocr_rgb_image(img: &image::RgbImage) -> Result<Option<String>> {
 
 /// One recognized OCR line with its pixel-space bounding box (top-left
 /// origin, y-down, same orientation as the input image).
-#[allow(dead_code)] // consumed by pdf_ocr (Task 10)
 pub(crate) struct OcrTextLine {
     pub text: String,
     pub x: i32,
@@ -300,7 +299,6 @@ fn lines_to_boxes(lines: Vec<GlyphRun>) -> Vec<OcrTextLine> {
 /// OCR an already-decoded RGB image, returning recognized lines with
 /// pixel-space bounding boxes (in reading order, as `find_text_lines`
 /// orders them). Empty when no text was detected.
-#[allow(dead_code)] // consumed by pdf_ocr (Task 10)
 pub(crate) fn ocr_rgb_image_lines(img: &image::RgbImage) -> Result<Vec<OcrTextLine>> {
     use ocrs::TextItem as _;
     let source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
