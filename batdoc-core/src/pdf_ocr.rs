@@ -156,10 +156,11 @@ pub(crate) fn map_ocr_lines(
 pub(crate) fn merge(native: Vec<Line>, ocr: Vec<Line>) -> Vec<Line> {
     let mut out = native;
     for ocr_line in ocr {
-        let overlaps = out.iter().any(|native_line| {
-            native_line
-                .rect
-                .intersects_expanded(&ocr_line.rect, OVERLAP_TOLERANCE_PT)
+        let overlaps = out.iter().any(|line| {
+            matches!(line.source, LineSource::Native)
+                && line
+                    .rect
+                    .intersects_expanded(&ocr_line.rect, OVERLAP_TOLERANCE_PT)
         });
         if !overlaps {
             out.push(ocr_line);
@@ -280,6 +281,49 @@ mod tests {
             }],
         );
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_keeps_two_ocr_lines_that_only_overlap_each_other() {
+        let native = vec![native_line("Native", 0.0, 0.0, 10.0, 10.0)];
+        let ocr = vec![
+            Line {
+                text: "OcrOne".into(),
+                words: vec![],
+                rect: PtRect {
+                    x0: 100.0,
+                    y0: 100.0,
+                    x1: 120.0,
+                    y1: 114.0,
+                },
+                font_size: 11.0,
+                source: LineSource::Ocr,
+            },
+            // Overlaps the first OCR line but not the native line → must be kept.
+            Line {
+                text: "OcrTwo".into(),
+                words: vec![],
+                rect: PtRect {
+                    x0: 110.0,
+                    y0: 105.0,
+                    x1: 130.0,
+                    y1: 119.0,
+                },
+                font_size: 11.0,
+                source: LineSource::Ocr,
+            },
+        ];
+        let merged = merge(native, ocr);
+        assert_eq!(merged.len(), 3);
+        assert!(merged
+            .iter()
+            .any(|l| l.text == "Native" && matches!(l.source, LineSource::Native)));
+        assert!(merged
+            .iter()
+            .any(|l| l.text == "OcrOne" && matches!(l.source, LineSource::Ocr)));
+        assert!(merged
+            .iter()
+            .any(|l| l.text == "OcrTwo" && matches!(l.source, LineSource::Ocr)));
     }
 
     #[test]
