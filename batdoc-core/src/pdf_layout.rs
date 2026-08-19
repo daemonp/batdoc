@@ -498,6 +498,16 @@ const HEADING_H3_RATIO: f64 = 1.3;
 /// Paragraph split: a top-to-top vertical gap larger than this many times
 /// the previous line's font size starts a new paragraph.
 const PARAGRAPH_GAP_RATIO: f64 = 1.5;
+/// List grouping: a marker line joins the open list while its top-to-top
+/// gap stays within this many times the previous item's font size (same
+/// ratio as paragraph joining — list items sit at body line spacing).
+const LIST_GAP_RATIO: f64 = 1.5;
+/// Bullet glyphs that open an unordered list item when followed by
+/// whitespace (spec-pinned set; liteparse recognizes a few more PUA/Symbol
+/// glyphs that this pipeline never produces).
+const BULLET_CHARS: &[char] = &[
+    '\u{2022}', '\u{25e6}', '\u{2023}', '-', '*', '\u{2013}', '\u{2014}',
+];
 /// Body size when the document yields no measurable text (image-only PDF).
 const DEFAULT_BODY_SIZE: f64 = 12.0;
 /// A normalized first/last-line signature must repeat on at least this many
@@ -530,8 +540,7 @@ pub(crate) struct DocSignalsBuilder {
     last_counts: std::collections::HashMap<String, usize>,
 }
 
-/// A classified block of body content. The List variant arrives in
-/// Tasks 15–16.
+/// A classified block of body content.
 #[derive(Debug)]
 pub(crate) enum Block {
     Heading {
@@ -542,6 +551,9 @@ pub(crate) enum Block {
     /// Borderless table (Task 14): rows of cells, empty string = no word
     /// landed in that column for that row.
     Table(Vec<Vec<String>>),
+    /// List items (Task 16) with their markers stripped; ordered and
+    /// unordered items both render as markdown `- ` bullets.
+    List(Vec<String>),
 }
 
 impl DocSignalsBuilder {
@@ -665,14 +677,68 @@ struct Para {
     y0: f64,
 }
 
-/// Incremental heading/paragraph classifier: [`detect_tables`] feeds it
-/// the non-table lines interleaved with detected table blocks, so the
-/// paragraph state must survive across calls. [`classify`] is the thin
-/// all-lines wrapper; the heading/paragraph rules live here exactly once.
+/// Open list under construction: stripped items plus the last item line's
+/// font size and top edge (the [`LIST_GAP_RATIO`] rule needs both).
+struct ListState {
+    items: Vec<String>,
+    font_size: f64,
+    y0: f64,
+}
+
+/// If `text` starts with a list marker, return the item text (marker
+/// stripped, trimmed). Unordered: a [`BULLET_CHARS`] glyph followed by
+/// whitespace. Ordered: 1–3 digits or one lowercase letter, then `.` or
+/// `)`, then whitespace. The remainder must be non-empty — a bare marker
+/// carries no item (liteparse `parse_list_marker`, trimmed to the
+/// spec-pinned marker set; its sequence-confirmed lettered/roman runs are
+/// deliberately not ported).
+fn parse_list_marker(text: &str) -> Option<&str> {
+    let t = text.trim_start();
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    if BULLET_CHARS.contains(&first) {
+        return marker_item(chars.as_str());
+    }
+    let body_len = if first.is_ascii_digit() {
+        let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+        // ^\d{1,3}: four or more leading digits is a number, not a marker.
+        if digits > 3 {
+            return None;
+        }
+        digits
+    } else if first.is_ascii_lowercase() {
+        1 // ^[a-z]: exactly one letter
+    } else {
+        return None;
+    };
+    let mut rest = t[body_len..].chars();
+    let punct = rest.next()?;
+    if punct != '.' && punct != ')' {
+        return None;
+    }
+    marker_item(rest.as_str())
+}
+
+/// Item text after a marker: the next char must be whitespace (so
+/// "well-known" and "1.5x" never match) and the trimmed remainder must
+/// carry content.
+fn marker_item(rest: &str) -> Option<&str> {
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let item = rest.trim();
+    (!item.is_empty()).then_some(item)
+}
+
+/// Incremental heading/list/paragraph classifier: [`detect_tables`] feeds
+/// it the non-table lines interleaved with detected table blocks, so the
+/// paragraph and list state must survive across calls. [`classify`] is
+/// the thin all-lines wrapper; the block rules live here exactly once.
 struct Classifier<'a> {
     signals: &'a DocSignals,
     blocks: Vec<Block>,
     para: Option<Para>,
+    list: Option<ListState>,
 }
 
 impl Classifier<'_> {
@@ -681,13 +747,25 @@ impl Classifier<'_> {
             signals,
             blocks: Vec::new(),
             para: None,
+            list: None,
+        }
+    }
+
+    fn flush_para(&mut self) {
+        if let Some(p) = self.para.take() {
+            self.blocks.push(Block::Paragraph(p.text));
+        }
+    }
+
+    fn flush_list(&mut self) {
+        if let Some(l) = self.list.take() {
+            self.blocks.push(Block::List(l.items));
         }
     }
 
     fn flush(&mut self) {
-        if let Some(p) = self.para.take() {
-            self.blocks.push(Block::Paragraph(p.text));
-        }
+        self.flush_para();
+        self.flush_list();
     }
 
     /// Fold one line into the block stream: header/footer drop, heading
@@ -724,6 +802,29 @@ impl Classifier<'_> {
             });
             return;
         }
+        // List items (Task 16): marker detection runs on text, so OCR
+        // lines (no words) can join lists. Marker lines interrupt
+        // paragraph runs and vice versa.
+        if let Some(item) = parse_list_marker(text) {
+            self.flush_para();
+            match self.list.as_mut() {
+                Some(l) if line.rect.y0 - l.y0 <= LIST_GAP_RATIO * l.font_size => {
+                    l.items.push(item.to_string());
+                    l.font_size = line.font_size;
+                    l.y0 = line.rect.y0;
+                }
+                _ => {
+                    self.flush_list();
+                    self.list = Some(ListState {
+                        items: vec![item.to_string()],
+                        font_size: line.font_size,
+                        y0: line.rect.y0,
+                    });
+                }
+            }
+            return;
+        }
+        self.flush_list();
         match self.para.as_mut() {
             Some(p) if line.rect.y0 - p.y0 <= PARAGRAPH_GAP_RATIO * p.font_size => {
                 if p.text.ends_with('-') {
@@ -759,7 +860,12 @@ impl Classifier<'_> {
 ///    (and break any open paragraph — chrome never glues text together).
 /// 2. A line at ≥ [`HEADING_MIN_RATIO`]× the body size is a heading; the
 ///    ratio band picks the level.
-/// 3. Remaining consecutive lines merge into paragraphs, joined with a
+/// 3. A body-size line starting with a list marker (see
+///    [`parse_list_marker`]) becomes a list item; consecutive items within
+///    [`LIST_GAP_RATIO`]× the previous item's font size group into one
+///    [`Block::List`]. Marker lines interrupt paragraph runs and vice
+///    versa.
+/// 4. Remaining consecutive lines merge into paragraphs, joined with a
 ///    space — except a trailing `-` dehyphenates ("exam-" + "ple" →
 ///    "example"). A top-to-top gap > [`PARAGRAPH_GAP_RATIO`]× the previous
 ///    line's font size splits the paragraph.
@@ -964,6 +1070,11 @@ fn table_candidate(line: &Line, signals: &DocSignals) -> bool {
     if line.words.len() < TABLE_MIN_WORDS {
         return false;
     }
+    // Binding rule (Task 16): a line starting with a list marker is never
+    // a table row, even with table-like word geometry — bullets win.
+    if parse_list_marker(&line.text).is_some() {
+        return false;
+    }
     signals.body_size > 0.0
         && (line.font_size - signals.body_size).abs()
             <= TABLE_BODY_SIZE_TOLERANCE * signals.body_size
@@ -1020,6 +1131,13 @@ pub(crate) fn render(
             }
             Block::Table(rows) => {
                 render_table(rows, sink)?;
+            }
+            Block::List(items) => {
+                for item in items {
+                    sink.write_str("- ")?;
+                    sink.write_str(item)?;
+                    sink.write_str("\n")?;
+                }
             }
         }
     }
@@ -1524,6 +1642,86 @@ mod tests {
         let blocks = classify(lines, &sig);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "native from ocr"));
+    }
+
+    #[test]
+    fn bullet_lines_become_list() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("\u{2022} first item", 72.0, 100.0, 300.0),
+            line("\u{2022} second item", 72.0, 114.0, 300.0),
+            line("trailing paragraph", 72.0, 140.0, 300.0), // 26pt gap → break
+        ];
+        let blocks = classify(lines, &sig);
+        assert!(
+            matches!(&blocks[0], Block::List(items) if items == &["first item", "second item"])
+        );
+        assert!(matches!(&blocks[1], Block::Paragraph(t) if t == "trailing paragraph"));
+    }
+
+    #[test]
+    fn ordered_markers_become_list() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("1. one", 72.0, 100.0, 300.0),
+            line("2. two", 72.0, 114.0, 300.0),
+        ];
+        let blocks = classify(lines, &sig);
+        assert!(matches!(&blocks[0], Block::List(items) if items == &["one", "two"]));
+    }
+
+    #[test]
+    fn hyphen_inside_prose_is_not_a_list() {
+        // "well-known" mid-line and a wrapped hyphenated line are not items.
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![line("a well-known fact", 72.0, 100.0, 300.0)];
+        let blocks = classify(lines, &sig);
+        assert!(matches!(&blocks[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn marker_lines_are_not_table_rows() {
+        // Binding rule: a bullet line with ≥2 words could pass the table
+        // geometry gates (3 aligned x-clusters, real gutters), but marker
+        // lines never join table runs — bullets win.
+        let lines = vec![
+            wline(&["-", "alpha", "1"], &[72.0, 110.0, 200.0], 100.0),
+            wline(&["-", "beta", "2"], &[72.0, 110.0, 200.0], 114.0),
+            wline(&["-", "gamma", "3"], &[72.0, 110.0, 200.0], 128.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::List(items) if items == &["alpha 1", "beta 2", "gamma 3"])
+        );
+    }
+
+    #[test]
+    fn render_list_block() {
+        let blocks = vec![crate::pdf_layout::Block::List(vec![
+            "one".into(),
+            "two".into(),
+        ])];
+        let mut out = String::new();
+        crate::pdf_layout::render(&blocks, &mut out).unwrap();
+        assert_eq!(out, "- one\n- two\n");
     }
 
     #[test]
