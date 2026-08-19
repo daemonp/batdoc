@@ -292,10 +292,9 @@ fn apply_cell_hyperlink(
     if value.is_empty() {
         return String::new();
     }
-    match hyperlinks.get(cell_ref) {
-        Some(url) => format!("[{value}]({url})"),
-        None => value.to_string(),
-    }
+    hyperlinks
+        .get(cell_ref)
+        .map_or_else(|| value.to_string(), |url| format!("[{value}]({url})"))
 }
 
 fn check_col(col: usize) -> crate::error::Result<()> {

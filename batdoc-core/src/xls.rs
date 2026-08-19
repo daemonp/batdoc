@@ -595,6 +595,7 @@ impl<'a> SheetWalk<'a> {
         })
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn next_cell(
         &mut self,
         sst: &StringArena,
@@ -656,7 +657,7 @@ fn densify_plain_row(cells: &[(u16, String)]) -> Vec<String> {
     for (col, value) in cells {
         let idx = usize::from(*col);
         if idx < dense.len() {
-            dense[idx] = value.clone();
+            dense[idx].clone_from(value);
         }
     }
     dense
@@ -670,7 +671,7 @@ fn densify_markdown_row(cells: &[(u16, String)], shape: &TableShape) -> Vec<Stri
         if col < shape.first_col || col > shape.last_col {
             continue;
         }
-        dense[col - shape.first_col] = value.clone();
+        dense[col - shape.first_col].clone_from(value);
     }
     dense
 }

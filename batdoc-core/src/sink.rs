@@ -1,6 +1,11 @@
 use crate::error::{BatdocError, Result};
 
 pub trait ExtractSink {
+    /// Write a string to the sink.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying sink or output budget cannot accept
+    /// the write.
     fn write_str(&mut self, s: &str) -> Result<()>;
 }
 
@@ -33,7 +38,7 @@ pub struct BudgetSink<S: ExtractSink> {
 }
 
 impl<S: ExtractSink> BudgetSink<S> {
-    pub fn new(inner: S, max: u64) -> Self {
+    pub const fn new(inner: S, max: u64) -> Self {
         Self {
             inner,
             written: 0,

@@ -4,14 +4,17 @@ pub(crate) struct StringArena {
 }
 
 impl StringArena {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             buf: Vec::new(),
             spans: Vec::new(),
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn push(&mut self, s: &str) -> usize {
+        // Offsets are stored as u32 by design; the arena is bounded by the
+        // 32-bit string table lengths used in the legacy formats we parse.
         let start = self.buf.len() as u32;
         self.buf.extend_from_slice(s.as_bytes());
         self.spans.push((start, s.len() as u32));
@@ -25,7 +28,7 @@ impl StringArena {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.spans.len()
     }
 }

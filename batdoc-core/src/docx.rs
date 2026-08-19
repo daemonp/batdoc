@@ -257,6 +257,7 @@ pub(crate) fn extract_markdown_to(
     extract_to(data, opts, Mode::Markdown, sink)
 }
 
+#[derive(Clone, Copy)]
 enum Mode {
     Plain,
     Markdown,
@@ -321,7 +322,7 @@ struct StreamOut<'a, S: ExtractSink> {
 }
 
 impl<'a, S: ExtractSink> StreamOut<'a, S> {
-    fn new(sink: &'a mut S) -> Self {
+    const fn new(sink: &'a mut S) -> Self {
         Self {
             sink,
             trailing_newlines: 0,
@@ -332,6 +333,7 @@ impl<'a, S: ExtractSink> StreamOut<'a, S> {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn write_str(&mut self, s: &str) -> crate::error::Result<()> {
         if s.is_empty() {
             return Ok(());
@@ -347,6 +349,8 @@ impl<'a, S: ExtractSink> StreamOut<'a, S> {
                 break;
             }
         }
+        // `bytes.len() < 256` makes the cast safe; n is already u8 and
+        // bounded by the trailing-newline count of the input string.
         if n == bytes.len() as u8 && bytes.len() < 256 {
             self.trailing_newlines = self.trailing_newlines.saturating_add(n);
         } else {
@@ -693,8 +697,10 @@ fn emit_table<R: BufRead, S: ExtractSink>(
 
         let mut md_rows: Vec<Vec<String>> = Vec::new();
         for row in rows {
-            let mut md_row: Vec<String> =
-                row.into_iter().map(|cell| cell.replace('|', "\\|")).collect();
+            let mut md_row: Vec<String> = row
+                .into_iter()
+                .map(|cell| cell.replace('|', "\\|"))
+                .collect();
             while md_row.len() < ncols {
                 md_row.push(String::new());
             }
@@ -1418,6 +1424,7 @@ fn push_note_marker(
 /// bodies) are skipped entirely. When `image_rels` is non-empty and a
 /// `<w:drawing>` is found inside the run, the image reference is extracted
 /// and returned as a `Block::Image`.
+#[allow(clippy::too_many_lines)]
 fn parse_run<R: BufRead>(
     reader: &mut Reader<R>,
     buf: &mut Vec<u8>,

@@ -192,7 +192,7 @@ struct DocWriter<'a, S: ExtractSink> {
 }
 
 impl<'a, S: ExtractSink> DocWriter<'a, S> {
-    fn new(sink: &'a mut S) -> Self {
+    const fn new(sink: &'a mut S) -> Self {
         Self {
             sink,
             paragraph: String::new(),
@@ -230,7 +230,8 @@ impl<'a, S: ExtractSink> DocWriter<'a, S> {
             0x0013 => {
                 // Field begin — start capturing instruction text
                 self.field_depth += 1;
-                self.field_stack.push(FieldState::Instruction(String::new()));
+                self.field_stack
+                    .push(FieldState::Instruction(String::new()));
             }
             0x0014 => {
                 // Field separator — switch from instruction to display text

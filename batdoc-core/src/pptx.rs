@@ -116,6 +116,7 @@ pub(crate) fn extract_markdown_to(
     extract_to(data, opts, Mode::Markdown, sink)
 }
 
+#[derive(Clone, Copy)]
 enum Mode {
     Plain,
     Markdown,
@@ -170,7 +171,7 @@ struct StreamOut<'a, S: ExtractSink> {
 }
 
 impl<'a, S: ExtractSink> StreamOut<'a, S> {
-    fn new(sink: &'a mut S) -> Self {
+    const fn new(sink: &'a mut S) -> Self {
         Self {
             sink,
             trailing_newlines: 0,
@@ -180,6 +181,7 @@ impl<'a, S: ExtractSink> StreamOut<'a, S> {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn write_str(&mut self, s: &str) -> crate::error::Result<()> {
         if s.is_empty() {
             return Ok(());
@@ -195,6 +197,8 @@ impl<'a, S: ExtractSink> StreamOut<'a, S> {
                 break;
             }
         }
+        // `bytes.len() < 256` makes the cast safe; n is already u8 and
+        // bounded by the trailing-newline count of the input string.
         if n == bytes.len() as u8 && bytes.len() < 256 {
             self.trailing_newlines = self.trailing_newlines.saturating_add(n);
         } else {
@@ -276,8 +280,7 @@ fn extract_to_streaming(
             let base_dir = path.rsplit_once('/').map_or("ppt", |(dir, _)| dir);
             for rid in &pic_rids {
                 if let Some(target) = image_rels.get(rid) {
-                    if let Some(data) =
-                        xml_util::read_image_from_zip(&mut images, target, base_dir)
+                    if let Some(data) = xml_util::read_image_from_zip(&mut images, target, base_dir)
                     {
                         out.image_counter += 1;
                         let id = format!("image{}", out.image_counter);
@@ -299,16 +302,13 @@ fn extract_to_streaming(
                 if multiple {
                     out.write_str(&format!("## Slide {num}\n\n"))?;
                 }
-                out.write_str(&body)?;
-            } else {
-                if multiple {
-                    if slide_index > 0 {
-                        out.write_str("\n")?;
-                    }
-                    out.write_str(&format!("--- Slide {num} ---\n"))?;
+            } else if multiple {
+                if slide_index > 0 {
+                    out.write_str("\n")?;
                 }
-                out.write_str(&body)?;
+                out.write_str(&format!("--- Slide {num} ---\n"))?;
             }
+            out.write_str(&body)?;
         }
 
         // Speaker notes (buffered; small). Emitted as a trailer after the deck.
@@ -2448,8 +2448,14 @@ mod tests {
             out
         });
 
-        let (slides, _) =
-            parse_pptx(&data, crate::ExtractOptions { images: false, ..opts }).unwrap();
+        let (slides, _) = parse_pptx(
+            &data,
+            crate::ExtractOptions {
+                images: false,
+                ..opts
+            },
+        )
+        .unwrap();
         let ref_plain = render_plain(&slides);
         let mut plain = String::new();
         extract_plain_to(&data, opts, &mut plain).unwrap();

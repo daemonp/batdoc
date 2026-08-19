@@ -222,7 +222,7 @@ fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
         // Indirect / ICCBased color spaces surface as `None` (a `/ColorSpace N 0 R`
         // reference is never dereferenced by lopdf) or `"ICCBased"`; there is no
         // channel count on `PdfImage`, so the decoded buffer length disambiguates.
-        (Some("ICCBased"), 8) | (None, 8) if area > 0 && len != 0 && len % area == 0 => {
+        (Some("ICCBased") | None, 8) if area > 0 && len != 0 && len % area == 0 => {
             match len / area {
                 1 | 3 => len / area,
                 _ => return None,
@@ -455,10 +455,9 @@ startxref\n\
                 .unwrap_err()
                 .to_string();
             let mut out = String::new();
-            let actual =
-                extract_plain_to(data, crate::ExtractOptions::default(), &mut out)
-                    .unwrap_err()
-                    .to_string();
+            let actual = extract_plain_to(data, crate::ExtractOptions::default(), &mut out)
+                .unwrap_err()
+                .to_string();
             assert_eq!(actual, expected);
             assert!(out.is_empty());
         }
@@ -533,7 +532,10 @@ startxref\n\
     fn extract_plain_to_matches_extract_plain_multipage() {
         let data = build_text_pdf(&["PageOne", "PageTwo"]);
         let expected = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
-        assert!(expected.contains("PageOne"), "no extracted text: {expected:?}");
+        assert!(
+            expected.contains("PageOne"),
+            "no extracted text: {expected:?}"
+        );
         let mut out = String::new();
         extract_plain_to(&data, crate::ExtractOptions::default(), &mut out).unwrap();
         assert_eq!(out, expected);
