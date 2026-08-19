@@ -61,7 +61,10 @@ const WORD_GAP_RATIO: f64 = 0.25;
 const WORD_GAP_FLOOR: f64 = 1.0;
 /// Horizontal line split: a same-baseline gap this many times the font size
 /// means two columns, not two words (liteparse `form_lines` equivalent).
-const LINE_SPLIT_RATIO: f64 = 1.5;
+/// Raised from 1.5 to 10 so that wide table gutters stay on one line:
+/// a 12 pt table with 96 pt between columns must not shatter into one-word
+/// lines, otherwise table detection sees no multi-word candidates.
+const LINE_SPLIT_RATIO: f64 = 10.0;
 /// Baseline band: chars join a line when `[y - 0.8·size, y + 0.2·size]`
 /// overlaps the line's running band (asymmetric: top-down y grows downward,
 /// so the band reaches further up toward the previous baseline).
@@ -766,7 +769,7 @@ impl Classifier<'_> {
 // Pass-by-value is the established Task 13 signature (mirrors the driver,
 // which hands over the owned line vec); the lines are only borrowed now
 // that classification is incremental.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(dead_code, clippy::needless_pass_by_value)]
 pub(crate) fn classify(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
     let mut c = Classifier::new(signals);
     for line in &lines {
@@ -820,9 +823,8 @@ const TABLE_MIN_COLUMNS: usize = 2;
 ///
 /// OCR-source lines carry no word geometry (`words` is empty), so they
 /// fail the word-count gate and never join a run.
-// Pass-by-value is the binding Task 14 signature (mirrors `classify`);
-// dead until Task 15 wires the driver over from `classify`.
-#[allow(dead_code, clippy::needless_pass_by_value)]
+// Pass-by-value is the binding Task 14 signature (mirrors `classify`).
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn detect_tables(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
     let mut c = Classifier::new(signals);
     let mut i = 0;
@@ -1016,17 +1018,51 @@ pub(crate) fn render(
                 sink.write_str(text)?;
                 sink.write_str("\n")?;
             }
-            // Interim plain-lines rendering so Task 14 stays compile-safe
-            // and testable; Task 15 replaces this arm with markdown
-            // pipe-table output.
             Block::Table(rows) => {
-                for row in rows {
-                    sink.write_str(&row.join(" | "))?;
-                    sink.write_str("\n")?;
-                }
+                render_table(rows, sink)?;
             }
         }
     }
+    Ok(())
+}
+
+/// Escape a table cell for pipe-table markdown: backslashes first, then
+/// pipes, so we don't double-escape the separator we just inserted.
+fn escape_cell(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+/// Render a pipe table: header row, `| --- |` separator per column, then
+/// body rows. The last row ends with a newline; the surrounding render loop
+/// supplies the blank-line separation between blocks.
+fn render_table(
+    rows: &[Vec<String>],
+    sink: &mut impl crate::ExtractSink,
+) -> crate::error::Result<()> {
+    let Some(header) = rows.first() else {
+        return Ok(());
+    };
+    render_table_row(header, sink)?;
+    for _ in header {
+        sink.write_str("| --- ")?;
+    }
+    sink.write_str("|\n")?;
+    for row in rows.iter().skip(1) {
+        render_table_row(row, sink)?;
+    }
+    Ok(())
+}
+
+fn render_table_row(
+    row: &[String],
+    sink: &mut impl crate::ExtractSink,
+) -> crate::error::Result<()> {
+    for cell in row {
+        sink.write_str("| ")?;
+        sink.write_str(&escape_cell(cell))?;
+        sink.write_str(" ")?;
+    }
+    sink.write_str("|\n")?;
     Ok(())
 }
 
@@ -1488,5 +1524,31 @@ mod tests {
         let blocks = classify(lines, &sig);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "native from ocr"));
+    }
+
+    #[test]
+    fn render_table_block() {
+        let blocks = vec![
+            Block::Paragraph("Before.".into()),
+            Block::Table(vec![
+                vec!["Name".into(), "Age".into()],
+                vec!["Alice".into(), "30".into()],
+            ]),
+            Block::Paragraph("After.".into()),
+        ];
+        let mut out = String::new();
+        render(&blocks, &mut out).unwrap();
+        assert_eq!(
+            out,
+            "Before.\n\n| Name | Age |\n| --- | --- |\n| Alice | 30 |\n\nAfter.\n"
+        );
+    }
+
+    #[test]
+    fn render_table_escapes_pipes() {
+        let blocks = vec![Block::Table(vec![vec!["a|b".into()], vec!["c".into()]])];
+        let mut out = String::new();
+        render(&blocks, &mut out).unwrap();
+        assert_eq!(out, "| a\\|b |\n| --- |\n| c |\n");
     }
 }

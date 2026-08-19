@@ -302,7 +302,7 @@ pub(crate) fn extract_markdown_to(
         }
         let merged = crate::pdf_ocr::merge(native, ocr_lines);
         let ordered = crate::pdf_layout::reading_order(merged);
-        let blocks = crate::pdf_layout::classify(ordered, &signals);
+        let blocks = crate::pdf_layout::detect_tables(ordered, &signals);
         let mut page_md = String::new();
         crate::pdf_layout::render(&blocks, &mut page_md)?;
         if !unplaced_text.trim().is_empty() {
@@ -727,5 +727,22 @@ startxref\n\
         let mut buf = Vec::new();
         doc.save_to(&mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn markdown_table_e2e() {
+        // Three aligned rows at fixed x positions → pipe table in output.
+        let data = build_text_pdf_content(
+            "BT /F1 12 Tf 72 700 Td (Name) Tj ET\n\
+             BT /F1 12 Tf 200 700 Td (Age) Tj ET\n\
+             BT /F1 12 Tf 72 680 Td (Alice) Tj ET\n\
+             BT /F1 12 Tf 200 680 Td (30) Tj ET\n\
+             BT /F1 12 Tf 72 660 Td (Bob) Tj ET\n\
+             BT /F1 12 Tf 200 660 Td (25) Tj ET",
+        );
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(md.contains("| Name | Age |"), "got: {md:?}");
+        assert!(md.contains("| Alice | 30 |"), "got: {md:?}");
+        assert!(md.contains("| --- | --- |"), "got: {md:?}");
     }
 }
