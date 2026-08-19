@@ -545,9 +545,9 @@ startxref\n\
     }
 
     #[test]
-    fn markdown_textless_pdf_reports_ocr_wording() {
-        // The no-page-tree PDF from extract_plain_textless_pdf_auto_ocrs_and_reports:
-        // markdown path must surface the same no-text error wording.
+    fn markdown_textless_pdf_reports_no_text_error() {
+        // For the zero-page fixture, the markdown path emits the no-text
+        // error (not the OCR wording the plain path uses after auto-OCR).
         let data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\nxref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n110\n%%EOF\n";
         let err = extract_markdown(data, crate::ExtractOptions::default())
             .unwrap_err()
@@ -576,6 +576,24 @@ startxref\n\
         let l2 = md.find("L2").unwrap();
         let r1 = md.find("R1").unwrap();
         assert!(l1 < l2 && l2 < r1, "reading order wrong: {md:?}");
+    }
+
+    #[test]
+    #[ignore = "characterization: documents v1 fused-gutter behavior; Phase 6 regression target"]
+    fn narrow_gutter_same_baseline_fuses_into_one_line() {
+        // Two-column PDF with a 3em (36pt) gutter. Left column at x=72,
+        // right column at x=180. At this narrow gap the v1 assembly pass
+        // treats the same-baseline fragments as one line and emits them
+        // interleaved. This test documents the known-bad behavior the Phase 6
+        // gutter-decoupling task must fix.
+        let data = build_text_pdf_content(
+            "BT /F1 12 Tf 72 700 Td (Left) Tj ET\nBT /F1 12 Tf 180 700 Td (Right) Tj ET",
+        );
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        // Today the pipeline fuses the two columns into a single line with a
+        // single space between them (gap 36pt < LINE_SPLIT_RATIO·12). This is
+        // the v1 known-bad output the Phase 6 gutter-decoupling task must fix.
+        assert_eq!(md, "Left Right\n", "unexpected v1 fused output: {md:?}");
     }
 
     /// Build a minimal one-or-more page PDF with a WinAnsi Helvetica text layer,
@@ -744,5 +762,55 @@ startxref\n\
         assert!(md.contains("| Name | Age |"), "got: {md:?}");
         assert!(md.contains("| Alice | 30 |"), "got: {md:?}");
         assert!(md.contains("| --- | --- |"), "got: {md:?}");
+    }
+
+    #[test]
+    #[ignore = "benchmark fixture generator — writes /tmp/batdoc-bench.pdf"]
+    fn make_benchmark_pdf() {
+        use lopdf::{dictionary, Document as LopdfDoc, Object, Stream};
+        let mut doc = LopdfDoc::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let mut kids = Vec::new();
+        for i in 0..200 {
+            let body = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(3);
+            let content = format!(
+                "BT /F1 18 Tf 72 720 Td (Section {i}) Tj ET\nBT /F1 11 Tf 72 690 Td ({body}) Tj ET"
+            );
+            let content_id =
+                doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => 200_i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        std::fs::write("/tmp/batdoc-bench.pdf", buf).unwrap();
     }
 }

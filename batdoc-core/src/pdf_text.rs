@@ -145,9 +145,6 @@ fn quantize_rotation(trm: &Transform) -> u16 {
 /// Extract one page of positioned characters. `page_num` is 1-based and
 /// matches `lopdf::Document::get_pages()` (the same page-tree order
 /// `extract_pages` relies on for its `page_ids[i] ↔ pages[i]` invariant).
-///
-/// Consumed by the markdown driver (Task 13) — allow dead code until then.
-#[allow(dead_code)]
 pub(crate) fn extract_positioned_page(
     doc: &lopdf::Document,
     page_num: u32,

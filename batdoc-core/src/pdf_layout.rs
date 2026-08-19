@@ -95,8 +95,8 @@ pub(crate) fn assemble(page: &PositionedPage) -> Vec<Line> {
 
     // Partition by rotation relative to the canonical frame: the majority
     // group is rotation 0; minority rotations land in their own groups. The
-    // relative rotation is kept in a local u16 (270 does not fit the char
-    // field's u8) and never written back into a `PositionedChar`.
+    // relative rotation is kept in a local u16 (matching the `PositionedChar`
+    // field width) and never written back into the original `PositionedChar`.
     let mut groups: [Vec<PositionedChar>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for c in chars {
         let rel = (c.rotation + R360 - page_rot) % R360;
@@ -1316,7 +1316,10 @@ mod tests {
     #[test]
     fn wide_horizontal_gap_splits_line() {
         // "L1" at x=72 and "R1" at x=320 on the same baseline → two lines
-        // (gap 234pt > 1.5*12), which is what lets xy-cut see columns.
+        // (gap 234pt = 19.5·12, well above LINE_SPLIT_RATIO=10.0·12). This
+        // is the upper pin of the (8.0, 19.5) ratio window that brackets the
+        // horizontal line-split threshold; the lower pin keeps a 96pt gap on
+        // one line.
         let chars = vec![
             pc('L', 72.0, 92.0, 12.0, 8.0),
             pc('1', 80.0, 92.0, 12.0, 6.0),
@@ -1676,6 +1679,24 @@ mod tests {
         ];
         let blocks = classify(lines, &sig);
         assert!(matches!(&blocks[0], Block::List(items) if items == &["one", "two"]));
+    }
+
+    #[test]
+    fn lettered_markers_become_list() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("a. first", 72.0, 100.0, 300.0),
+            line("b. second", 72.0, 114.0, 300.0),
+        ];
+        let blocks = classify(lines, &sig);
+        assert!(
+            matches!(&blocks[0], Block::List(items) if items == &["first", "second"]),
+            "got: {blocks:?}"
+        );
     }
 
     #[test]

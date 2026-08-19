@@ -297,3 +297,17 @@ fn ocr_pdf_embedded_image_page() {
     .unwrap();
     assert!(text.contains("123"), "OCR text missing: {text:?}");
 }
+
+#[test]
+#[ignore = "requires OCR models (downloaded on first use)"]
+fn ocr_pdf_markdown_mode_region_merge() {
+    let pdf = build_pdf_with_image(&render_test_image());
+    // Markdown mode on a textless PDF must also run OCR and include the
+    // recognized text (region merge path is shared with plain mode).
+    let md = batdoc_core::extract_markdown(&pdf, Format::Pdf, false).unwrap();
+    assert!(md.contains("123"), "OCR text missing in markdown: {md:?}");
+    assert!(
+        md.contains("BATDOC"),
+        "OCR text missing in markdown: {md:?}"
+    );
+}

@@ -70,26 +70,31 @@ too.
 ## Install
 
 **Arch Linux (AUR):**
+
 ```
 yay -S batdoc
 ```
 
 **Homebrew:**
+
 ```
 brew install daemonp/tap/batdoc
 ```
 
 **Linux (x86_64, static musl):**
+
 ```
 curl -sL https://github.com/daemonp/batdoc/releases/latest/download/batdoc-linux-x86_64.zst | zstd -d > batdoc && chmod +x batdoc
 ```
 
 **macOS (Apple Silicon):**
+
 ```
 curl -sL https://github.com/daemonp/batdoc/releases/latest/download/batdoc-darwin-aarch64.zst | zstd -d > batdoc && chmod +x batdoc
 ```
 
 **From source:**
+
 ```
 cargo build --release
 cp target/release/batdoc ~/.local/bin/
@@ -125,6 +130,16 @@ layer at all (a scan), batdoc automatically falls back to OCR'ing its embedded
 page images — no `--ocr` flag needed. A scanned PDF whose OCR also finds
 nothing gets a clean error message. Malformed PDFs that would crash the
 underlying library are caught and reported as errors rather than panics.
+
+### PDF extraction notes
+
+PDFs with broken or missing font mappings (garbled CID fonts) are recovered
+via a vendored fork of `pdf-extract` under `crates/pdf-extract`, wired in with
+`[patch.crates-io]`. Builds from this repository — releases, AUR, deb/rpm,
+Homebrew — include the fix. `cargo install batdoc` resolves `pdf-extract` from
+crates.io instead and gets upstream behavior: still safe (panics are caught), but
+garbled documents stay garbled. Publishing the fork to close this gap is a
+deferred follow-up.
 
 ## Options
 

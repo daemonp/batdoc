@@ -18,7 +18,6 @@ const MAX_OCR_IMAGE_PIXELS: u64 = 100_000_000;
 
 /// Overlap tolerance in page points for OCR/native dedup (liteparse
 /// `ocr_merge.rs:688` uses 2.0 pt).
-#[allow(dead_code)] // consumed by merge; merge is not yet called by the driver.
 const OVERLAP_TOLERANCE_PT: f64 = 2.0;
 
 /// Select up to [`MAX_OCR_IMAGES_PER_PAGE`] OCR candidates, largest by
