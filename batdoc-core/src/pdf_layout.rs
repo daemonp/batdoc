@@ -478,6 +478,280 @@ fn widest_gap(lines: &[Line], threshold: f64, vertical: bool) -> Option<Cut> {
     best
 }
 
+// ---------------------------------------------------------------------------
+// Document-level signals + heading/paragraph classification
+// (liteparse `markdown_layout/{headings,repetition,classify}`, minimal port).
+//
+// Pass 1 of the Task 13 driver feeds each page's assembled lines to
+// [`DocSignalsBuilder`] and drops the page; pass 2 runs [`classify`] over the
+// merged, reading-ordered line set. liteparse gates headings on `size > body
+// + 0.5pt` and derives levels from a doc-wide rank of distinct heading sizes
+// (its headings.rs:578/:644) — the plan deliberately trimmed that to a pure
+// size-ratio scheme so signals stay three small fields (spec §7).
+// ---------------------------------------------------------------------------
+
+/// Heading gate: a line at least this much larger than the body size.
+const HEADING_MIN_RATIO: f64 = 1.2;
+/// Size-ratio bands → heading level: ≥1.8 → H1, ≥1.5 → H2, ≥1.3 → H3, and
+/// anything still over [`HEADING_MIN_RATIO`] → H4.
+const HEADING_H1_RATIO: f64 = 1.8;
+const HEADING_H2_RATIO: f64 = 1.5;
+const HEADING_H3_RATIO: f64 = 1.3;
+/// Paragraph split: a top-to-top vertical gap larger than this many times
+/// the previous line's font size starts a new paragraph.
+const PARAGRAPH_GAP_RATIO: f64 = 1.5;
+/// Body size when the document yields no measurable text (image-only PDF).
+const DEFAULT_BODY_SIZE: f64 = 12.0;
+/// A normalized first/last-line signature must repeat on at least this many
+/// pages to count as a header/footer…
+const HEADER_FOOTER_MIN_PAGES: usize = 2;
+/// …or on one page in `HEADER_FOOTER_PAGE_DIV`, whichever is larger.
+const HEADER_FOOTER_PAGE_DIV: usize = 3;
+
+/// Document-wide aggregates collected in driver pass 1 (tiny — no pages
+/// retained, spec §4.2/§11).
+///
+/// Consumed by Task 13 — allow dead code until it lands.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct DocSignals {
+    /// Modal font size across the document (quarter-point buckets) — the
+    /// body text size.
+    pub body_size: f64,
+    /// Normalized signatures of lines repeated as a page's first line.
+    pub headers: std::collections::HashSet<String>,
+    /// Same for last lines (footers).
+    pub footers: std::collections::HashSet<String>,
+}
+
+/// Pass-1 accumulator for [`DocSignals`].
+///
+/// Consumed by Task 13 — allow dead code until it lands.
+#[allow(dead_code)]
+#[derive(Default)]
+pub(crate) struct DocSignalsBuilder {
+    /// Quarter-point bucket key → summed text length at that size.
+    size_weights: std::collections::HashMap<u64, usize>,
+    /// Normalized first-line signature → pages seen on.
+    first_counts: std::collections::HashMap<String, usize>,
+    /// Normalized last-line signature → pages seen on.
+    last_counts: std::collections::HashMap<String, usize>,
+}
+
+/// A classified block of body content. Table and List variants arrive in
+/// Tasks 14–16.
+///
+/// Consumed by Task 13 — allow dead code until it lands.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum Block {
+    Heading { level: u8, text: String },
+    Paragraph(String),
+}
+
+#[allow(dead_code)] // consumed by Task 13
+impl DocSignalsBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one page's assembled lines into the aggregates. Lines are
+    /// unordered here: the page's "first line" is the one with min
+    /// `rect.y0`, its "last line" the one with max `rect.y0`.
+    /// Whitespace-only lines carry no signal and are skipped entirely.
+    pub(crate) fn add_lines(&mut self, lines: &[Line]) {
+        let mut first: Option<&Line> = None;
+        let mut last: Option<&Line> = None;
+        for l in lines {
+            let text = l.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if l.font_size > 0.0 {
+                *self
+                    .size_weights
+                    .entry(size_bucket(l.font_size))
+                    .or_insert(0) += text.chars().count();
+            }
+            if first.is_none_or(|f| l.rect.y0 < f.rect.y0) {
+                first = Some(l);
+            }
+            if last.is_none_or(|f| l.rect.y0 > f.rect.y0) {
+                last = Some(l);
+            }
+        }
+        if let Some(f) = first {
+            *self
+                .first_counts
+                .entry(normalize_signature(&f.text))
+                .or_insert(0) += 1;
+        }
+        if let Some(l) = last {
+            *self
+                .last_counts
+                .entry(normalize_signature(&l.text))
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// Emit the aggregates. `body_size` is the bucket with the most text
+    /// (ties go to the larger size — the body is never smaller than its own
+    /// footnotes); signatures under the repetition threshold are dropped.
+    pub(crate) fn finish(self, page_count: usize) -> DocSignals {
+        let body_size = self
+            .size_weights
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+            .map_or(DEFAULT_BODY_SIZE, |(&key, _)| bucket_size(key));
+        let threshold = HEADER_FOOTER_MIN_PAGES.max(page_count / HEADER_FOOTER_PAGE_DIV);
+        let collect = |counts: std::collections::HashMap<String, usize>| {
+            counts
+                .into_iter()
+                .filter(|(_, n)| *n >= threshold)
+                .map(|(sig, _)| sig)
+                .collect()
+        };
+        DocSignals {
+            body_size,
+            headers: collect(self.first_counts),
+            footers: collect(self.last_counts),
+        }
+    }
+}
+
+/// Quarter-point histogram bucket for a font size. Positive sizes only —
+/// callers skip `<= 0.0` (a malformed-PDF guard, not a real case).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // size > 0 and ≤ ~1e3pt
+fn size_bucket(size: f64) -> u64 {
+    (size * 4.0).round() as u64
+}
+
+/// Inverse of [`size_bucket`].
+#[allow(clippy::cast_precision_loss)] // bucket keys are small integers
+fn bucket_size(key: u64) -> f64 {
+    key as f64 / 4.0
+}
+
+/// Normalize a line for header/footer matching: lowercase, every RUN of
+/// ASCII digits collapses to one `#`, whitespace runs collapse to one space
+/// (liteparse `normalize_for_repetition`). Run-collapse — not per-digit —
+/// so "Page 3 of 9" and "Page 12 of 9" normalize together.
+fn normalize_signature(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_digits = false;
+    let mut pending_space = false;
+    for c in text.trim().chars().flat_map(char::to_lowercase) {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+            in_digits = false;
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            out.push(c);
+            in_digits = false;
+        }
+    }
+    out
+}
+
+/// Classify reading-ordered `lines` (native + OCR merged — OCR lines
+/// participate exactly like native ones) into blocks:
+///
+/// 1. Lines whose normalized text is a known header/footer are dropped
+///    (and break any open paragraph — chrome never glues text together).
+/// 2. A line at ≥ [`HEADING_MIN_RATIO`]× the body size is a heading; the
+///    ratio band picks the level.
+/// 3. Remaining consecutive lines merge into paragraphs, joined with a
+///    space — except a trailing `-` dehyphenates ("exam-" + "ple" →
+///    "example"). A top-to-top gap > [`PARAGRAPH_GAP_RATIO`]× the previous
+///    line's font size splits the paragraph.
+///
+/// Whitespace-only lines (all-space clusters) are dropped, never emitted
+/// as empty paragraphs.
+///
+/// Consumed by Task 13 — allow dead code until it lands.
+#[allow(dead_code)]
+pub(crate) fn classify(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
+    /// Open paragraph: text plus the last line's font size and top edge
+    /// (the gap rule needs both).
+    struct Para {
+        text: String,
+        font_size: f64,
+        y0: f64,
+    }
+    let flush = |blocks: &mut Vec<Block>, para: &mut Option<Para>| {
+        if let Some(p) = para.take() {
+            blocks.push(Block::Paragraph(p.text));
+        }
+    };
+    let mut blocks = Vec::new();
+    let mut para: Option<Para> = None;
+    for line in lines {
+        let text = line.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let sig = normalize_signature(text);
+        if signals.headers.contains(&sig) || signals.footers.contains(&sig) {
+            flush(&mut blocks, &mut para);
+            continue;
+        }
+        let ratio = if signals.body_size > 0.0 {
+            line.font_size / signals.body_size
+        } else {
+            0.0
+        };
+        if ratio >= HEADING_MIN_RATIO {
+            flush(&mut blocks, &mut para);
+            let level = if ratio >= HEADING_H1_RATIO {
+                1
+            } else if ratio >= HEADING_H2_RATIO {
+                2
+            } else if ratio >= HEADING_H3_RATIO {
+                3
+            } else {
+                4
+            };
+            blocks.push(Block::Heading {
+                level,
+                text: text.to_string(),
+            });
+            continue;
+        }
+        match para.as_mut() {
+            Some(p) if line.rect.y0 - p.y0 <= PARAGRAPH_GAP_RATIO * p.font_size => {
+                if p.text.ends_with('-') {
+                    p.text.pop();
+                } else {
+                    p.text.push(' ');
+                }
+                p.text.push_str(text);
+                p.font_size = line.font_size;
+                p.y0 = line.rect.y0;
+            }
+            _ => {
+                flush(&mut blocks, &mut para);
+                para = Some(Para {
+                    text: text.to_string(),
+                    font_size: line.font_size,
+                    y0: line.rect.y0,
+                });
+            }
+        }
+    }
+    flush(&mut blocks, &mut para);
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,5 +966,143 @@ mod tests {
             chars: vec![],
         });
         assert!(lines.is_empty());
+    }
+
+    fn sig_lines(pages: &[Vec<Line>]) -> DocSignals {
+        let mut b = DocSignalsBuilder::new();
+        for p in pages {
+            b.add_lines(p);
+        }
+        b.finish(pages.len())
+    }
+
+    #[test]
+    fn body_size_is_modal() {
+        let pages = vec![vec![
+            line("body text here", 72.0, 100.0, 300.0), // 12pt (helper default)
+            Line {
+                font_size: 18.0,
+                ..line("H", 72.0, 60.0, 100.0)
+            },
+        ]];
+        assert!((sig_lines(&pages).body_size - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn repeated_first_line_becomes_header() {
+        // The trailing "common closer" line is deliberate: without it the
+        // digit-normalized body line is every page's LAST line and would
+        // itself qualify as a footer (first/last-line signatures have no
+        // page-band gating — see task-12 report). It doubles as a footer
+        // fixture: classify must drop it too.
+        let mk = |n: usize| {
+            vec![
+                line("CONFIDENTIAL", 72.0, 30.0, 200.0),
+                line(&format!("body {n}"), 72.0, 100.0, 300.0),
+                line("common closer", 72.0, 700.0, 300.0),
+            ]
+        };
+        let pages: Vec<Vec<Line>> = (0..4).map(mk).collect();
+        let sig = sig_lines(&pages);
+        assert!(sig.headers.contains("confidential"));
+        let blocks = classify(pages[0].clone(), &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "body 0"));
+    }
+
+    #[test]
+    fn page_numbers_in_footers_normalize_together() {
+        let mk = |n: usize| {
+            vec![
+                line("body", 72.0, 100.0, 300.0),
+                line(&format!("Page {n} of 9"), 250.0, 750.0, 350.0),
+            ]
+        };
+        let pages: Vec<Vec<Line>> = (1..=3).map(mk).collect();
+        let sig = sig_lines(&pages);
+        assert!(sig.footers.contains("page # of #"), "{:?}", sig.footers);
+    }
+
+    #[test]
+    fn heading_levels_from_size_ratio() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            Line {
+                font_size: 24.0,
+                ..line("Big", 72.0, 50.0, 200.0)
+            }, // 2.0x → H1
+            Line {
+                font_size: 18.0,
+                ..line("Mid", 72.0, 90.0, 200.0)
+            }, // 1.5x → H2
+            Line {
+                font_size: 14.5,
+                ..line("Small", 72.0, 120.0, 200.0)
+            }, // 1.21x → H4
+            line("body", 72.0, 150.0, 300.0),
+        ];
+        let blocks = classify(lines, &sig);
+        assert!(matches!(&blocks[0], Block::Heading { level: 1, text } if text == "Big"));
+        assert!(matches!(&blocks[1], Block::Heading { level: 2, .. }));
+        assert!(matches!(&blocks[2], Block::Heading { level: 4, .. }));
+        assert!(matches!(&blocks[3], Block::Paragraph(t) if t == "body"));
+    }
+
+    #[test]
+    fn paragraph_join_and_dehyphenation() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("This is an exam-", 72.0, 100.0, 300.0),
+            line("ple of joining.", 72.0, 114.0, 300.0),
+            line("New para.", 72.0, 140.0, 300.0), // 26pt gap > 1.5*12 → split
+        ];
+        let blocks = classify(lines, &sig);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "This is an example of joining."));
+        assert!(matches!(&blocks[1], Block::Paragraph(t) if t == "New para."));
+    }
+
+    #[test]
+    fn whitespace_only_lines_are_dropped() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("real text", 72.0, 100.0, 300.0),
+            Line {
+                text: "   ".into(),
+                ..line("", 72.0, 114.0, 300.0)
+            },
+        ];
+        let blocks = classify(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "real text"));
+    }
+
+    #[test]
+    fn ocr_lines_join_paragraphs() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let ocr = Line {
+            source: LineSource::Ocr,
+            ..line("from ocr", 72.0, 114.0, 300.0)
+        };
+        let lines = vec![line("native", 72.0, 100.0, 300.0), ocr];
+        let blocks = classify(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "native from ocr"));
     }
 }
