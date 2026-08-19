@@ -22,3 +22,6 @@ lopdf = { version = "0.38", default-features = false }
 postscript = "0.14"
 type1-encoding-parser = "0.1.0"
 unicode-normalization = "0.1.19"
+
+[dev-dependencies]
+lopdf = { version = "0.38", default-features = false }

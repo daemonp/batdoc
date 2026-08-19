@@ -157,11 +157,12 @@ const PDFDocEncoding: &'static [u16] = &[
 ];
 
 fn pdf_to_utf8(s: &[u8]) -> String {
+    // Fork: invalid UTF-16BE (e.g. lone surrogates) decodes to an empty
+    // string instead of panicking.
     if s.len() > 2 && s[0] == 0xfe && s[1] == 0xff {
         return UTF_16BE
             .decode_without_bom_handling_and_without_replacement(&s[2..])
-            .unwrap()
-            .to_string();
+            .map_or_else(String::new, |s| s.into_owned());
     } else {
         let r: Vec<u8> = s
             .iter()
@@ -173,17 +174,17 @@ fn pdf_to_utf8(s: &[u8]) -> String {
             .collect();
         return UTF_16BE
             .decode_without_bom_handling_and_without_replacement(&r)
-            .unwrap()
-            .to_string();
+            .map_or_else(String::new, |s| s.into_owned());
     }
 }
 
 fn to_utf8(encoding: &[u16], s: &[u8]) -> String {
+    // Fork: invalid UTF-16BE decodes to an empty string instead of
+    // panicking.
     if s.len() > 2 && s[0] == 0xfe && s[1] == 0xff {
         return UTF_16BE
             .decode_without_bom_handling_and_without_replacement(&s[2..])
-            .unwrap()
-            .to_string();
+            .map_or_else(String::new, |s| s.into_owned());
     } else {
         let r: Vec<u8> = s
             .iter()
@@ -195,8 +196,7 @@ fn to_utf8(encoding: &[u16], s: &[u8]) -> String {
             .collect();
         return UTF_16BE
             .decode_without_bom_handling_and_without_replacement(&r)
-            .unwrap()
-            .to_string();
+            .map_or_else(String::new, |s| s.into_owned());
     }
 }
 
@@ -332,13 +332,13 @@ fn maybe_get<'a, T: FromObj<'a>>(doc: &'a Document, dict: &'a Dictionary, key: &
 }
 
 fn get_name_string<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> String {
-    pdf_to_utf8(
-        dict.get(key)
-            .map(|o| maybe_deref(doc, o))
-            .unwrap_or_else(|_| panic!("deref"))
-            .as_name()
-            .expect("name"),
-    )
+    // Fork: a missing/mistyped name yields an empty string instead of a
+    // panic (font dictionaries with broken BaseFont/Subtype/Encoding).
+    dict.get(key)
+        .ok()
+        .map(|o| maybe_deref(doc, o))
+        .and_then(|o| o.as_name().ok())
+        .map_or_else(String::new, pdf_to_utf8)
 }
 
 #[allow(dead_code)]
@@ -383,15 +383,17 @@ struct PdfType3Font<'a> {
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
 }
 
-fn make_font<'a>(doc: &'a Document, font: &'a Dictionary) -> Rc<dyn PdfFont + 'a> {
+// Fork: returns None when a font is too broken to construct (upstream
+// panicked); callers leave the current font unchanged.
+fn make_font<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<Rc<dyn PdfFont + 'a>> {
     let subtype = get_name_string(doc, font, b"Subtype");
     dlog!("MakeFont({})", subtype);
     if subtype == "Type0" {
-        Rc::new(PdfCIDFont::new(doc, font))
+        PdfCIDFont::new(doc, font).map(|f| Rc::new(f) as Rc<dyn PdfFont>)
     } else if subtype == "Type3" {
-        Rc::new(PdfType3Font::new(doc, font))
+        Some(Rc::new(PdfType3Font::new(doc, font)))
     } else {
-        Rc::new(PdfSimpleFont::new(doc, font))
+        Some(Rc::new(PdfSimpleFont::new(doc, font)))
     }
 }
 
@@ -420,13 +422,22 @@ fn encoding_to_unicode_table(name: &[u8]) -> Vec<u16> {
         b"MacRomanEncoding" => encodings::MAC_ROMAN_ENCODING,
         b"MacExpertEncoding" => encodings::MAC_EXPERT_ENCODING,
         b"WinAnsiEncoding" => encodings::WIN_ANSI_ENCODING,
-        _ => panic!("unexpected encoding {:?}", pdf_to_utf8(name)),
+        // Fork: unknown encoding names fall back to PDFDocEncoding instead
+        // of panicking (malformed documents).
+        _ => {
+            warn!(
+                "unexpected encoding {:?}; falling back to PDFDocEncoding",
+                pdf_to_utf8(name)
+            );
+            return Vec::from(PDFDocEncoding);
+        }
     };
     let encoding_table = encoding
         .iter()
         .map(|x| {
             if let &Some(x) = x {
-                glyphnames::name_to_unicode(x).unwrap()
+                // Fork: unknown glyph names map to unmapped (0), not panic.
+                glyphnames::name_to_unicode(x).unwrap_or(0)
             } else {
                 0
             }
@@ -465,8 +476,15 @@ impl<'a> PdfSimpleFont<'a> {
                     Some(&Object::Stream(ref s)) => {
                         let s = get_contents(s);
                         //dlog!("font contents {:?}", pdf_to_utf8(&s));
-                        type1_encoding =
-                            Some(type1_encoding_parser::get_encoding_map(&s).expect("encoding"));
+                        // Fork: a malformed embedded Type1 program loses
+                        // its encoding fallback instead of panicking.
+                        type1_encoding = match type1_encoding_parser::get_encoding_map(&s) {
+                            Ok(map) => Some(map),
+                            Err(e) => {
+                                dlog!("failed to parse Type1 encoding: {:?}", e);
+                                None
+                            }
+                        };
                     }
                     _ => {
                         dlog!("font file {:?}", file)
@@ -492,22 +510,32 @@ impl<'a> PdfSimpleFont<'a> {
                     dlog!("font file {}, {:?}", subtype, s);
                     let s = get_contents(s);
                     if subtype == "Type1C" {
-                        let table = cff_parser::Table::parse(&s).unwrap();
-                        let charset = table.charset.get_table();
-                        let encoding = table.encoding.get_table();
-                        let mut mapping = HashMap::new();
-                        for i in 0..encoding.len().min(charset.len()) {
-                            let cid = encoding[i];
-                            let sid = charset[i];
-                            let name = cff_parser::string_by_id(&table, sid).unwrap();
-                            let unicode = glyphnames::name_to_unicode(&name)
-                                .or_else(|| zapfglyphnames::zapfdigbats_names_to_unicode(name));
-                            if let Some(unicode) = unicode {
-                                let str = String::from_utf16(&[unicode]).unwrap();
-                                mapping.insert(cid as u32, str);
+                        // Fork: a malformed CFF program yields no unicode
+                        // map instead of panicking.
+                        match cff_parser::Table::parse(&s) {
+                            Some(table) => {
+                                let charset = table.charset.get_table();
+                                let encoding = table.encoding.get_table();
+                                let mut mapping = HashMap::new();
+                                for i in 0..encoding.len().min(charset.len()) {
+                                    let cid = encoding[i];
+                                    let sid = charset[i];
+                                    let Some(name) = cff_parser::string_by_id(&table, sid) else {
+                                        continue;
+                                    };
+                                    let unicode = glyphnames::name_to_unicode(name).or_else(|| {
+                                        zapfglyphnames::zapfdigbats_names_to_unicode(name)
+                                    });
+                                    if let Some(unicode) = unicode {
+                                        if let Ok(str) = String::from_utf16(&[unicode]) {
+                                            mapping.insert(cid as u32, str);
+                                        }
+                                    }
+                                }
+                                unicode_map = Some(mapping);
                             }
+                            None => dlog!("failed to parse CFF font program"),
                         }
-                        unicode_map = Some(mapping);
                         //
                         //File::create(format!("/tmp/{}", base_name)).unwrap().write_all(&s);
                     }
@@ -564,6 +592,16 @@ impl<'a> PdfSimpleFont<'a> {
                             }
                             &Object::Name(ref n) => {
                                 let name = pdf_to_utf8(&n);
+                                // Fork: ignore out-of-range Differences
+                                // codes instead of indexing past the table.
+                                if code < 0 || code as usize >= table.len() {
+                                    warn!(
+                                        "Differences code {} out of range for font {}",
+                                        code, base_name
+                                    );
+                                    code += 1;
+                                    continue;
+                                }
                                 // XXX: names of Type1 fonts can map to arbitrary strings instead of real
                                 // unicode names, so we should probably handle this differently
                                 let unicode = glyphnames::name_to_unicode(&name);
@@ -574,13 +612,19 @@ impl<'a> PdfSimpleFont<'a> {
                                         match unicode_map.entry(code as u32) {
                                             // If there's a unicode table entry missing use one based on the name
                                             Entry::Vacant(v) => {
-                                                v.insert(String::from_utf16(&be).unwrap());
+                                                // Fork: from_utf16 never
+                                                // panics (fallback: "").
+                                                v.insert(
+                                                    String::from_utf16(&be).unwrap_or_default(),
+                                                );
                                             }
                                             Entry::Occupied(e) => {
-                                                if e.get() != &String::from_utf16(&be).unwrap() {
+                                                if e.get()
+                                                    != &String::from_utf16(&be).unwrap_or_default()
+                                                {
                                                     let normal_match =
                                                         e.get().nfkc().eq(String::from_utf16(&be)
-                                                            .unwrap()
+                                                            .unwrap_or_default()
                                                             .nfkc());
                                                     if !normal_match {
                                                         warn!(
@@ -608,7 +652,8 @@ impl<'a> PdfSimpleFont<'a> {
                                                     v.insert("".to_owned());
                                                 }
                                                 Entry::Occupied(_e) => {
-                                                    panic!("unexpected entry in unicode map")
+                                                    // Fork: warn instead of panicking.
+                                                    warn!("unexpected entry in unicode map");
                                                 }
                                             }
                                         }
@@ -631,7 +676,9 @@ impl<'a> PdfSimpleFont<'a> {
                                 code += 1;
                             }
                             _ => {
-                                panic!("wrong type {:?}", o);
+                                // Fork: skip non-integer/non-name
+                                // Differences entries instead of panicking.
+                                warn!("unexpected Differences entry {:?}", o);
                             }
                         }
                     }
@@ -664,7 +711,9 @@ impl<'a> PdfSimpleFont<'a> {
                             .iter()
                             .map(|x| {
                                 if let &Some(x) = x {
-                                    glyphnames::name_to_unicode(x).unwrap()
+                                    // Fork: unknown glyph names map to
+                                    // unmapped (0), not panic.
+                                    glyphnames::name_to_unicode(x).unwrap_or(0)
                                 } else {
                                     0
                                 }
@@ -673,8 +722,10 @@ impl<'a> PdfSimpleFont<'a> {
                     );
                 }
             }
-            _ => {
-                panic!()
+            other => {
+                // Fork: an Encoding that is neither name nor dictionary
+                // leaves no encoding table instead of panicking.
+                warn!("unexpected Encoding object {:?}", other);
             }
         }
 
@@ -706,7 +757,14 @@ impl<'a> PdfSimpleFont<'a> {
                 width_map.insert((first_char + i) as CharCode, w);
                 i += 1;
             }
-            assert_eq!(first_char + i - 1, last_char);
+            // Fork: a FirstChar/LastChar/Widths length mismatch is logged,
+            // not asserted (malformed documents).
+            if first_char + i - 1 != last_char {
+                warn!(
+                    "Widths length mismatch: first_char {} + {} widths - 1 != last_char {}",
+                    first_char, i, last_char
+                );
+            }
         } else {
             let _name = if is_core_font(&base_name) {
                 &base_name
@@ -734,7 +792,11 @@ impl<'a> PdfSimpleFont<'a> {
                     if let Some(ref encoding) = encoding_table {
                         dlog!("has encoding");
                         for w in font_metrics.2 {
-                            let c = glyphnames::name_to_unicode(w.2).unwrap();
+                            // Fork: unknown glyph names are skipped instead
+                            // of panicking (they cannot map to a codepoint).
+                            let Some(c) = glyphnames::name_to_unicode(w.2) else {
+                                continue;
+                            };
                             for i in 0..encoding.len() {
                                 if encoding[i] == c {
                                     width_map.insert(i as CharCode, w.1 as f64);
@@ -751,11 +813,13 @@ impl<'a> PdfSimpleFont<'a> {
                             dlog!("{} {}", w.0, w.2);
                             // -1 is "not encoded"
                             if w.0 != -1 {
+                                // Fork: unknown glyph names decode to
+                                // U+FFFD instead of panicking.
                                 table[w.0 as usize] = if base_name == "ZapfDingbats" {
                                     zapfglyphnames::zapfdigbats_names_to_unicode(w.2)
-                                        .unwrap_or_else(|| panic!("bad name {:?}", w))
+                                        .unwrap_or(0xFFFD)
                                 } else {
-                                    glyphnames::name_to_unicode(w.2).unwrap()
+                                    glyphnames::name_to_unicode(w.2).unwrap_or(0xFFFD)
                                 }
                             }
                         }
@@ -857,6 +921,13 @@ impl<'a> PdfType3Font<'a> {
                             }
                             &Object::Name(ref n) => {
                                 let name = pdf_to_utf8(&n);
+                                // Fork: ignore out-of-range Differences
+                                // codes instead of indexing past the table.
+                                if code < 0 || code as usize >= table.len() {
+                                    warn!("Differences code {} out of range", code);
+                                    code += 1;
+                                    continue;
+                                }
                                 // XXX: names of Type1 fonts can map to arbitrary strings instead of real
                                 // unicode names, so we should probably handle this differently
                                 let unicode = glyphnames::name_to_unicode(&name);
@@ -870,7 +941,9 @@ impl<'a> PdfType3Font<'a> {
                                 code += 1;
                             }
                             _ => {
-                                panic!("wrong type");
+                                // Fork: skip bad entries instead of
+                                // panicking.
+                                warn!("unexpected Differences entry {:?}", o);
                             }
                         }
                     }
@@ -884,14 +957,19 @@ impl<'a> PdfType3Font<'a> {
 
                 encoding_table = Some(table);
             }
-            _ => {
-                panic!()
+            other => {
+                // Fork: a Type3 font without a usable Encoding gets no
+                // encoding table instead of panicking.
+                warn!("unexpected Type3 Encoding object {:?}", other);
+                encoding_table = None;
             }
         }
 
-        let first_char: i64 = get(doc, font, b"FirstChar");
-        let last_char: i64 = get(doc, font, b"LastChar");
-        let widths: Vec<f64> = get(doc, font, b"Widths");
+        // Fork: Type3 metrics fall back to defaults instead of panicking
+        // on malformed font dictionaries.
+        let first_char: i64 = maybe_get(doc, font, b"FirstChar").unwrap_or(0);
+        let last_char: i64 = maybe_get(doc, font, b"LastChar").unwrap_or(0);
+        let widths: Vec<f64> = maybe_get(doc, font, b"Widths").unwrap_or_default();
 
         let mut width_map = HashMap::new();
 
@@ -908,7 +986,13 @@ impl<'a> PdfType3Font<'a> {
             width_map.insert((first_char + i) as CharCode, w);
             i += 1;
         }
-        assert_eq!(first_char + i - 1, last_char);
+        // Fork: mismatch logged, not asserted (malformed documents).
+        if first_char + i - 1 != last_char {
+            warn!(
+                "Widths length mismatch: first_char {} + {} widths - 1 != last_char {}",
+                first_char, i, last_char
+            );
+        }
         PdfType3Font {
             doc,
             font,
@@ -998,11 +1082,13 @@ impl<'a> PdfFont for PdfSimpleFont<'a> {
                     );
                     // some pdf's like http://arxiv.org/pdf/2312.00064v1 are missing entries in their unicode map but do have
                     // entries in the encoding.
+                    // Fork: fall back to PDFDocEncoding instead of
+                    // panicking when both are missing.
                     let encoding = self
                         .encoding
                         .as_ref()
                         .map(|x| &x[..])
-                        .expect("missing unicode map and encoding");
+                        .unwrap_or(PDFDocEncoding);
                     let s = to_utf8(encoding, &slice);
                     debug!("falling back to encoding {} -> {:?}", char, s);
                     s
@@ -1034,7 +1120,9 @@ impl<'a> PdfFont for PdfType3Font<'a> {
         if let Some(width) = width {
             return *width;
         } else {
-            panic!("missing width for {} {:?}", id, self.font);
+            // Fork: missing Type3 widths degrade to 0 instead of panicking.
+            dlog!("missing width for {} {:?}", id, self.font);
+            return 0.0;
         }
     }
     /*fn decode(&self, chars: &[u8]) -> String {
@@ -1057,11 +1145,13 @@ impl<'a> PdfFont for PdfType3Font<'a> {
                     );
                     // some pdf's like http://arxiv.org/pdf/2312.00577v1 are missing entries in their unicode map but do have
                     // entries in the encoding.
+                    // Fork: fall back to PDFDocEncoding instead of
+                    // panicking when both are missing.
                     let encoding = self
                         .encoding
                         .as_ref()
                         .map(|x| &x[..])
-                        .expect("missing unicode map and encoding");
+                        .unwrap_or(PDFDocEncoding);
                     let s = to_utf8(encoding, &slice);
                     debug!("falling back to encoding {} -> {:?}", char, s);
                     s
@@ -1105,9 +1195,14 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
     match to_unicode {
         Some(&Object::Stream(ref stream)) => {
             let contents = get_contents(stream);
-            dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
+            dlog!("Stream: {}", String::from_utf8_lossy(&contents));
 
-            let cmap = adobe_cmap_parser::get_unicode_map(&contents).unwrap();
+            // Fork: an unparseable ToUnicode CMap means no unicode map,
+            // not a panic.
+            let Ok(cmap) = adobe_cmap_parser::get_unicode_map(&contents) else {
+                dlog!("failed to parse ToUnicode CMap");
+                return None;
+            };
             let mut unicode = HashMap::new();
             // "It must use the beginbfchar, endbfchar, beginbfrange, and endbfrange operators to
             // define the mapping from character codes to Unicode character sequences expressed in
@@ -1115,7 +1210,12 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
             for (&k, v) in cmap.iter() {
                 let mut be: Vec<u16> = Vec::new();
                 let mut i = 0;
-                assert!(v.len() % 2 == 0);
+                // Fork: skip malformed (odd-length) UTF-16BE values
+                // instead of asserting.
+                if v.len() % 2 != 0 {
+                    warn!("odd-length ToUnicode value for code {}", k);
+                    continue;
+                }
                 while i < v.len() {
                     be.push(((v[i] as u16) << 8) | v[i + 1] as u16);
                     i += 2;
@@ -1128,7 +1228,10 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
                     }
                     _ => {}
                 }
-                let s = String::from_utf16(&be).unwrap();
+                // Fork: skip values that aren't valid UTF-16.
+                let Ok(s) = String::from_utf16(&be) else {
+                    continue;
+                };
 
                 unicode.insert(k, s);
             }
@@ -1140,26 +1243,27 @@ fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMa
         Some(&Object::Name(ref name)) => {
             let name = pdf_to_utf8(name);
             if name != "Identity-H" {
-                todo!("unsupported ToUnicode name: {:?}", name);
+                // Fork: unsupported ToUnicode names degrade to no map.
+                warn!("unsupported ToUnicode name: {:?}", name);
             }
         }
-        _ => {
-            panic!("unsupported cmap {:?}", to_unicode)
+        other => {
+            // Fork: non-stream, non-name ToUnicode values degrade to no map.
+            warn!("unsupported ToUnicode value {:?}", other);
         }
     }
     unicode_map
 }
 
 impl<'a> PdfCIDFont<'a> {
-    fn new(doc: &'a Document, font: &'a Dictionary) -> PdfCIDFont<'a> {
+    // Fork: returns None instead of panicking when the font dictionary is
+    // structurally broken (missing DescendantFonts/Encoding, unparseable
+    // CMap streams); make_font disables the font in that case.
+    fn new(doc: &'a Document, font: &'a Dictionary) -> Option<PdfCIDFont<'a>> {
         let base_name = get_name_string(doc, font, b"BaseFont");
-        let descendants =
-            maybe_get_array(doc, font, b"DescendantFonts").expect("Descendant fonts required");
-        let ciddict = maybe_deref(doc, &descendants[0])
-            .as_dict()
-            .expect("should be CID dict");
-        let encoding =
-            maybe_get_obj(doc, font, b"Encoding").expect("Encoding required in type0 fonts");
+        let descendants = maybe_get_array(doc, font, b"DescendantFonts")?;
+        let ciddict = maybe_deref(doc, descendants.first()?).as_dict().ok()?;
+        let encoding = maybe_get_obj(doc, font, b"Encoding")?;
         dlog!("base_name {} {:?}", base_name, font);
 
         let encoding = match encoding {
@@ -1180,16 +1284,21 @@ impl<'a> PdfCIDFont<'a> {
                         }],
                     }
                 } else {
-                    panic!("unsupported encoding {}", name);
+                    // Fork: unsupported CID encodings disable the font
+                    // instead of panicking.
+                    dlog!("unsupported encoding {}", name);
+                    return None;
                 }
             }
             &Object::Stream(ref stream) => {
                 let contents = get_contents(stream);
-                dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
-                adobe_cmap_parser::get_byte_mapping(&contents).unwrap()
+                dlog!("Stream: {}", String::from_utf8_lossy(&contents));
+                // Fork: an unparseable CID encoding CMap disables the font.
+                adobe_cmap_parser::get_byte_mapping(&contents).ok()?
             }
-            _ => {
-                panic!("unsupported encoding {:?}", encoding)
+            other => {
+                dlog!("unsupported encoding {:?}", other);
+                return None;
             }
         };
 
@@ -1202,18 +1311,30 @@ impl<'a> PdfCIDFont<'a> {
 
         dlog!("descendents {:?} {:?}", descendants, ciddict);
 
-        let font_dict = maybe_get_obj(doc, ciddict, b"FontDescriptor").expect("required");
+        // Fork: a missing FontDescriptor is logged, not panicked on (the
+        // value was only type-checked upstream, never actually used).
+        let font_dict = maybe_get_obj(doc, ciddict, b"FontDescriptor");
         dlog!("{:?}", font_dict);
-        let _f = font_dict.as_dict().expect("must be dict");
         let default_width = get::<Option<i64>>(doc, ciddict, b"DW").unwrap_or(1000);
         let w: Option<Vec<&Object>> = get(doc, ciddict, b"W");
         dlog!("widths {:?}", w);
         let mut widths = HashMap::new();
         let mut i = 0;
         if let Some(w) = w {
-            while i < w.len() {
+            // Fork: malformed W arrays stop width parsing instead of
+            // panicking (both the index and the element types are
+            // untrusted). Upstream's (likely accidental) w[i] reads for
+            // c_first/c_last/c_width are preserved verbatim for
+            // byte-stability.
+            while i + 1 < w.len() {
                 if let &Object::Array(ref wa) = w[i + 1] {
-                    let cid = w[i].as_i64().expect("id should be num");
+                    let cid = match w[i].as_i64() {
+                        Ok(cid) => cid,
+                        Err(_) => {
+                            dlog!("non-integer W array element");
+                            break;
+                        }
+                    };
                     let mut j = 0;
                     dlog!("wa: {:?} -> {:?}", cid, wa);
                     for w in wa {
@@ -1222,8 +1343,13 @@ impl<'a> PdfCIDFont<'a> {
                     }
                     i += 2;
                 } else {
-                    let c_first = w[i].as_i64().expect("first should be num");
-                    let c_last = w[i].as_i64().expect("last should be num");
+                    let (c_first, c_last) = match (w[i].as_i64(), w[i].as_i64()) {
+                        (Ok(first), Ok(last)) => (first, last),
+                        _ => {
+                            dlog!("non-integer W range bounds");
+                            break;
+                        }
+                    };
                     let c_width = as_num(&w[i]);
                     for id in c_first..c_last {
                         widths.insert(id as CharCode, c_width);
@@ -1232,14 +1358,14 @@ impl<'a> PdfCIDFont<'a> {
                 }
             }
         }
-        PdfCIDFont {
+        Some(PdfCIDFont {
             doc,
             font,
             widths,
             to_unicode: unicode_map,
             encoding,
             default_width: Some(default_width as f64),
-        }
+        })
     }
 }
 
@@ -1251,7 +1377,9 @@ impl<'a> PdfFont for PdfCIDFont<'a> {
             return *width;
         } else {
             dlog!("missing width for {} falling back to default_width", id);
-            return self.default_width.unwrap();
+            // Fork: a missing default width degrades to 1000 (the PDF
+            // default) instead of panicking.
+            return self.default_width.unwrap_or(1000.0);
         }
     } /*
       fn decode(&self, chars: &[u8]) -> String {
@@ -1504,7 +1632,12 @@ fn show_text(
     output: &mut dyn OutputDev,
 ) -> Result<(), OutputError> {
     let ts = &mut gs.ts;
-    let font = ts.font.as_ref().unwrap();
+    // Fork: text with no font selected (e.g. a failed font load) is
+    // skipped instead of panicking.
+    let Some(font) = ts.font.as_ref() else {
+        dlog!("show_text with no font set");
+        return Ok(());
+    };
     //let encoding = font.encoding.as_ref().map(|x| &x[..]).unwrap_or(&PDFDocEncoding);
     dlog!("{:?}", font.decode(s));
     dlog!("{:?}", font.decode(s).as_bytes());
@@ -1828,7 +1961,15 @@ impl<'a> Processor<'a> {
         output: &mut dyn OutputDev,
         page_num: u32,
     ) -> Result<(), OutputError> {
-        let content = Content::decode(&content).unwrap();
+        // Fork: a content stream that fails to lex is skipped (the page
+        // yields no text) instead of panicking.
+        let content = match Content::decode(&content) {
+            Ok(content) => content,
+            Err(e) => {
+                warn!("failed to decode content stream: {:?}", e);
+                return Ok(());
+            }
+        };
         let mut font_table = HashMap::new();
         let mut gs: GraphicsState = GraphicsState {
             ts: TextState {
@@ -1883,11 +2024,22 @@ impl<'a> Processor<'a> {
                     dlog!("matrix {:?}", gs.ctm);
                 }
                 "CS" => {
-                    let name = operation.operands[0].as_name().unwrap();
+                    // Fork: missing/mistyped operands are skipped instead
+                    // of panicking (make_colorspace internals remain
+                    // upstream — graphics-only path).
+                    let Some(name) = operation.operands.first().and_then(|o| o.as_name().ok())
+                    else {
+                        warn!("CS without a colorspace name operand");
+                        continue;
+                    };
                     gs.stroke_colorspace = make_colorspace(doc, name, resources);
                 }
                 "cs" => {
-                    let name = operation.operands[0].as_name().unwrap();
+                    let Some(name) = operation.operands.first().and_then(|o| o.as_name().ok())
+                    else {
+                        warn!("cs without a colorspace name operand");
+                        continue;
+                    };
                     gs.fill_colorspace = make_colorspace(doc, name, resources);
                 }
                 "SC" | "SCN" => {
@@ -1911,8 +2063,10 @@ impl<'a> Processor<'a> {
                 "G" | "g" | "RG" | "rg" | "K" | "k" => {
                     dlog!("unhandled color operation {:?}", operation);
                 }
-                "TJ" => match operation.operands[0] {
-                    Object::Array(ref array) => {
+                // Fork: a missing/mistyped TJ operand falls through to the
+                // catch-all instead of panicking on the index.
+                "TJ" => match operation.operands.first() {
+                    Some(&Object::Array(ref array)) => {
                         for e in array {
                             match e {
                                 &Object::String(ref s, _) => {
@@ -1948,14 +2102,18 @@ impl<'a> Processor<'a> {
                             }
                         }
                     }
-                    _ => {}
+                    other => {
+                        warn!("unexpected TJ operand {:?}", other)
+                    }
                 },
-                "Tj" => match operation.operands[0] {
-                    Object::String(ref s, _) => {
+                "Tj" => match operation.operands.first() {
+                    Some(&Object::String(ref s, _)) => {
                         show_text(&mut gs, s, &tlm, &flip_ctm, output)?;
                     }
-                    _ => {
-                        panic!("unexpected Tj operand {:?}", operation)
+                    // Fork: malformed Tj operands are skipped, not
+                    // panicked on.
+                    other => {
+                        warn!("unexpected Tj operand {:?}", other)
                     }
                 },
                 "Tc" => {
@@ -1971,36 +2129,53 @@ impl<'a> Processor<'a> {
                     gs.ts.leading = as_num(&operation.operands[0]);
                 }
                 "Tf" => {
-                    let fonts: &Dictionary = get(&doc, resources, b"Font");
-                    let name = operation.operands[0].as_name().unwrap();
-                    let font = font_table
-                        .entry(name.to_owned())
-                        .or_insert_with(|| make_font(doc, get::<&Dictionary>(doc, fonts, name)))
-                        .clone();
-                    {
-                        /*let file = font.get_descriptor().and_then(|desc| desc.get_file());
-                        if let Some(file) = file {
-                            let file_contents = filter_data(file.as_stream().unwrap());
-                            let mut cursor = Cursor::new(&file_contents[..]);
-                            //let f = Font::read(&mut cursor);
-                            //dlog!("font file: {:?}", f);
-                        }*/
+                    // Fork: a missing/invalid Font resource or operand, or
+                    // a font that fails to load, leaves the current font
+                    // unchanged instead of panicking.
+                    let name = operation.operands.first().and_then(|o| o.as_name().ok());
+                    let font_dict = name
+                        .and_then(|name| {
+                            maybe_get_obj(&doc, resources, b"Font")?
+                                .as_dict()
+                                .ok()
+                                .and_then(|fonts| maybe_get_obj(&doc, fonts, name))
+                        })
+                        .and_then(|f| f.as_dict().ok());
+                    match (name, font_dict) {
+                        (Some(name), Some(font_dict)) => {
+                            if !font_table.contains_key(name) {
+                                if let Some(font) = make_font(doc, font_dict) {
+                                    font_table.insert(name.to_owned(), font);
+                                } else {
+                                    warn!("failed to load font {:?}", pdf_to_utf8(name));
+                                }
+                            }
+                            if let Some(font) = font_table.get(name) {
+                                gs.ts.font = Some(font.clone());
+                            }
+                            if let Some(size) = operation.operands.get(1) {
+                                gs.ts.font_size = as_num(size);
+                            }
+                            dlog!(
+                                "font {} size: {} {:?}",
+                                pdf_to_utf8(name),
+                                gs.ts.font_size,
+                                operation
+                            );
+                        }
+                        _ => warn!("Tf with missing font resource or operand"),
                     }
-                    gs.ts.font = Some(font);
-
-                    gs.ts.font_size = as_num(&operation.operands[1]);
-                    dlog!(
-                        "font {} size: {} {:?}",
-                        pdf_to_utf8(name),
-                        gs.ts.font_size,
-                        operation
-                    );
                 }
                 "Ts" => {
                     gs.ts.rise = as_num(&operation.operands[0]);
                 }
                 "Tm" => {
-                    assert!(operation.operands.len() == 6);
+                    // Fork: malformed Tm operators are skipped, not
+                    // asserted on.
+                    if operation.operands.len() != 6 {
+                        warn!("Tm with {} operands", operation.operands.len());
+                        continue;
+                    }
                     tlm = Transform2D::row_major(
                         as_num(&operation.operands[0]),
                         as_num(&operation.operands[1]),
@@ -2066,10 +2241,17 @@ impl<'a> Processor<'a> {
                     }
                 }
                 "gs" => {
-                    let ext_gstate: &Dictionary = get(doc, resources, b"ExtGState");
-                    let name = operation.operands[0].as_name().unwrap();
-                    let state: &Dictionary = get(doc, ext_gstate, name);
-                    apply_state(doc, &mut gs, state);
+                    // Fork: malformed ExtGState references are skipped
+                    // instead of panicking.
+                    let name = operation.operands.first().and_then(|o| o.as_name().ok());
+                    let state = maybe_get_obj(&doc, resources, b"ExtGState")
+                        .and_then(|g| g.as_dict().ok())
+                        .and_then(|g| name.and_then(|name| maybe_get_obj(&doc, g, name)))
+                        .and_then(|s| s.as_dict().ok());
+                    match state {
+                        Some(state) => apply_state(doc, &mut gs, state),
+                        None => warn!("gs operator with missing ExtGState or operand"),
+                    }
                 }
                 "i" => {
                     dlog!(
@@ -2152,14 +2334,31 @@ impl<'a> Processor<'a> {
                 "Do" => {
                     // `Do` process an entire subdocument, so we do a recursive call to `process_stream`
                     // with the subdocument content and resources
-                    let xobject: &Dictionary = get(&doc, resources, b"XObject");
-                    let name = operation.operands[0].as_name().unwrap();
-                    let xf: &Stream = get(&doc, xobject, name);
-                    let resources = maybe_get_obj(&doc, &xf.dict, b"Resources")
-                        .and_then(|n| n.as_dict().ok())
-                        .unwrap_or(resources);
-                    let contents = get_contents(xf);
-                    self.process_stream(&doc, contents, resources, &media_box, output, page_num)?;
+                    // Fork: missing/mistyped XObjects are skipped instead
+                    // of panicking.
+                    let xf = operation
+                        .operands
+                        .first()
+                        .and_then(|o| o.as_name().ok())
+                        .and_then(|name| {
+                            maybe_get_obj(&doc, resources, b"XObject")?
+                                .as_dict()
+                                .ok()
+                                .and_then(|xobject| maybe_get_obj(&doc, xobject, name))
+                        })
+                        .and_then(|x| x.as_stream().ok());
+                    match xf {
+                        Some(xf) => {
+                            let resources = maybe_get_obj(&doc, &xf.dict, b"Resources")
+                                .and_then(|n| n.as_dict().ok())
+                                .unwrap_or(resources);
+                            let contents = get_contents(xf);
+                            self.process_stream(
+                                &doc, contents, resources, &media_box, output, page_num,
+                            )?;
+                        }
+                        None => warn!("Do with missing XObject or operand"),
+                    }
                 }
                 _ => {
                     dlog!("unknown operation {:?}", operation);
@@ -2829,25 +3028,46 @@ fn output_doc_inner<'a>(
     output: &mut dyn OutputDev,
     empty_resources: &'a Dictionary,
 ) -> Result<(), OutputError> {
-    let page_dict = doc.get_object(object_id).unwrap().as_dict().unwrap();
+    // Fork: malformed pages produce OutputError, not panics.
+    let page_dict = doc
+        .get_object(object_id)
+        .ok()
+        .and_then(|o| o.as_dict().ok())
+        .ok_or(OutputError::PdfError(lopdf::Error::ObjectType {
+            expected: "Dictionary",
+            found: "other",
+        }))?;
     dlog!("page {} {:?}", page_num, page_dict);
     // XXX: Some pdfs lack a Resources directory
     let resources = get_inherited(doc, page_dict, b"Resources").unwrap_or(empty_resources);
     dlog!("resources {:?}", resources);
     // pdfium searches up the page tree for MediaBoxes as needed
-    let media_box: Vec<f64> = get_inherited(doc, page_dict, b"MediaBox").expect("MediaBox");
-    let media_box = MediaBox {
-        llx: media_box[0],
-        lly: media_box[1],
-        urx: media_box[2],
-        ury: media_box[3],
+    let media_box: Vec<f64> = get_inherited(doc, page_dict, b"MediaBox").ok_or(
+        OutputError::PdfError(lopdf::Error::DictKey("MediaBox".into())),
+    )?;
+    let media_box = match media_box.as_slice() {
+        [llx, lly, urx, ury] => MediaBox {
+            llx: *llx,
+            lly: *lly,
+            urx: *urx,
+            ury: *ury,
+        },
+        _ => {
+            return Err(OutputError::PdfError(lopdf::Error::ObjectType {
+                expected: "MediaBox [llx lly urx ury]",
+                found: "other",
+            }))
+        }
     };
     let art_box =
-        get::<Option<Vec<f64>>>(&doc, page_dict, b"ArtBox").map(|x| (x[0], x[1], x[2], x[3]));
+        get::<Option<Vec<f64>>>(&doc, page_dict, b"ArtBox").and_then(|x| match x.as_slice() {
+            [a, b, c, d] => Some((*a, *b, *c, *d)),
+            _ => None,
+        });
     output.begin_page(page_num, &media_box, art_box)?;
     p.process_stream(
         &doc,
-        doc.get_page_content(object_id).unwrap(),
+        doc.get_page_content(object_id)?,
         resources,
         &media_box,
         output,
