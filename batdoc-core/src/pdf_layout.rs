@@ -335,6 +335,149 @@ fn rotate_rect(rect: PtRect, rot: u16, w: f64, h: f64) -> PtRect {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reading order: recursive XY-cut (liteparse `xy_cut`, reimplemented).
+//
+// liteparse builds a bucketed density projection per axis and searches for
+// valleys; here lines are whole baseline clusters, so the same idea collapses
+// to interval merging: merge each axis's coverage intervals, and the widest
+// surviving gap between merged clusters is a cut no line crosses. The axis
+// with the LARGER absolute gap wins (classic xy-cut: a column gutter dwarfs
+// inter-line y-gaps, while a full-width spanning line blocks the vertical
+// cut entirely, letting the horizontal band break fire first).
+// ---------------------------------------------------------------------------
+
+/// Column gutter: a gap in x-coverage this many times the median font size.
+const XCUT_COLUMN_RATIO: f64 = 2.0;
+/// Band break: a gap in y-coverage this many times the median font size
+/// (half the column ratio — stacked paragraphs sit closer than columns).
+const XCUT_BAND_RATIO: f64 = 1.0;
+/// Recursion backstop: adversarial geometry peeling one line per cut must
+/// not blow the stack (repo rule: no panics on malformed input).
+const XCUT_MAX_DEPTH: u32 = 32;
+
+/// A qualifying cut: `gap` is its absolute width (the larger-gap axis wins),
+/// `at` the gap midpoint to compare line centers against.
+struct Cut {
+    gap: f64,
+    at: f64,
+    vertical: bool,
+}
+
+/// Order `lines` for reading: recursive XY-cut, columns left→right inside
+/// bands top→bottom. Consumed by the Task 13 driver on the merged
+/// (native + OCR) line set — allow dead code until it lands.
+#[allow(dead_code)]
+pub(crate) fn reading_order(lines: Vec<Line>) -> Vec<Line> {
+    let mut out = Vec::with_capacity(lines.len());
+    let median = median_font_size(&lines);
+    xy_cut(lines, median, 0, &mut out);
+    out
+}
+
+/// Median `font_size` of the line set (mean of the two middles when even).
+fn median_font_size(lines: &[Line]) -> f64 {
+    let mut sizes: Vec<f64> = lines.iter().map(|l| l.font_size).collect();
+    sizes.sort_by(f64::total_cmp);
+    if sizes.is_empty() {
+        return 0.0;
+    }
+    let n = sizes.len();
+    f64::midpoint(sizes[(n - 1) / 2], sizes[n / 2])
+}
+
+/// Append `lines` to `out` in reading order. The median is computed once at
+/// the top level and passed down so nested regions use page-consistent
+/// thresholds.
+fn xy_cut(lines: Vec<Line>, median: f64, depth: u32, out: &mut Vec<Line>) {
+    if lines.len() <= 1 || depth >= XCUT_MAX_DEPTH {
+        return push_sorted(lines, out);
+    }
+    let Some(cut) = find_cut(&lines, median) else {
+        return push_sorted(lines, out);
+    };
+    // Split every line by which side of the gap midpoint its rect center
+    // falls on. No line can straddle the gap (a straddler would have merged
+    // the coverage intervals), so both sides are non-empty and recursion
+    // strictly shrinks. First = top for horizontal cuts, left for vertical.
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    for l in lines {
+        let center = if cut.vertical {
+            f64::midpoint(l.rect.x0, l.rect.x1)
+        } else {
+            f64::midpoint(l.rect.y0, l.rect.y1)
+        };
+        if center < cut.at {
+            first.push(l);
+        } else {
+            second.push(l);
+        }
+    }
+    xy_cut(first, median, depth + 1, out);
+    xy_cut(second, median, depth + 1, out);
+}
+
+/// No qualifying cut: a leaf sorts top→bottom, then left→right.
+fn push_sorted(mut lines: Vec<Line>, out: &mut Vec<Line>) {
+    lines.sort_by(|a, b| {
+        a.rect
+            .y0
+            .total_cmp(&b.rect.y0)
+            .then_with(|| a.rect.x0.total_cmp(&b.rect.x0))
+    });
+    out.extend(lines);
+}
+
+/// Pick the cut on the axis with the larger absolute qualifying gap; `None`
+/// when neither axis has one.
+fn find_cut(lines: &[Line], median: f64) -> Option<Cut> {
+    let v = widest_gap(lines, XCUT_COLUMN_RATIO * median, true);
+    let h = widest_gap(lines, XCUT_BAND_RATIO * median, false);
+    match (v, h) {
+        (Some(v), Some(h)) => Some(if v.gap > h.gap { v } else { h }),
+        (Some(v), None) => Some(v),
+        (None, h) => h,
+    }
+}
+
+/// Widest gap between consecutive merged coverage intervals along one axis,
+/// if it clears `threshold`. Merging first is what makes a spanning line
+/// block the cut: it overlaps both neighbors, so no gap survives between
+/// them (liteparse `xy_find_best_cut`, restated as interval merging).
+fn widest_gap(lines: &[Line], threshold: f64, vertical: bool) -> Option<Cut> {
+    let mut ivals: Vec<(f64, f64)> = lines
+        .iter()
+        .map(|l| {
+            if vertical {
+                (l.rect.x0, l.rect.x1)
+            } else {
+                (l.rect.y0, l.rect.y1)
+            }
+        })
+        .collect();
+    ivals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Sole caller (`xy_cut`) guarantees ≥ 2 lines, so `ivals` is non-empty.
+    let mut best: Option<Cut> = None;
+    let mut end = ivals[0].1;
+    for &(n0, n1) in &ivals[1..] {
+        if n0 <= end {
+            // Overlapping/adjacent: same coverage cluster, extend its end.
+            end = end.max(n1);
+            continue;
+        }
+        let gap = n0 - end;
+        if gap >= threshold && best.as_ref().is_none_or(|b| gap > b.gap) {
+            best = Some(Cut {
+                gap,
+                at: f64::midpoint(end, n0),
+                vertical,
+            });
+        }
+        end = n1;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +625,63 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "L1");
         assert_eq!(lines[1].text, "R1");
+    }
+
+    fn line(text: &str, x0: f64, y0: f64, x1: f64) -> Line {
+        Line {
+            text: text.into(),
+            words: vec![],
+            rect: PtRect {
+                x0,
+                y0,
+                x1,
+                y1: y0 + 12.0,
+            },
+            font_size: 12.0,
+            source: LineSource::Native,
+        }
+    }
+
+    fn texts(lines: &[Line]) -> Vec<&str> {
+        lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    #[test]
+    fn single_column_sorts_by_y() {
+        let lines = vec![
+            line("second", 72.0, 100.0, 200.0),
+            line("first", 72.0, 80.0, 200.0),
+        ];
+        assert_eq!(texts(&reading_order(lines)), ["first", "second"]);
+    }
+
+    #[test]
+    fn two_columns_left_then_right() {
+        // Left column x 72..250, right column x 320..500 (gap 70pt >= 2*12).
+        let lines = vec![
+            line("R1", 320.0, 80.0, 500.0),
+            line("L2", 72.0, 100.0, 250.0),
+            line("L1", 72.0, 80.0, 250.0),
+            line("R2", 320.0, 100.0, 500.0),
+        ];
+        assert_eq!(texts(&reading_order(lines)), ["L1", "L2", "R1", "R2"]);
+    }
+
+    #[test]
+    fn full_width_title_then_columns() {
+        let lines = vec![
+            line("R1", 320.0, 100.0, 500.0),
+            line("TITLE", 72.0, 60.0, 500.0), // spans both columns
+            line("L1", 72.0, 100.0, 250.0),
+        ];
+        assert_eq!(texts(&reading_order(lines)), ["TITLE", "L1", "R1"]);
+    }
+
+    #[test]
+    fn narrow_gap_is_not_a_column_cut() {
+        // 15pt gap < 2*12=24pt threshold → one column, y-sorted.
+        let lines = vec![line("b", 200.0, 90.0, 280.0), line("a", 72.0, 80.0, 185.0)];
+        assert_eq!(texts(&reading_order(lines)), ["a", "b"]);
     }
 
     #[test]
