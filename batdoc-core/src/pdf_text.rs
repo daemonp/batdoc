@@ -94,7 +94,8 @@ impl OutputDev for PositionedOutputDev {
         let sy = (trm.m12 + trm.m22) * font_size;
         let size = (sx * sy).abs().sqrt();
         let rotation = quantize_rotation(trm);
-        for c in ch.chars() {
+        let char_count = ch.chars().count();
+        for (idx, c) in ch.chars().enumerate() {
             self.chars.push(PositionedChar {
                 ch: c,
                 x,
@@ -103,7 +104,17 @@ impl OutputDev for PositionedOutputDev {
                 // `mul_add` is the fused equivalent of `width * size +
                 // spacing` (the quantity PlainTextOutput tracks); more
                 // accurate, same value within f64.
-                advance: width.mul_add(size, spacing),
+                //
+                // A multi-char decode (e.g. a ligature glyph whose
+                // ToUnicode mapping is "fi") expands to several chars at
+                // ONE origin; only the last carries the glyph's advance,
+                // so downstream gap math measures from the glyph's true
+                // end instead of double-counting the advance per char.
+                advance: if idx + 1 == char_count {
+                    width.mul_add(size, spacing)
+                } else {
+                    0.0
+                },
                 rotation,
             });
         }
@@ -197,6 +208,96 @@ mod tests {
         // Tm with a 90° rotation: 0 1 -1 0 x y.
         let page = positioned("BT /F1 12 Tf 0 1 -1 0 100 700 Tm (R) Tj ET");
         assert_eq!(page.chars[0].rotation, 90);
+    }
+
+    /// Build a one-page PDF whose font's ToUnicode maps char code 0x41
+    /// ('A') to the two-char string "fi" (a ligature-style mapping) and
+    /// 0x42 ('B') to "x".
+    fn build_ligature_pdf() -> Vec<u8> {
+        use lopdf::{dictionary, Document as LopdfDoc, Object, Stream};
+        let mut doc = LopdfDoc::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let cmap = b"/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Adobe-Identity-UCS def
+/CMapType 2 def
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+2 beginbfchar
+<41> <00660069>
+<42> <0078>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end
+"
+        .to_vec();
+        let tounicode_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), cmap));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+            "ToUnicode" => tounicode_id,
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let content_id = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf 72 720 Td (AB) Tj ET".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1_i64,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn multi_char_glyph_shares_origin_last_carries_advance() {
+        // ToUnicode can decode one char code into several chars (e.g. a
+        // ligature glyph -> "fi"). The expanded chars share the glyph's
+        // origin; only the last carries its advance, so the char after
+        // the ligature measures its gap from the glyph's true end.
+        let data = build_ligature_pdf();
+        let doc = lopdf::Document::load_mem(&data).unwrap();
+        let page = extract_positioned_page(&doc, 1).unwrap();
+        assert_eq!(page.chars.len(), 3, "{:?}", page.chars);
+        let (f, i, x) = (&page.chars[0], &page.chars[1], &page.chars[2]);
+        assert_eq!((f.ch, i.ch, x.ch), ('f', 'i', 'x'));
+        assert_eq!(f.x, i.x);
+        assert_eq!(f.advance, 0.0);
+        assert!(i.advance > 0.0);
+        assert!(
+            x.x >= i.x + i.advance - 0.01,
+            "x={} i.x={} adv={}",
+            x.x,
+            i.x,
+            i.advance
+        );
     }
 
     #[test]

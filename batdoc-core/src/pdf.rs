@@ -263,8 +263,12 @@ fn render_pages(
             }
         }
         let merged = crate::pdf_ocr::merge(native, ocr_lines);
-        let ordered = crate::pdf_layout::reading_order(merged);
-        let blocks = crate::pdf_layout::detect_tables(ordered, signals);
+        // Tables are detected on the assembly-order stream (row fragments
+        // are adjacent there), then regions join the xy-cut as opaque
+        // full-width bands.
+        let items = crate::pdf_layout::find_tables(&merged, signals);
+        let ordered = crate::pdf_layout::reading_order_items(items);
+        let blocks = crate::pdf_layout::classify_items(ordered, signals);
         let mut page_md = String::new();
         crate::pdf_layout::render(&blocks, &mut page_md)?;
         if !unplaced_text.trim().is_empty() {
@@ -405,6 +409,7 @@ fn page_looks_garbled(page: &crate::pdf_text::PositionedPage) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -632,24 +637,26 @@ startxref\n\
     }
 
     #[test]
-    fn narrow_gutter_same_baseline_fuses_into_one_line() {
-        // Characterization test for documents v1 fused-gutter behavior. Runs in
-        // CI; it will fail loudly when the Phase 6 gutter-decoupling task fixes
-        // the bug, which is the intended signal to update the assertion.
-        // Two-column PDF with a 3em (36pt) gutter. Left column at x=72,
-        // right column at x=180. At this narrow gap the v1 assembly pass
-        // treats the same-baseline fragments as one line and emits them
-        // fused with a single space.
+    fn narrow_gutter_columns_read_in_column_order() {
+        // The sharp version of the fused-gutter characterization: two
+        // rows per column at a 3em-ish gutter. Assembly splits the rows
+        // (gap > 2.5x font size) and xy-cut orders column by column —
+        // "L1 R1 L2 R2" interleaving would mean the gutter fused.
         let data = build_text_pdf_content(
-            "BT /F1 12 Tf 72 700 Td (Left) Tj ET\nBT /F1 12 Tf 180 700 Td (Right) Tj ET",
+            "BT /F1 12 Tf 72 700 Td (L1) Tj ET\n\
+             BT /F1 12 Tf 180 700 Td (R1) Tj ET\n\
+             BT /F1 12 Tf 72 680 Td (L2) Tj ET\n\
+             BT /F1 12 Tf 180 680 Td (R2) Tj ET",
         );
         let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
-        // Today the pipeline fuses the two columns into a single line with a
-        // single space between them (gap 36pt < LINE_SPLIT_RATIO·12). This is
-        // the v1 known-bad output the Phase 6 gutter-decoupling task must fix.
-        assert_eq!(md, "Left Right\n", "unexpected v1 fused output: {md:?}");
+        let (l1, l2, r1, r2) = (
+            md.find("L1").unwrap(),
+            md.find("L2").unwrap(),
+            md.find("R1").unwrap(),
+            md.find("R2").unwrap(),
+        );
+        assert!(l1 < l2 && l2 < r1 && r1 < r2, "column order wrong: {md:?}");
     }
-
     #[test]
     fn furniture_stripping_safety_net_keeps_body_text() {
         // Without the safety net, the repeated first line is a header and the

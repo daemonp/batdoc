@@ -3,7 +3,7 @@
 //!
 //! Assembles the positioned per-char stream from [`crate::pdf_text`] into
 //! words and lines: canonical rotation → rotation partition → baseline
-//! clustering → advance-gap word breaks → horizontal (column) line split.
+//! clustering → word breaks (space glyphs / median-relative advance gaps) → horizontal (column) line split.
 //! liteparse runs the same pipeline over whole text items with PDFium-sized
 //! boxes; here it runs per char with `font_size`/`advance` from pdf-extract,
 //! so the thresholds are restated in those units (see the constants below).
@@ -57,19 +57,25 @@ pub(crate) struct Line {
 
 /// Word break: gap between consecutive chars exceeds a quarter of the line
 /// font size, with a 1pt floor so tiny fonts don't shatter words.
-const WORD_GAP_RATIO: f64 = 0.25;
-const WORD_GAP_FLOOR: f64 = 1.0;
+/// Word break when a gap exceeds all of: 1.5× the line's median char
+/// advance, 0.5× the line's font size, and 2.0pt. PDF producers that
+/// position glyphs with TJ kerning report understated per-char advances
+/// (the real advance is visible only in the next glyph's origin); the
+/// median-relative term keeps those small phantom gaps from splitting
+/// words, while explicit space glyphs (which exist in such files) still
+/// break words directly.
+const WORD_GAP_MEDIAN_RATIO: f64 = 1.5;
+const WORD_GAP_SIZE_RATIO: f64 = 0.5;
+const WORD_GAP_FLOOR: f64 = 2.0;
 /// Horizontal line split: a same-baseline gap this many times the font size
-/// means two columns, not two words (liteparse `form_lines` equivalent).
-/// Raised from 1.5 to 10 so that wide table gutters stay on one line:
-/// a 12 pt table with 96 pt between columns must not shatter into one-word
-/// lines, otherwise table detection sees no multi-word candidates.
-const LINE_SPLIT_RATIO: f64 = 10.0;
-/// Baseline band: chars join a line when `[y - 0.8·size, y + 0.2·size]`
-/// overlaps the line's running band (asymmetric: top-down y grows downward,
-/// so the band reaches further up toward the previous baseline).
-const BAND_UP: f64 = 0.8;
-const BAND_DOWN: f64 = 0.2;
+/// means two columns, not two words (liteparse `form_lines` equivalent —
+/// its column gap fires at 2× median char width). Table rows DO shatter
+/// into one-word fragments at this threshold — that is fine:
+/// `merge_baseline_fragments` rejoins them for table detection, and xy-cut
+/// reading order handles the rest. (v1 note: this was briefly 10.0 to keep
+/// table rows intact, which fused narrow-gutter columns — the fragment
+/// merge made the low value safe again.)
+const LINE_SPLIT_RATIO: f64 = 2.5;
 /// One rotation value must cover this share of the page's chars before the
 /// whole page is canonicalized to it.
 const CANONICAL_SHARE_PCT: usize = 70;
@@ -170,26 +176,32 @@ fn canonicalize(chars: &[PositionedChar], w: f64, h: f64) -> (Vec<PositionedChar
     (out, best)
 }
 
-/// Cluster chars into baseline groups: sorted by y, a char joins the current
-/// cluster while its band overlaps the cluster's running band.
+/// Cluster chars into baseline groups: y snapped to an absolute grid of
+/// max(median char size × 0.5, 5.0) pt — same bucket = same line, x-sorted
+/// within. Absolute buckets, not a running band: a tall line bridging two
+/// tight lines (e.g. a sidebar line between two body lines) must not
+/// chain-merge them into one interleaved cluster. liteparse `form_lines`
+/// (`projection.rs`) uses the same snap-to-grid approach.
 fn cluster_lines(chars: &[PositionedChar]) -> Vec<Vec<PositionedChar>> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let tol = (median_size(chars) * 0.5).max(5.0);
+    // y is bounded by the page box (thousands of points); the cast cannot
+    // truncate a real value.
+    #[allow(clippy::cast_possible_truncation)]
+    let bucket = |c: &PositionedChar| (c.y / tol).round() as i64;
     let mut sorted = chars.to_vec();
-    sorted.sort_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
+    sorted.sort_by(|a, b| bucket(a).cmp(&bucket(b)).then_with(|| a.x.total_cmp(&b.x)));
     let mut lines: Vec<Vec<PositionedChar>> = Vec::new();
-    let mut band = (0.0, 0.0);
+    let mut cur_bucket = i64::MIN;
     for c in sorted {
-        let lo = (-BAND_UP).mul_add(c.font_size, c.y);
-        let hi = BAND_DOWN.mul_add(c.font_size, c.y);
-        if let Some(cur) = lines.last_mut() {
-            if lo <= band.1 && hi >= band.0 {
-                cur.push(c);
-                band.0 = band.0.min(lo);
-                band.1 = band.1.max(hi);
-                continue;
-            }
+        let b = bucket(&c);
+        if b != cur_bucket {
+            lines.push(Vec::new());
+            cur_bucket = b;
         }
-        band = (lo, hi);
-        lines.push(vec![c]);
+        lines.last_mut().expect("bucket change pushes").push(c);
     }
     lines
 }
@@ -220,11 +232,29 @@ fn assemble_group(chars: &[PositionedChar]) -> Vec<Line> {
     out
 }
 
+/// Median char advance within a line (chars with zero advance —
+/// ligature-expansion phantoms sharing a glyph origin — excluded). Falls
+/// back to 0 for an all-zero line, where the size/floor terms rule.
+fn median_advance(chars: &[PositionedChar]) -> f64 {
+    let mut advs: Vec<f64> = chars
+        .iter()
+        .map(|c| c.advance)
+        .filter(|a| *a > 0.0)
+        .collect();
+    if advs.is_empty() {
+        return 0.0;
+    }
+    advs.sort_by(f64::total_cmp);
+    advs[advs.len() / 2]
+}
+
 /// Build one line from its x-sorted chars: word breaks on explicit space
 /// glyphs and on advance gaps, rect = union of char boxes.
 fn build_line(chars: &[PositionedChar]) -> Line {
     let size = median_size(chars);
-    let word_gap = (WORD_GAP_RATIO * size).max(WORD_GAP_FLOOR);
+    let word_gap = (WORD_GAP_MEDIAN_RATIO * median_advance(chars))
+        .max(WORD_GAP_SIZE_RATIO * size)
+        .max(WORD_GAP_FLOOR);
     let mut words: Vec<Word> = Vec::new();
     let mut text = String::new();
     let (mut wx0, mut wx1) = (0.0, 0.0);
@@ -366,11 +396,39 @@ struct Cut {
 
 /// Order `lines` for reading: recursive XY-cut, columns left→right inside
 /// bands top→bottom. Runs on the merged (native + OCR) line set.
+/// Thin line-only wrapper over [`reading_order_items`] — used by the
+/// xy-cut unit tests; the production driver passes a mixed stream.
+#[allow(dead_code)] // test-only wrapper
 pub(crate) fn reading_order(lines: Vec<Line>) -> Vec<Line> {
-    let mut out = Vec::with_capacity(lines.len());
-    let median = median_font_size(&lines);
-    xy_cut(lines, median, 0, &mut out);
+    let items: Vec<Item> = lines.into_iter().map(Item::Line).collect();
+    reading_order_items(items)
+        .into_iter()
+        .map(|it| match it {
+            Item::Line(l) => l,
+            Item::Table(_) => unreachable!("lines never become tables"),
+        })
+        .collect()
+}
+
+/// Reading-order a mixed line/table stream: table regions are opaque
+/// full-width bands in the xy-cut geometry — they sort between text
+/// regions by position and are never column-cut.
+pub(crate) fn reading_order_items(items: Vec<Item>) -> Vec<Item> {
+    let mut out = Vec::with_capacity(items.len());
+    let median = median_font_size_items(&items);
+    xy_cut(items, median, 0, &mut out);
     out
+}
+
+/// Median `font_size` of the item stream.
+fn median_font_size_items(items: &[Item]) -> f64 {
+    let mut sizes: Vec<f64> = items.iter().map(Item::font_size).collect();
+    sizes.sort_by(f64::total_cmp);
+    if sizes.is_empty() {
+        return 0.0;
+    }
+    let n = sizes.len();
+    f64::midpoint(sizes[(n - 1) / 2], sizes[n / 2])
 }
 
 /// Median `font_size` of the line set (mean of the two middles when even).
@@ -387,7 +445,7 @@ fn median_font_size(lines: &[Line]) -> f64 {
 /// Append `lines` to `out` in reading order. The median is computed once at
 /// the top level and passed down so nested regions use page-consistent
 /// thresholds.
-fn xy_cut(lines: Vec<Line>, median: f64, depth: u32, out: &mut Vec<Line>) {
+fn xy_cut(lines: Vec<Item>, median: f64, depth: u32, out: &mut Vec<Item>) {
     if lines.len() <= 1 || depth >= XCUT_MAX_DEPTH {
         return push_sorted(lines, out);
     }
@@ -400,10 +458,11 @@ fn xy_cut(lines: Vec<Line>, median: f64, depth: u32, out: &mut Vec<Line>) {
     // strictly shrinks. First = top for horizontal cuts, left for vertical.
     let (mut first, mut second) = (Vec::new(), Vec::new());
     for l in lines {
+        let r = l.rect();
         let center = if cut.vertical {
-            f64::midpoint(l.rect.x0, l.rect.x1)
+            f64::midpoint(r.x0, r.x1)
         } else {
-            f64::midpoint(l.rect.y0, l.rect.y1)
+            f64::midpoint(r.y0, r.y1)
         };
         if center < cut.at {
             first.push(l);
@@ -416,19 +475,19 @@ fn xy_cut(lines: Vec<Line>, median: f64, depth: u32, out: &mut Vec<Line>) {
 }
 
 /// No qualifying cut: a leaf sorts top→bottom, then left→right.
-fn push_sorted(mut lines: Vec<Line>, out: &mut Vec<Line>) {
+fn push_sorted(mut lines: Vec<Item>, out: &mut Vec<Item>) {
     lines.sort_by(|a, b| {
-        a.rect
+        a.rect()
             .y0
-            .total_cmp(&b.rect.y0)
-            .then_with(|| a.rect.x0.total_cmp(&b.rect.x0))
+            .total_cmp(&b.rect().y0)
+            .then_with(|| a.rect().x0.total_cmp(&b.rect().x0))
     });
     out.extend(lines);
 }
 
 /// Pick the cut on the axis with the larger absolute qualifying gap; `None`
 /// when neither axis has one.
-fn find_cut(lines: &[Line], median: f64) -> Option<Cut> {
+fn find_cut(lines: &[Item], median: f64) -> Option<Cut> {
     let v = widest_gap(lines, XCUT_COLUMN_RATIO * median, true);
     let h = widest_gap(lines, XCUT_BAND_RATIO * median, false);
     match (v, h) {
@@ -442,14 +501,15 @@ fn find_cut(lines: &[Line], median: f64) -> Option<Cut> {
 /// if it clears `threshold`. Merging first is what makes a spanning line
 /// block the cut: it overlaps both neighbors, so no gap survives between
 /// them (liteparse `xy_find_best_cut`, restated as interval merging).
-fn widest_gap(lines: &[Line], threshold: f64, vertical: bool) -> Option<Cut> {
+fn widest_gap(lines: &[Item], threshold: f64, vertical: bool) -> Option<Cut> {
     let mut ivals: Vec<(f64, f64)> = lines
         .iter()
         .map(|l| {
+            let r = l.rect();
             if vertical {
-                (l.rect.x0, l.rect.x1)
+                (r.x0, r.x1)
             } else {
-                (l.rect.y0, l.rect.y1)
+                (r.y0, r.y1)
             }
         })
         .collect();
@@ -506,7 +566,18 @@ const LIST_GAP_RATIO: f64 = 1.5;
 /// whitespace (spec-pinned set; liteparse recognizes a few more PUA/Symbol
 /// glyphs that this pipeline never produces).
 const BULLET_CHARS: &[char] = &[
-    '\u{2022}', '\u{25e6}', '\u{2023}', '-', '*', '\u{2013}', '\u{2014}',
+    '\u{2022}', // •
+    '\u{25e6}', // ◦
+    '\u{2023}', // ‣
+    '-', '*', '\u{2013}', // –
+    '\u{2014}', // —
+    '\u{25a0}', // ■
+    '\u{25aa}', // ▪
+    '\u{25c6}', // ◆
+    '\u{25ba}', // ►
+    '\u{25b8}', // ▸
+    '\u{25cf}', // ●
+    '\u{25cb}', // ○
 ];
 /// Body size when the document yields no measurable text (image-only PDF).
 const DEFAULT_BODY_SIZE: f64 = 12.0;
@@ -683,6 +754,9 @@ struct ListState {
     items: Vec<String>,
     font_size: f64,
     y0: f64,
+    /// x0 of the marker lines — a wrapped item's continuation is more
+    /// indented than this.
+    indent: f64,
 }
 
 /// If `text` starts with a list marker, return the item text (marker
@@ -739,6 +813,9 @@ struct Classifier<'a> {
     blocks: Vec<Block>,
     para: Option<Para>,
     list: Option<ListState>,
+    /// Position of the most recent heading line, for multi-line heading
+    /// merging (reset by any intervening non-heading line).
+    last_heading: Option<(u8, f64, f64)>,
 }
 
 impl Classifier<'_> {
@@ -748,6 +825,7 @@ impl Classifier<'_> {
             blocks: Vec::new(),
             para: None,
             list: None,
+            last_heading: None,
         }
     }
 
@@ -785,23 +863,7 @@ impl Classifier<'_> {
         } else {
             0.0
         };
-        if ratio >= HEADING_MIN_RATIO {
-            self.flush();
-            let level = if ratio >= HEADING_H1_RATIO {
-                1
-            } else if ratio >= HEADING_H2_RATIO {
-                2
-            } else if ratio >= HEADING_H3_RATIO {
-                3
-            } else {
-                4
-            };
-            self.blocks.push(Block::Heading {
-                level,
-                text: text.to_string(),
-            });
-            return;
-        }
+        let prev_heading = self.last_heading.take();
         // List items (Task 16): marker detection runs on text, so OCR
         // lines (no words) can join lists. Marker lines interrupt
         // paragraph runs and vice versa.
@@ -819,9 +881,55 @@ impl Classifier<'_> {
                         items: vec![item.to_string()],
                         font_size: line.font_size,
                         y0: line.rect.y0,
+                        indent: line.rect.x0,
                     });
                 }
             }
+            return;
+        }
+        // Wrapped list item: an indented non-marker line right after an
+        // item continues it (liteparse `lists.rs` continuation lines).
+        if let Some(l) = self.list.as_mut() {
+            if line.rect.x0 > l.indent && line.rect.y0 - l.y0 <= LIST_GAP_RATIO * l.font_size {
+                if let Some(item) = l.items.last_mut() {
+                    item.push(' ');
+                    item.push_str(text);
+                }
+                l.font_size = line.font_size;
+                l.y0 = line.rect.y0;
+                return;
+            }
+        }
+        self.flush_list();
+        if ratio >= HEADING_MIN_RATIO {
+            self.flush();
+            let level = if ratio >= HEADING_H1_RATIO {
+                1
+            } else if ratio >= HEADING_H2_RATIO {
+                2
+            } else if ratio >= HEADING_H3_RATIO {
+                3
+            } else {
+                4
+            };
+            // Multi-line headings (deck-style display-sized paragraphs)
+            // merge consecutive same-level heading lines into one block.
+            if let Some((prev_level, prev_y0, prev_size)) = prev_heading {
+                if prev_level == level && line.rect.y0 - prev_y0 <= PARAGRAPH_GAP_RATIO * prev_size
+                {
+                    if let Some(Block::Heading { text: t, .. }) = self.blocks.last_mut() {
+                        t.push(' ');
+                        t.push_str(text);
+                    }
+                    self.last_heading = Some((level, line.rect.y0, line.font_size));
+                    return;
+                }
+            }
+            self.blocks.push(Block::Heading {
+                level,
+                text: text.to_string(),
+            });
+            self.last_heading = Some((level, line.rect.y0, line.font_size));
             return;
         }
         self.flush_list();
@@ -847,10 +955,28 @@ impl Classifier<'_> {
         }
     }
 
+    /// A detected table interrupts any open paragraph/list.
+    fn feed_table(&mut self, rows: Vec<Vec<String>>) {
+        self.flush();
+        self.blocks.push(Block::Table(rows));
+    }
+
     fn finish(mut self) -> Vec<Block> {
         self.flush();
         self.blocks
     }
+}
+
+/// Classify an ordered mixed stream (tables already detected) into blocks.
+pub(crate) fn classify_items(items: Vec<Item>, signals: &DocSignals) -> Vec<Block> {
+    let mut c = Classifier::new(signals);
+    for item in items {
+        match item {
+            Item::Line(line) => c.feed(&line),
+            Item::Table(t) => c.feed_table(t.rows),
+        }
+    }
+    c.finish()
 }
 
 /// Classify reading-ordered `lines` (native + OCR merged — OCR lines
@@ -902,9 +1028,11 @@ const TABLE_BODY_SIZE_TOLERANCE: f64 = 0.2;
 /// candidate lines stays within this many times the previous line's font
 /// size (liteparse `table_rows_adjacent`, restated in `Line` geometry).
 const TABLE_ROW_GAP_RATIO: f64 = 2.5;
-/// Column anchors: word x0s within this many times the run's font size
-/// belong to the same column.
-const TABLE_COL_TOLERANCE_RATIO: f64 = 0.5;
+/// Column-anchor clustering tolerance in points (liteparse
+/// `TABLE_TRACK_TOLERANCE_PT`, same role): absolute, not font-relative —
+/// a header label centered over its data column sits a fixed few points
+/// off the body anchor regardless of font size.
+const TABLE_TRACK_TOLERANCE_PT: f64 = 6.0;
 /// Gutter check: between consecutive anchor columns a line occupies, the
 /// whitespace gap must reach this many times the line's font size. Prose
 /// word spacing (~0.25em) fails; table gutters pass.
@@ -931,20 +1059,65 @@ const TABLE_MIN_COLUMNS: usize = 2;
 /// fail the word-count gate and never join a run.
 // Pass-by-value is the binding Task 14 signature (mirrors `classify`).
 #[allow(clippy::needless_pass_by_value)]
+/// Line-in/block-out wrapper over `find_tables` + `classify_items` for
+/// the table unit tests; the production driver interposes
+/// `reading_order_items` between the two.
+#[allow(dead_code)] // test-only wrapper
 pub(crate) fn detect_tables(lines: Vec<Line>, signals: &DocSignals) -> Vec<Block> {
-    let mut c = Classifier::new(signals);
+    classify_items(find_tables(&lines, signals), signals)
+}
+
+/// A detected borderless table as an opaque reading-order item. Its
+/// full-width rect participates in xy-cut geometry — a table is a band,
+/// never column-cut.
+pub(crate) struct TableRegion {
+    pub rect: PtRect,
+    pub font_size: f64,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// A reading-order item: a text line or a detected table region.
+pub(crate) enum Item {
+    Line(Line),
+    Table(TableRegion),
+}
+
+impl Item {
+    const fn rect(&self) -> &PtRect {
+        match self {
+            Self::Line(l) => &l.rect,
+            Self::Table(t) => &t.rect,
+        }
+    }
+    const fn font_size(&self) -> f64 {
+        match self {
+            Self::Line(l) => l.font_size,
+            Self::Table(t) => t.font_size,
+        }
+    }
+}
+
+/// Walk lines in assembly order (row fragments are adjacent there —
+/// after a column cut they would not be), detect table runs, and return
+/// a mixed item stream in the same relative order: a table occupies the
+/// position of the lines it consumed.
+pub(crate) fn find_tables(lines: &[Line], signals: &DocSignals) -> Vec<Item> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if let Some((rows, end)) = try_table_run(&lines, i, signals) {
-            c.flush();
-            c.blocks.push(Block::Table(rows));
+        if let Some((rows, rect, font_size, end)) = try_table_run(lines, i, signals) {
+            out.push(Item::Table(TableRegion {
+                rect,
+                font_size,
+                rows,
+            }));
             i = end;
         } else {
-            c.feed(&lines[i]);
+            out.push(Item::Line(lines[i].clone()));
             i += 1;
         }
     }
-    c.finish()
+    out
 }
 
 /// If a table run starts at `lines[start]`, return its rows of cells and
@@ -955,50 +1128,31 @@ fn try_table_run(
     lines: &[Line],
     start: usize,
     signals: &DocSignals,
-) -> Option<(Vec<Vec<String>>, usize)> {
-    if !table_candidate(&lines[start], signals) {
+) -> Option<(Vec<Vec<String>>, PtRect, f64, usize)> {
+    if !fragment_candidate(&lines[start], None, signals) {
         return None;
     }
     let mut end = start + 1;
-    while end < lines.len()
-        && table_candidate(&lines[end], signals)
-        && lines[end].rect.y0 - lines[end - 1].rect.y1
-            <= TABLE_ROW_GAP_RATIO * lines[end - 1].font_size
-    {
+    while end < lines.len() && fragment_candidate(&lines[end], Some(&lines[end - 1]), signals) {
         end += 1;
     }
-    let run = &lines[start..end];
+    // Same-baseline fragments (a row split across a wide column gutter)
+    // merge into logical rows before geometry is evaluated.
+    let run = &merge_baseline_fragments(&lines[start..end]);
     if run.len() < TABLE_MIN_ROWS {
         return None;
     }
-    // All run lines are within 20% of the body size, so the first line's
-    // size is a representative scale for the anchor tolerance.
-    let tol = TABLE_COL_TOLERANCE_RATIO * run[0].font_size;
-    let anchors = column_anchors(run, tol);
+    if run.iter().any(|r| r.words.len() < TABLE_MIN_WORDS) {
+        return None;
+    }
+    let anchors = column_anchors(run, TABLE_TRACK_TOLERANCE_PT);
     if anchors.len() < TABLE_MIN_COLUMNS {
         return None;
     }
-    // Word → column assignment: nearest anchor within tolerance; words
-    // landing between columns (unassigned) count against line occupancy.
-    let assign = |line: &Line| -> Vec<Option<usize>> {
-        line.words
-            .iter()
-            .map(|w| {
-                anchors
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| (w.x0 - *a).abs() <= tol)
-                    .min_by(|(ai, a), (bi, b)| {
-                        (w.x0 - *a)
-                            .abs()
-                            .total_cmp(&(w.x0 - *b).abs())
-                            .then_with(|| ai.cmp(bi))
-                    })
-                    .map(|(i, _)| i)
-            })
-            .collect()
-    };
-    let assigned: Vec<Vec<Option<usize>>> = run.iter().map(assign).collect();
+    let assigned: Vec<Vec<Option<usize>>> = run
+        .iter()
+        .map(|line| assign_columns(&anchors, line))
+        .collect();
     // Gutter check: for every pair of consecutive anchor columns a line
     // occupies, the whitespace between the right edge of the left cell's
     // last word and the left edge of the right cell's first word must be
@@ -1060,35 +1214,140 @@ fn try_table_run(
             cells
         })
         .collect();
-    Some((rows, end))
+    let rect = run
+        .iter()
+        .map(|l| l.rect)
+        .reduce(|a, b| PtRect {
+            x0: a.x0.min(b.x0),
+            y0: a.y0.min(b.y0),
+            x1: a.x1.max(b.x1),
+            y1: a.y1.max(b.y1),
+        })
+        .expect("run is non-empty (TABLE_MIN_ROWS)");
+    let font_size = median_font_size(run);
+    Some((rows, rect, font_size, end))
 }
 
-/// A line that can join a table run: enough words to carry column signal
-/// (OCR lines have none and are excluded here) and a font size within
-/// [`TABLE_BODY_SIZE_TOLERANCE`] of the body size.
-fn table_candidate(line: &Line, signals: &DocSignals) -> bool {
-    if line.words.len() < TABLE_MIN_WORDS {
+/// A line that can extend a table-run candidate window: body-size,
+/// non-empty, not a list-marker line, with ≥1 word, and either sharing
+/// the previous line's baseline (a right-hand row fragment) or within
+/// [`TABLE_ROW_GAP_RATIO`] × font size below it. Word-count candidacy is
+/// evaluated AFTER baseline fragments merge ([`TABLE_MIN_WORDS`] on
+/// logical rows), because a split row's left fragment is often a single
+/// word.
+fn fragment_candidate(line: &Line, prev: Option<&Line>, signals: &DocSignals) -> bool {
+    if line.text.trim().is_empty() || line.words.is_empty() {
         return false;
     }
-    // Binding rule (Task 16): a line starting with a list marker is never
-    // a table row, even with table-like word geometry — bullets win.
+    // Binding rule (Task 16): bullets win over table geometry.
     if parse_list_marker(&line.text).is_some() {
         return false;
     }
-    signals.body_size > 0.0
+    if !(signals.body_size > 0.0
         && (line.font_size - signals.body_size).abs()
-            <= TABLE_BODY_SIZE_TOLERANCE * signals.body_size
+            <= TABLE_BODY_SIZE_TOLERANCE * signals.body_size)
+    {
+        return false;
+    }
+    prev.is_none_or(|p| {
+        let same_baseline =
+            (line.rect.y0 - p.rect.y0).abs() <= 0.5 * line.font_size && line.rect.x0 > p.rect.x1;
+        let next_row = line.rect.y0 - p.rect.y1 <= TABLE_ROW_GAP_RATIO * p.font_size;
+        same_baseline || next_row
+    })
 }
 
-/// Cluster the run's word x0 positions into sorted column anchors:
-/// positions within `tol` of a cluster's running mean merge into it (the
+/// Merge same-baseline right-hand fragments into logical rows: a line
+/// whose baseline matches the previous line's (within half a font size)
+/// and which starts right of it is the same row, split across a wide
+/// gutter. Identity when no fragments exist.
+fn merge_baseline_fragments(lines: &[Line]) -> Vec<Line> {
+    let mut rows: Vec<Line> = Vec::new();
+    for line in lines {
+        let merge = rows.last().is_some_and(|prev| {
+            (line.rect.y0 - prev.rect.y0).abs() <= 0.5 * line.font_size
+                && line.rect.x0 > prev.rect.x1
+        });
+        if merge {
+            let prev = rows.last_mut().expect("checked above");
+            prev.text.push(' ');
+            prev.text.push_str(&line.text);
+            prev.words.extend(line.words.iter().cloned());
+            prev.rect.x1 = prev.rect.x1.max(line.rect.x1);
+            prev.rect.y0 = prev.rect.y0.min(line.rect.y0);
+            prev.rect.y1 = prev.rect.y1.max(line.rect.y1);
+        } else {
+            rows.push(line.clone());
+        }
+    }
+    rows
+}
+
+/// Word → column assignment (hybrid): coverage first — an anchor inside
+/// the word's x-extent ± [`TABLE_TRACK_TOLERANCE_PT`] (handles header
+/// labels centered over right-aligned data, and right-aligned numbers
+/// under left-aligned labels); otherwise region — the rightmost anchor
+/// left of the word (continuation words inside a prose cell). Words left
+/// of the first anchor are out of band (unassigned) and count against
+/// line occupancy.
+fn assign_columns(anchors: &[f64], line: &Line) -> Vec<Option<usize>> {
+    line.words
+        .iter()
+        .map(|w| {
+            anchors
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    **a >= w.x0 - TABLE_TRACK_TOLERANCE_PT && **a <= w.x1 + TABLE_TRACK_TOLERANCE_PT
+                })
+                .min_by(|(ai, a), (bi, b)| {
+                    (w.x0 - *a)
+                        .abs()
+                        .total_cmp(&(w.x0 - *b).abs())
+                        .then_with(|| ai.cmp(bi))
+                })
+                .map(|(i, _)| i)
+                .or_else(|| {
+                    anchors
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, a)| **a <= w.x0 - TABLE_TRACK_TOLERANCE_PT)
+                        .map(|(i, _)| i)
+                })
+        })
+        .collect()
+}
+
+/// Cluster the run's column-start positions into sorted column anchors.
+/// A word seeds a column only when it is the line's first word or follows
+/// a real gutter (≥ [`TABLE_GUTTER_RATIO`] × font size from the previous
+/// word's right edge) — continuation words inside a prose cell never seed
+/// (they would form phantom columns at scattered x positions).
+///
+/// Seeds within `tol` of a cluster's running mean merge into it (the
 /// mean keeps the anchor centered as left/right-aligned cells drift in).
+/// Clusters witnessed by a single seed (a header label offset from its
+/// data column) are pruned when a clear multi-row body exists (max
+/// support ≥ 3) — liteparse's phantom-track pruning (`tables.rs`
+/// `infer_tracks_from_raw_items`), reimplemented.
 #[allow(clippy::cast_precision_loss)] // cluster sizes are tiny; exact in f64
 fn column_anchors(run: &[Line], tol: f64) -> Vec<f64> {
-    let mut xs: Vec<f64> = run
-        .iter()
-        .flat_map(|l| l.words.iter().map(|w| w.x0))
-        .collect();
+    // A word seeds a column only when it is the line's first word or
+    // follows a real gutter (≥ TABLE_GUTTER_RATIO × font size from the
+    // previous word's right edge) — continuation words inside a prose
+    // cell never seed (they would form phantom columns at scattered x).
+    let mut xs: Vec<f64> = Vec::new();
+    for line in run {
+        let gutter = TABLE_GUTTER_RATIO * line.font_size;
+        let mut prev_x1 = f64::NEG_INFINITY;
+        for w in &line.words {
+            if w.x0 - prev_x1 >= gutter {
+                xs.push(w.x0);
+            }
+            prev_x1 = w.x1;
+        }
+    }
     xs.sort_by(f64::total_cmp);
     // (sum, count) per open cluster; anchors are the final means.
     let mut clusters: Vec<(f64, usize)> = Vec::new();
@@ -1100,6 +1359,10 @@ fn column_anchors(run: &[Line], tol: f64) -> Vec<f64> {
             }
             _ => clusters.push((x, 1)),
         }
+    }
+    let max_support = clusters.iter().map(|c| c.1).max().unwrap_or(0);
+    if max_support >= 3 {
+        clusters.retain(|c| c.1 >= 2);
     }
     clusters.iter().map(|(sum, n)| sum / *n as f64).collect()
 }
@@ -1224,13 +1487,14 @@ mod tests {
 
     #[test]
     fn word_break_on_advance_gap() {
-        // "Hi there": gap of 6pt (> 0.25*12=3) after "Hi".
+        // "Hi there": gap of 10pt (> 1.5*5.5 median advance = 8.25)
+        // after "Hi".
         let mut chars = hi_page().chars;
         #[allow(clippy::cast_precision_loss)] // tiny synthetic index; exact in f64
         let mut rest = "there"
             .chars()
             .enumerate()
-            .map(|(i, c)| pc(c, 117.0 + i as f64 * 6.0, 92.0, 12.0, 5.5))
+            .map(|(i, c)| pc(c, 121.0 + i as f64 * 6.0, 92.0, 12.0, 5.5))
             .collect::<Vec<_>>();
         chars.append(&mut rest);
         let lines = assemble(&PositionedPage {
@@ -1271,6 +1535,41 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "Hi");
         assert_eq!(lines[1].text, "Bye");
+    }
+
+    #[test]
+    fn tight_lines_do_not_chain_merge_through_a_tall_line() {
+        // Real layout: a sidebar line (taller font, x >= 440) between two
+        // body lines only 1.5 line-pitches apart. The running-band sweep
+        // used to let the sidebar's band bridge the two body lines into
+        // one cluster whose x-sorted chars interleaved into soup.
+        let mut chars = Vec::new();
+        let mut emit = |text: &str, x: f64, y: f64, size: f64| {
+            for (i, ch) in text.chars().enumerate() {
+                #[allow(clippy::cast_precision_loss)] // synthetic positions
+                chars.push(PositionedChar {
+                    ch,
+                    x: x + i as f64 * 5.0,
+                    y,
+                    font_size: size,
+                    advance: 4.5,
+                    rotation: 0,
+                });
+            }
+        };
+        emit("guesswork", 42.0, 100.0, 9.4); // body line A
+        emit("How do we compare", 440.0, 109.8, 11.0); // sidebar S (bridging band)
+        emit("consulting", 42.0, 114.3, 9.4); // body line B
+        let lines = assemble(&PositionedPage {
+            page_num: 1,
+            media_box: (0.0, 0.0, 612.0, 792.0),
+            chars,
+        });
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"guesswork"), "{texts:?}");
+        assert!(texts.contains(&"consulting"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("guces")), "{texts:?}");
+        assert!(texts.contains(&"How do we compare"), "{texts:?}");
     }
 
     #[test]
@@ -1612,6 +1911,231 @@ mod tests {
     }
 
     #[test]
+    fn find_tables_preserves_stream_order() {
+        // Paragraph, then a shattered-row table (fragments adjacent in
+        // assembly order), then another paragraph: the item stream keeps
+        // relative order, with the table occupying its lines' position.
+        let lines = vec![
+            line("Intro text.", 72.0, 60.0, 200.0),
+            frag(&["Class"], &[173.0], 100.0),
+            frag(&["Criteria", "Share"], &[328.0, 386.0], 100.0),
+            frag(&["Metric"], &[173.0], 124.0),
+            frag(&["89", "66%"], &[354.0, 392.0], 124.0),
+            frag(&["Document"], &[173.0], 148.0),
+            frag(&["28", "21%"], &[354.0, 392.0], 148.0),
+            frag(&["Judgment"], &[173.0], 172.0),
+            frag(&["18", "13%"], &[354.0, 392.0], 172.0),
+            line("Outro text.", 72.0, 220.0, 200.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let items = find_tables(&lines, &sig);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], Item::Line(l) if l.text == "Intro text."));
+        assert!(matches!(&items[1], Item::Table(_)));
+        assert!(matches!(&items[2], Item::Line(l) if l.text == "Outro text."));
+        match &items[1] {
+            Item::Table(t) => {
+                assert_eq!(t.rows[0], vec!["Class", "Criteria", "Share"]);
+                assert_eq!(t.rows[1], vec!["Metric", "89", "66%"]);
+            }
+            Item::Line(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn reading_order_items_keeps_table_regions_whole() {
+        // A full-width table band between two two-column text rows: the
+        // table must not be column-cut; it orders between the rows by y.
+        let lines = vec![
+            line("L1", 72.0, 80.0, 120.0),
+            line("R1", 320.0, 80.0, 370.0),
+            line("L2", 72.0, 300.0, 120.0),
+            line("R2", 320.0, 300.0, 370.0),
+        ];
+        let mut items: Vec<Item> = lines.into_iter().map(Item::Line).collect();
+        items.push(Item::Table(TableRegion {
+            rect: PtRect {
+                x0: 72.0,
+                y0: 150.0,
+                x1: 500.0,
+                y1: 200.0,
+            },
+            font_size: 12.0,
+            rows: vec![vec!["a".into(), "b".into()]],
+        }));
+        let ordered = reading_order_items(items);
+        let kinds: Vec<String> = ordered
+            .iter()
+            .map(|it| match it {
+                Item::Line(l) => l.text.clone(),
+                Item::Table(_) => "TABLE".into(),
+            })
+            .collect();
+        assert_eq!(kinds, ["L1", "R1", "TABLE", "L2", "R2"]);
+    }
+
+    #[test]
+    fn sidebar_orders_after_main_column() {
+        // Same-baseline main-column line + sidebar line: assembly splits
+        // them (gap > 2.5x size), xy-cut orders main column first.
+        let lines = vec![
+            line("Main body text", 42.0, 100.0, 300.0),
+            line("Side note", 440.0, 103.0, 560.0),
+            line("More body", 42.0, 114.0, 300.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let items = find_tables(&lines, &sig);
+        let ordered = reading_order_items(items);
+        let texts: Vec<&str> = ordered
+            .iter()
+            .map(|it| match it {
+                Item::Line(l) => l.text.as_str(),
+                Item::Table(_) => "TABLE",
+            })
+            .collect();
+        assert_eq!(texts, ["Main body text", "More body", "Side note"]);
+    }
+
+    /// A fragment of a table row: one baseline's left or right piece.
+    fn frag(words: &[&str], x0s: &[f64], y0: f64) -> Line {
+        let mut l = wline(words, x0s, y0);
+        l.rect.x1 = l
+            .words
+            .iter()
+            .map(|w| w.x1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        l
+    }
+
+    #[test]
+    fn table_from_same_baseline_fragments() {
+        // Modeled on a real page: each row arrives as two lines (left
+        // label fragment, right numbers fragment) on the same baseline,
+        // split by a gap exceeding the line-split threshold.
+        let lines = vec![
+            frag(&["Class"], &[173.0], 100.0),
+            frag(&["Criteria", "Share"], &[328.0, 386.0], 100.0),
+            frag(&["Metric"], &[173.0], 124.0),
+            frag(&["89", "66%"], &[354.0, 392.0], 124.0),
+            frag(&["Document"], &[173.0], 148.0),
+            frag(&["28", "21%"], &[354.0, 392.0], 148.0),
+            frag(&["Judgment"], &[173.0], 172.0),
+            frag(&["18", "13%"], &[354.0, 392.0], 172.0),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Table(rows) => {
+                assert_eq!(rows[0], vec!["Class", "Criteria", "Share"]);
+                assert_eq!(rows[1], vec!["Metric", "89", "66%"]);
+                assert_eq!(rows[3], vec!["Judgment", "18", "13%"]);
+            }
+            other => panic!("expected table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_item_continuation_joins() {
+        // A wrapped list item: the indented non-marker line right after
+        // the item continues it instead of becoming its own paragraph.
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line(
+                "- Metric. Evidenced by a tabular or API pull, scoreable against a",
+                90.0,
+                100.0,
+                500.0,
+            ),
+            line("threshold.", 108.0, 114.0, 159.0),
+        ];
+        let blocks = classify(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::List(items) if items == &["Metric. Evidenced by a tabular or API pull, scoreable against a threshold."]),
+            "got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn non_indented_line_after_list_is_a_new_paragraph() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("- a", 90.0, 100.0, 120.0),
+            line("Following text.", 72.0, 114.0, 300.0),
+        ];
+        let blocks = classify(lines, &sig);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], Block::List(items) if items == &["a"]));
+        assert!(matches!(&blocks[1], Block::Paragraph(t) if t == "Following text."));
+    }
+
+    #[test]
+    fn table_with_offset_header_and_prose_column() {
+        // Modeled on a real document's table: the header row's labels sit
+        // several points off the body column anchors (centered over
+        // right-aligned data), and the last column holds long prose.
+        let lines = vec![
+            wline(
+                &["Tier", "Dips", "Share", "Meaning"],
+                &[55.0, 167.0, 234.0, 274.0],
+                100.0,
+            ),
+            wline(
+                &["Full-auto", "33", "62%", "An", "agent", "pulls"],
+                &[55.0, 177.0, 244.0, 274.0, 289.0, 318.0],
+                124.0,
+            ),
+            wline(
+                &["Partial-auto", "10", "19%", "Automatable", "with"],
+                &[55.0, 177.0, 244.0, 274.0, 334.0],
+                148.0,
+            ),
+            wline(
+                &["Manual", "10", "19%", "Human,", "permanently,"],
+                &[55.0, 177.0, 244.0, 274.0, 313.0],
+                172.0,
+            ),
+        ];
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let blocks = detect_tables(lines, &sig);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            Block::Table(rows) => {
+                assert_eq!(rows.len(), 4);
+                assert_eq!(rows[0], vec!["Tier", "Dips", "Share", "Meaning"]);
+                assert_eq!(rows[1], vec!["Full-auto", "33", "62%", "An agent pulls"]);
+                assert_eq!(rows[3], vec!["Manual", "10", "19%", "Human, permanently,"]);
+            }
+            other => panic!("expected table, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn missing_cell_yields_empty_string() {
         let lines = vec![
             wline(&["Name", "Age", "City"], &[72.0, 200.0, 300.0], 100.0),
@@ -1645,6 +2169,88 @@ mod tests {
         let blocks = classify(lines, &sig);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], Block::Paragraph(t) if t == "native from ocr"));
+    }
+
+    #[test]
+    fn square_bullet_lines_become_list_even_when_larger_than_body() {
+        // Consulting-deck bullets: U+25A0 glyphs in a font ~1.25x body.
+        // Marker lines must classify as list items BEFORE the heading
+        // gate, or every bullet becomes a heading.
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let lines = vec![
+            line("\u{25a0} first item", 72.0, 100.0, 300.0),
+            line("\u{25a0} second item", 72.0, 118.0, 300.0),
+        ];
+        let mut big = lines;
+        for l in &mut big {
+            l.font_size = 15.0; // 1.25x body — would be a heading otherwise
+        }
+        let blocks = classify(big, &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::List(items) if items == &["first item", "second item"]),
+            "got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_heading_lines_merge() {
+        // A multi-line heading (common in deck-style PDFs where a whole
+        // paragraph is display-sized) must not produce one heading per
+        // line.
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let mut h1 = line(
+            "Lenders value predictable businesses and data",
+            72.0,
+            100.0,
+            500.0,
+        );
+        h1.font_size = 18.0;
+        let mut h2 = line(
+            "maturity enables value creation with automation",
+            72.0,
+            114.0,
+            500.0,
+        );
+        h2.font_size = 18.0;
+        let blocks = classify(vec![h1, h2], &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::Heading { level: 2, text } if text == "Lenders value predictable businesses and data maturity enables value creation with automation"),
+            "got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn large_bullet_continuation_joins() {
+        let sig = DocSignals {
+            body_size: 12.0,
+            headers: Default::default(),
+            footers: Default::default(),
+        };
+        let mut b = line(
+            "\u{25a0} Tightly coordinated to minimize",
+            72.0,
+            100.0,
+            500.0,
+        );
+        b.font_size = 15.0;
+        let mut cont = line("PortCo time required.", 90.0, 118.0, 300.0);
+        cont.font_size = 15.0;
+        let blocks = classify(vec![b, cont], &sig);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], Block::List(items) if items == &["Tightly coordinated to minimize PortCo time required."]),
+            "got {blocks:?}"
+        );
     }
 
     #[test]
