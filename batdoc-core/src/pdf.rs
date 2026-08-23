@@ -467,7 +467,27 @@ mod tests {
     fn extract_plain_textless_pdf_auto_ocrs_and_reports() {
         // A structurally valid PDF with no page tree (so text extraction succeeds
         // but yields zero pages); large enough for `%%EOF`/`startxref` detection.
-        let data = b"%PDF-1.4\n\
+        let data = textless_pdf();
+        // The PDF falls back to OCR even without --ocr, so a textless-but-empty
+        // document reports the OCR-failed message in both the explicit and the
+        // implicit (auto-fallback) OCR cases.
+        for opts in [
+            crate::ExtractOptions::default(),
+            crate::ExtractOptions {
+                ocr: true,
+                ..crate::ExtractOptions::default()
+            },
+        ] {
+            let err = extract_plain(data, opts).unwrap_err().to_string();
+            assert!(err.contains("OCR found nothing"), "got: {err}");
+        }
+    }
+
+    /// Structurally valid PDF with an empty page tree: text extraction
+    /// succeeds but yields zero pages, so it exercises the textless/fallback
+    /// error paths without needing OCR models.
+    fn textless_pdf() -> &'static [u8] {
+        b"%PDF-1.4\n\
 1 0 obj\n\
 << /Type /Catalog /Pages 2 0 R >>\n\
 endobj\n\
@@ -483,20 +503,57 @@ trailer\n\
 << /Size 3 /Root 1 0 R >>\n\
 startxref\n\
 110\n\
-%%EOF\n";
-        // The PDF falls back to OCR even without --ocr, so a textless-but-empty
-        // document reports the OCR-failed message in both the explicit and the
-        // implicit (auto-fallback) OCR cases.
-        for opts in [
-            crate::ExtractOptions::default(),
+%%EOF\n"
+    }
+
+    #[test]
+    fn extract_plain_auto_ocr_false_does_not_ocr() {
+        let err = extract_plain(
+            textless_pdf(),
             crate::ExtractOptions {
-                ocr: true,
-                ..crate::ExtractOptions::default()
+                images: false,
+                ocr: false,
+                auto_ocr: false,
+                max_output_bytes: None,
             },
-        ] {
-            let err = extract_plain(data, opts).unwrap_err().to_string();
-            assert!(err.contains("OCR found nothing"), "got: {err}");
-        }
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may be scanned/image-only"), "got: {err}");
+        assert!(!err.contains("OCR"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_plain_ocr_true_auto_ocr_false_still_ocrs() {
+        let err = extract_plain(
+            textless_pdf(),
+            crate::ExtractOptions {
+                images: false,
+                ocr: true,
+                auto_ocr: false,
+                max_output_bytes: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("OCR found nothing"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_markdown_auto_ocr_false_does_not_ocr() {
+        let err = extract_markdown(
+            textless_pdf(),
+            crate::ExtractOptions {
+                images: false,
+                ocr: false,
+                auto_ocr: false,
+                max_output_bytes: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no extractable text"), "got: {err}");
+        assert!(!err.contains("OCR found nothing"), "got: {err}");
     }
 
     #[test]
@@ -606,7 +663,7 @@ startxref\n\
     fn markdown_textless_pdf_reports_no_text_error() {
         // For the zero-page fixture, the markdown path emits the no-text
         // error (not the OCR wording the plain path uses after auto-OCR).
-        let data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\nxref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n110\n%%EOF\n";
+        let data = textless_pdf();
         let err = extract_markdown(data, crate::ExtractOptions::default())
             .unwrap_err()
             .to_string();
