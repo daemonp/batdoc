@@ -88,10 +88,10 @@ jobs:
       - name: Browser feature still typechecks
         run: cargo check --target wasm32-unknown-unknown -p batdoc-core --no-default-features --features wasm-bindgen
 
-      - name: Worker-shaped wasm size budget (10 MB)
+      - name: Full-pipeline wasm size budget (10 MB)
         run: |
           set -euo pipefail
-          cargo build --target wasm32-unknown-unknown --release -p batdoc-core --no-default-features
+          cargo build --target wasm32-unknown-unknown --release -p batdoc-core --no-default-features --features wasm-bindgen
           wasm="target/wasm32-unknown-unknown/release/batdoc_core.wasm"
           bytes="$(wc -c < "$wasm")"
           echo "batdoc_core.wasm: $bytes bytes"
