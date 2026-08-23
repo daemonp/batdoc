@@ -541,8 +541,11 @@ startxref\n\
 
     #[test]
     fn extract_markdown_auto_ocr_false_does_not_ocr() {
+        // Use a 1-page PDF with an empty text layer (not the zero-page
+        // `textless_pdf()`): page_count 0 never enters `render_pages`, which
+        // would let this pass without exercising the markdown `need_ocr` branch.
         let err = extract_markdown(
-            textless_pdf(),
+            &build_text_pdf(&[""]),
             crate::ExtractOptions {
                 images: false,
                 ocr: false,
