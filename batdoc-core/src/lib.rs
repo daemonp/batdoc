@@ -24,7 +24,7 @@ mod pdf_text;
 mod pptx;
 mod sheet;
 mod sink;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 mod wasm;
 mod xls;
 mod xlsx;
