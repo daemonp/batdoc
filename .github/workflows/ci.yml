@@ -58,3 +58,44 @@ jobs:
 
       - name: OCR e2e tests (release mode — ocrs is slow in debug)
         run: cargo test --release -p batdoc-core --test ocr_e2e -- --ignored
+
+  worker-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: worker-wasm
+
+      - name: Worker-shaped graph (no direct wasm-bindgen; log ocrs/rten)
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features --prefix none)"
+          direct="$(cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features --prefix none --depth 1)"
+          echo "$tree"
+          cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features -i ocrs || true
+          cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features -i rten || true
+          if echo "$direct" | grep -q '^wasm-bindgen '; then
+            echo "wasm-bindgen must not be a direct dep in the Worker-shaped build" >&2
+            exit 1
+          fi
+
+      - name: Browser feature still typechecks
+        run: cargo check --target wasm32-unknown-unknown -p batdoc-core --no-default-features --features wasm-bindgen
+
+      - name: Worker-shaped wasm size budget (10 MB)
+        run: |
+          set -euo pipefail
+          cargo build --target wasm32-unknown-unknown --release -p batdoc-core --no-default-features
+          wasm="target/wasm32-unknown-unknown/release/batdoc_core.wasm"
+          bytes="$(wc -c < "$wasm")"
+          echo "batdoc_core.wasm: $bytes bytes"
+          if [ "$bytes" -ge 10485760 ]; then
+            echo "wasm artifact $bytes bytes exceeds 10 MB budget" >&2
+            exit 1
+          fi
