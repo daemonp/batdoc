@@ -9,12 +9,13 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Cursor, Read};
+use std::io::{BufRead, Cursor, Read};
 use zip::ZipArchive;
 
 use crate::markup;
 use crate::xml_util::{self, get_attr, Rels};
 use crate::ExtractOptions;
+use crate::ExtractSink;
 
 /// A parsed slide: its number and extracted text runs.
 #[derive(Debug)]
@@ -72,14 +73,26 @@ struct TextRun {
 
 /// Extract plain text from a .pptx file.
 pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
-    let (slides, _) = parse_pptx(
+    let mut out = String::new();
+    extract_plain_to(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// Stream plain text from a .pptx file into `sink`.
+pub(crate) fn extract_plain_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    extract_to(
         data,
         ExtractOptions {
             images: false,
             ..opts
         },
-    )?;
-    Ok(render_plain(&slides))
+        Mode::Plain,
+        sink,
+    )
 }
 
 /// Extract markdown-formatted text from a .pptx file.
@@ -89,15 +102,397 @@ pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> crate::error::
 /// When `opts.ocr` is set, embedded images are OCR'd and rendered as a
 /// blockquote after each slide's images.
 pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
+    let mut out = String::new();
+    extract_markdown_to(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// Stream markdown from a .pptx file into `sink`.
+pub(crate) fn extract_markdown_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    extract_to(data, opts, Mode::Markdown, sink)
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Plain,
+    Markdown,
+}
+
+fn extract_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    mode: Mode,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    if opts.ocr {
+        return extract_to_buffered(data, opts, mode, sink);
+    }
+    extract_to_streaming(data, opts, mode, sink)
+}
+
+/// Buffered path for `--ocr`: reuses the untouched `parse_pptx` → render
+/// pipeline, which OCRs embedded images and renders their text.
+fn extract_to_buffered(
+    data: &[u8],
+    opts: ExtractOptions,
+    mode: Mode,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
     let (slides, image_defs) = parse_pptx(data, opts)?;
-    let mut md = render_markdown(&slides);
-    if !image_defs.is_empty() {
-        for def in &image_defs {
-            md.push_str(def);
-            md.push('\n');
+    let out = match mode {
+        Mode::Plain => render_plain(&slides),
+        Mode::Markdown => {
+            let mut md = render_markdown(&slides);
+            if !image_defs.is_empty() {
+                for def in &image_defs {
+                    md.push_str(def);
+                    md.push('\n');
+                }
+            }
+            md
+        }
+    };
+    sink.write_str(&out)
+}
+
+/// Tracks the trailing-newline state of the streaming output so the notes
+/// trailer can be blank-line separated from the deck, and queues image
+/// definitions during streaming for a single write at the very end.
+struct StreamOut<'a, S: ExtractSink> {
+    sink: &'a mut S,
+    trailing_newlines: u8,
+    wrote: bool,
+    image_counter: usize,
+    image_queue: Vec<(String, String, String)>,
+}
+
+impl<'a, S: ExtractSink> StreamOut<'a, S> {
+    const fn new(sink: &'a mut S) -> Self {
+        Self {
+            sink,
+            trailing_newlines: 0,
+            wrote: false,
+            image_counter: 0,
+            image_queue: Vec::new(),
         }
     }
-    Ok(md)
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn write_str(&mut self, s: &str) -> crate::error::Result<()> {
+        if s.is_empty() {
+            return Ok(());
+        }
+        self.sink.write_str(s)?;
+        self.wrote = true;
+        let bytes = s.as_bytes();
+        let mut n = 0u8;
+        for &b in bytes.iter().rev() {
+            if b == b'\n' {
+                n = n.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        // `bytes.len() < 256` makes the cast safe; n is already u8 and
+        // bounded by the trailing-newline count of the input string.
+        if n == bytes.len() as u8 && bytes.len() < 256 {
+            self.trailing_newlines = self.trailing_newlines.saturating_add(n);
+        } else {
+            self.trailing_newlines = n;
+        }
+        Ok(())
+    }
+
+    fn ensure_trailer_blank_line(&mut self) -> crate::error::Result<()> {
+        if !self.wrote || self.trailing_newlines >= 2 {
+            return Ok(());
+        }
+        if self.trailing_newlines == 1 {
+            self.write_str("\n")
+        } else {
+            self.write_str("\n\n")
+        }
+    }
+}
+
+fn extract_to_streaming(
+    data: &[u8],
+    opts: ExtractOptions,
+    mode: Mode,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let markdown = matches!(mode, Mode::Markdown);
+    let cursor = Cursor::new(data);
+    let mut archive = ZipArchive::new(cursor)?;
+
+    let mut slide_paths = discover_slides(&mut archive)?;
+
+    // Slides whose parts are missing are dropped (the buffered `parse_pptx`
+    // `continue`s on a failed `by_name`), so the multi-slide heading decision
+    // must see the same slide count as the buffered renderer.
+    slide_paths.retain(|(_, path)| archive.by_name(path).is_ok());
+
+    let multiple = slide_paths.len() > 1;
+    let heading_offset = if multiple { 2 } else { 0 };
+
+    // Separate archive for reading image bytes without holding the slide
+    // reader's borrow of `archive`.
+    let mut images = ZipArchive::new(Cursor::new(data))?;
+    let mut out = StreamOut::new(sink);
+
+    // Buffered speaker notes (small): emitted as a trailer after all slides.
+    let mut notes_entries: Vec<(usize, Vec<ShapeText>)> = Vec::new();
+
+    for (slide_index, (num, path)) in slide_paths.into_iter().enumerate() {
+        let rels_path = xml_util::rels_path(&path);
+        let rels = xml_util::load_rels(&mut archive, &rels_path);
+        let image_rels = if opts.images {
+            xml_util::load_image_rels(&mut archive, &rels_path)
+        } else {
+            Rels::new()
+        };
+
+        let mut body = String::new();
+        let mut pic_rids: Vec<String> = Vec::new();
+        let has_shapes = {
+            let mut reader = xml_util::open_xml(&mut archive, &path)?;
+            let mut buf = Vec::new();
+            let mut first_shape = true;
+            emit_slide_body(
+                &mut reader,
+                &mut buf,
+                &rels,
+                markdown,
+                heading_offset,
+                &mut first_shape,
+                &mut body,
+                &mut pic_rids,
+                opts.images,
+            )
+        };
+
+        let mut has_images = false;
+        if markdown && opts.images && !image_rels.is_empty() {
+            let base_dir = path.rsplit_once('/').map_or("ppt", |(dir, _)| dir);
+            for rid in &pic_rids {
+                if let Some(target) = image_rels.get(rid) {
+                    if let Some(data) = xml_util::read_image_from_zip(&mut images, target, base_dir)
+                    {
+                        out.image_counter += 1;
+                        let id = format!("image{}", out.image_counter);
+                        if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, &id) {
+                            body.push_str(&img_ref.inline);
+                            body.push_str("\n\n");
+                            out.image_queue
+                                .push((id, target.clone(), base_dir.to_string()));
+                            has_images = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_content = has_shapes || has_images;
+        if has_content {
+            if markdown {
+                if multiple {
+                    out.write_str(&format!("## Slide {num}\n\n"))?;
+                }
+            } else if multiple {
+                if slide_index > 0 {
+                    out.write_str("\n")?;
+                }
+                out.write_str(&format!("--- Slide {num} ---\n"))?;
+            }
+            out.write_str(&body)?;
+        }
+
+        // Speaker notes (buffered; small). Emitted as a trailer after the deck.
+        let notes = load_slide_notes(&mut archive, &path);
+        if !notes.is_empty() {
+            notes_entries.push((num, notes));
+        }
+    }
+
+    match mode {
+        Mode::Plain => append_notes_plain_streaming(&notes_entries, &mut out)?,
+        Mode::Markdown => append_notes_markdown_streaming(&notes_entries, &mut out)?,
+    }
+
+    if opts.images {
+        let queue = std::mem::take(&mut out.image_queue);
+        write_image_defs(&mut images, &queue, &mut out)?;
+    }
+
+    Ok(())
+}
+
+/// Write queued image definitions at the very end, in global counter order.
+fn write_image_defs<S: ExtractSink>(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    queue: &[(String, String, String)],
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    for (id, target, base_dir) in queue {
+        if let Some(data) = xml_util::read_image_from_zip(archive, target, base_dir) {
+            if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, id) {
+                out.write_str(&img_ref.definition)?;
+                out.write_str("\n")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stream a slide's XML: render shapes as they close and collect `<p:pic>`
+/// rIds in document order. Returns whether the slide contained any shape
+/// with a non-empty text body (mirrors the buffered `shapes.is_empty()` skip
+/// condition, which counts parsed shapes rather than rendered text).
+#[allow(clippy::too_many_arguments)]
+fn emit_slide_body<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    markdown: bool,
+    heading_offset: u8,
+    first_shape: &mut bool,
+    body: &mut String,
+    pic_rids: &mut Vec<String>,
+    collect_pics: bool,
+) -> bool {
+    let mut has_shapes = false;
+    let mut in_pic = false;
+    let mut pic_depth = 0u32;
+
+    loop {
+        let mut start_sp = false;
+        let mut start_gf = false;
+        let mut start_pic = false;
+        let mut pic_rid: Option<String> = None;
+        let mut end_pic = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"sp" => start_sp = true,
+                    b"graphicFrame" => start_gf = true,
+                    b"pic" => start_pic = true,
+                    _ => {
+                        if in_pic {
+                            pic_depth += 1;
+                            if collect_pics && name.as_ref() == b"blip" {
+                                pic_rid = get_attr(e, b"r:embed");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e))
+                if in_pic && collect_pics && e.local_name().as_ref() == b"blip" =>
+            {
+                pic_rid = get_attr(e, b"r:embed");
+            }
+            Ok(Event::End(ref e)) => {
+                if e.local_name().as_ref() == b"sld" {
+                    done = true;
+                } else if in_pic {
+                    if e.local_name().as_ref() == b"pic" {
+                        end_pic = true;
+                    } else {
+                        pic_depth -= 1;
+                        if pic_depth == 0 {
+                            end_pic = true;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => done = true,
+            _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_pic {
+            in_pic = true;
+            pic_depth = 1;
+        } else if start_sp || start_gf {
+            let end_tag: &[u8] = if start_sp { b"sp" } else { b"graphicFrame" };
+            if let Some(shape) = parse_shape(reader, buf, rels, end_tag) {
+                has_shapes = true;
+                if !*first_shape {
+                    body.push('\n');
+                }
+                *first_shape = false;
+                if markdown {
+                    render_shape_markdown(&shape, body, heading_offset);
+                } else {
+                    render_shape_plain(&shape, body);
+                }
+            }
+        } else if let Some(rid) = pic_rid {
+            pic_rids.push(rid);
+        } else if end_pic {
+            in_pic = false;
+        }
+    }
+
+    has_shapes
+}
+
+/// Append the streaming notes trailer to a markdown body.
+fn append_notes_markdown_streaming<S: ExtractSink>(
+    entries: &[(usize, Vec<ShapeText>)],
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    let mut any = false;
+    for (num, notes) in entries {
+        if !notes_nonempty(notes) {
+            continue;
+        }
+        if !any {
+            out.ensure_trailer_blank_line()?;
+            out.write_str("## Notes\n\n")?;
+            any = true;
+        }
+        out.write_str(&format!("### Slide {num}\n\n"))?;
+        for shape in notes {
+            let mut rendered = String::new();
+            render_shape_markdown(shape, &mut rendered, 3);
+            out.write_str(&rendered)?;
+        }
+    }
+    Ok(())
+}
+
+/// Append the streaming notes trailer to a plain-text body.
+fn append_notes_plain_streaming<S: ExtractSink>(
+    entries: &[(usize, Vec<ShapeText>)],
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    let mut any = false;
+    for (num, notes) in entries {
+        if !notes_nonempty(notes) {
+            continue;
+        }
+        if !any {
+            out.ensure_trailer_blank_line()?;
+            out.write_str("--- Notes ---\n")?;
+            any = true;
+        }
+        out.write_str(&format!("[Slide {num}]\n"))?;
+        for shape in notes {
+            let mut rendered = String::new();
+            render_shape_plain(shape, &mut rendered);
+            out.write_str(&rendered)?;
+        }
+    }
+    Ok(())
 }
 
 // ── Parsing ────────────────────────────────────────────────────────
@@ -195,43 +590,58 @@ fn parse_pptx(
 ///
 /// Returns the rIds in document order.
 fn parse_slide_pic_rids(xml: &str) -> Vec<String> {
-    let mut rids = Vec::new();
     let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    parse_slide_pic_rids_reader(&mut reader, &mut buf)
+}
+
+fn parse_slide_pic_rids_reader<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+) -> Vec<String> {
+    let mut rids = Vec::new();
     let mut in_pic = false;
     let mut depth = 0u32;
 
     loop {
-        match reader.read_event() {
+        let mut start_rid: Option<String> = None;
+        let mut ended = false;
+        let mut start_pic = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 if e.local_name().as_ref() == b"pic" {
-                    in_pic = true;
-                    depth = 1;
+                    start_pic = true;
                 } else if in_pic {
                     depth += 1;
                     if e.local_name().as_ref() == b"blip" {
-                        if let Some(rid) = get_attr(e, b"r:embed") {
-                            rids.push(rid);
-                        }
+                        start_rid = get_attr(e, b"r:embed");
                     }
                 }
             }
             Ok(Event::Empty(ref e)) if in_pic && e.local_name().as_ref() == b"blip" => {
-                if let Some(rid) = get_attr(e, b"r:embed") {
-                    rids.push(rid);
-                }
+                start_rid = get_attr(e, b"r:embed");
             }
             Ok(Event::End(ref e)) if in_pic => {
                 if e.local_name().as_ref() == b"pic" {
-                    in_pic = false;
+                    ended = true;
                 } else {
                     depth -= 1;
                     if depth == 0 {
-                        in_pic = false;
+                        ended = true;
                     }
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
+        }
+        buf.clear();
+        if start_pic {
+            in_pic = true;
+            depth = 1;
+        } else if let Some(rid) = start_rid {
+            rids.push(rid);
+        } else if ended {
+            in_pic = false;
         }
     }
 
@@ -315,23 +725,41 @@ fn discover_slides(
 /// Parse a single slide's XML, extracting text from all shapes.
 fn parse_slide_xml(xml: &str, rels: &Rels) -> Vec<ShapeText> {
     let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    parse_slide_reader(&mut reader, &mut buf, rels)
+}
+
+fn parse_slide_reader<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+) -> Vec<ShapeText> {
     let mut shapes = Vec::new();
 
     loop {
-        match reader.read_event() {
+        let mut start_tag: Option<Vec<u8>> = None;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 // <p:sp> = shape, <p:graphicFrame> = table/chart, <p:grpSp> = group
                 if name.as_ref() == b"sp" || name.as_ref() == b"graphicFrame" {
-                    if let Some(shape) = parse_shape(&mut reader, rels, e.local_name().as_ref()) {
-                        if !shape.paragraphs.is_empty() {
-                            shapes.push(shape);
-                        }
-                    }
+                    start_tag = Some(name.as_ref().to_vec());
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if let Some(tag) = start_tag {
+            if let Some(shape) = parse_shape(reader, buf, rels, &tag) {
+                if !shape.paragraphs.is_empty() {
+                    shapes.push(shape);
+                }
+            }
         }
     }
 
@@ -339,19 +767,33 @@ fn parse_slide_xml(xml: &str, rels: &Rels) -> Vec<ShapeText> {
 }
 
 /// Parse a shape element (`<p:sp>` or `<p:graphicFrame>`), extracting its text body.
-fn parse_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Option<ShapeText> {
+fn parse_shape<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    end_tag: &[u8],
+) -> Option<ShapeText> {
     let mut paragraphs = Vec::new();
 
     loop {
-        match reader.read_event() {
+        let mut start_body = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"txBody" => {
-                parse_text_body(reader, rels, &mut paragraphs);
+                start_body = true;
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == end_tag => {
-                break;
+                done = true;
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_body {
+            parse_text_body(reader, buf, rels, &mut paragraphs);
         }
     }
 
@@ -411,18 +853,28 @@ fn load_slide_notes(archive: &mut ZipArchive<Cursor<&[u8]>>, slide_path: &str) -
 /// so the run walker runs against an empty `Rels`.
 fn parse_notes_slide_xml(xml: &str) -> Vec<ShapeText> {
     let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
     let rels = Rels::new();
     let mut shapes = Vec::new();
 
     loop {
-        match reader.read_event() {
+        let mut start_sp = false;
+        let mut done = false;
+        match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"sp" => {
-                if let Some(shape) = parse_notes_shape(&mut reader, &rels, b"sp") {
-                    shapes.push(shape);
-                }
+                start_sp = true;
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_sp {
+            if let Some(shape) = parse_notes_shape(&mut reader, &mut buf, &rels, b"sp") {
+                shapes.push(shape);
+            }
         }
     }
 
@@ -435,25 +887,39 @@ fn parse_notes_slide_xml(xml: &str) -> Vec<ShapeText> {
 /// `<p:nvSpPr>/<p:nvPr>` before the text body), then parses `txBody` with
 /// the same walker used for slides. Shapes whose placeholder type is not
 /// `body` — including freeform shapes with no `<p:ph>` at all — are dropped.
-fn parse_notes_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) -> Option<ShapeText> {
+fn parse_notes_shape<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    end_tag: &[u8],
+) -> Option<ShapeText> {
     let mut ph_type: Option<String> = None;
     let mut paragraphs = Vec::new();
 
     loop {
-        match reader.read_event() {
+        let mut start_body = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Empty(ref e) | Event::Start(ref e))
                 if e.local_name().as_ref() == b"ph" && ph_type.is_none() =>
             {
                 ph_type = get_attr(e, b"type");
             }
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"txBody" => {
-                parse_text_body(reader, rels, &mut paragraphs);
+                start_body = true;
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == end_tag => {
-                break;
+                done = true;
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_body {
+            parse_text_body(reader, buf, rels, &mut paragraphs);
         }
     }
 
@@ -468,91 +934,106 @@ fn parse_notes_shape(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: &[u8]) ->
 }
 
 /// Parse a `<p:txBody>` (or `<a:txBody>`) element.
-fn parse_text_body(reader: &mut Reader<&[u8]>, rels: &Rels, paragraphs: &mut Vec<Paragraph>) {
+fn parse_text_body<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    paragraphs: &mut Vec<Paragraph>,
+) {
     loop {
-        match reader.read_event() {
+        let mut start_p = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"p" => {
-                let para = parse_para(reader, rels);
-                if !para.runs.is_empty() {
-                    paragraphs.push(para);
-                }
+                start_p = true;
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == b"txBody" => {
-                break;
+                done = true;
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_p {
+            let para = parse_para(reader, buf, rels);
+            if !para.runs.is_empty() {
+                paragraphs.push(para);
+            }
         }
     }
 }
 
 /// Parse a `<a:p>` paragraph element within a text body.
-fn parse_para(reader: &mut Reader<&[u8]>, rels: &Rels) -> Paragraph {
+fn parse_para<R: BufRead>(reader: &mut Reader<R>, buf: &mut Vec<u8>, rels: &Rels) -> Paragraph {
     let mut runs = Vec::new();
     let mut max_font_size: Option<u32> = None;
     let mut bullet = BulletKind::None;
 
     loop {
-        match reader.read_event() {
+        let mut start_ppr = false;
+        let mut ppr_lvl = 0u8;
+        let mut start_r = false;
+        let mut start_fld = false;
+        let mut empty_br = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
                     b"pPr" => {
-                        parse_para_props(reader, e, &mut bullet);
-                    }
-                    b"r" => {
-                        let run = parse_text_run(reader, rels, None);
-                        if let Some(fs) = run.font_size {
-                            max_font_size = Some(max_font_size.map_or(fs, |prev| prev.max(fs)));
-                        }
-                        if !run.text.is_empty() {
-                            runs.push(run);
-                        }
-                    }
-                    b"fld" => {
-                        // Field element (slide number, date, etc.) — extract text
-                        let run = parse_text_run(reader, rels, Some(b"fld"));
-                        if !run.text.is_empty() {
-                            runs.push(run);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::Empty(ref e)) => {
-                let name = e.local_name();
-                match name.as_ref() {
-                    b"br" => {
-                        runs.push(TextRun {
-                            text: "\n".into(),
-                            bold: false,
-                            italic: false,
-                            link_url: None,
-                            font_size: None,
-                        });
-                    }
-                    b"pPr" => {
-                        // Self-closing <a:pPr lvl="1"/> with no bullet children
-                        // means default bullet for body placeholders
-                        let lvl = get_attr(e, b"lvl")
+                        start_ppr = true;
+                        ppr_lvl = get_attr(e, b"lvl")
                             .and_then(|v| v.parse::<u8>().ok())
                             .unwrap_or(0);
-                        // Self-closing pPr has no child elements, so we can't tell
-                        // bullet vs. no-bullet — leave as None (will be plain text).
-                        // In practice, self-closing pPr without buNone in a body
-                        // placeholder still gets a bullet from the master, but we
-                        // can't know that without parsing the slide layout/master.
-                        // We'll rely on the <a:pPr> Start form for bullet info.
-                        let _ = lvl;
                     }
+                    b"r" => start_r = true,
+                    b"fld" => start_fld = true,
                     _ => {}
                 }
             }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
-                break;
+            // A self-closing <a:pPr lvl="1"/> has no bullet children, so
+            // (as with the Start form) we leave the bullet as None and rely
+            // on the non-empty `pPr` form for bullet info.
+            Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"br" => {
+                empty_br = true;
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
+                done = true;
+            }
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_ppr {
+            parse_para_props(reader, buf, ppr_lvl, &mut bullet);
+        } else if start_r {
+            let run = parse_text_run(reader, buf, rels, None);
+            if let Some(fs) = run.font_size {
+                max_font_size = Some(max_font_size.map_or(fs, |prev| prev.max(fs)));
+            }
+            if !run.text.is_empty() {
+                runs.push(run);
+            }
+        } else if start_fld {
+            // Field element (slide number, date, etc.) — extract text
+            let run = parse_text_run(reader, buf, rels, Some(b"fld"));
+            if !run.text.is_empty() {
+                runs.push(run);
+            }
+        } else if empty_br {
+            runs.push(TextRun {
+                text: "\n".into(),
+                bold: false,
+                italic: false,
+                link_url: None,
+                font_size: None,
+            });
         }
     }
 
@@ -593,22 +1074,20 @@ fn parse_para(reader: &mut Reader<&[u8]>, rels: &Rels) -> Paragraph {
 /// to an unordered bullet — `PowerPoint` body placeholders inherit bullets
 /// from the slide layout/master, and the `lvl` attribute alone indicates
 /// list membership in practice.
-fn parse_para_props(
-    reader: &mut Reader<&[u8]>,
-    start: &quick_xml::events::BytesStart,
+fn parse_para_props<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    lvl: u8,
     bullet: &mut BulletKind,
 ) {
-    let lvl = get_attr(start, b"lvl")
-        .and_then(|v| v.parse::<u8>().ok())
-        .unwrap_or(0);
-
     let mut found_bu_char = false;
     let mut found_bu_auto = false;
     let mut found_bu_none = false;
     let mut depth = 1u32;
 
     loop {
-        match reader.read_event() {
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(_)) => {
                 depth += 1;
             }
@@ -624,11 +1103,15 @@ fn parse_para_props(
             Ok(Event::End(_)) => {
                 depth -= 1;
                 if depth == 0 {
-                    break;
+                    done = true;
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
         }
     }
 
@@ -648,7 +1131,12 @@ fn parse_para_props(
 /// Parse a `<a:r>` text run (or `<a:fld>` field) element.
 ///
 /// Extracts text, bold/italic, font size, and hyperlink URL.
-fn parse_text_run(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: Option<&[u8]>) -> TextRun {
+fn parse_text_run<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    end_tag: Option<&[u8]>,
+) -> TextRun {
     let end_name = end_tag.unwrap_or(b"r");
     let mut text = String::new();
     let mut bold = false;
@@ -657,22 +1145,20 @@ fn parse_text_run(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: Option<&[u8]
     let mut font_size: Option<u32> = None;
 
     loop {
-        match reader.read_event() {
+        let mut start_rpr = false;
+        let mut start_t = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
                     b"rPr" => {
                         // Read attributes from the <a:rPr> start tag
                         read_rpr_attrs(e, &mut bold, &mut italic, &mut font_size);
-                        // Parse children for hyperlinks
-                        parse_run_props_children(reader, &mut link_url, rels);
+                        start_rpr = true;
                     }
                     b"t" => {
-                        if let Ok(Event::Text(t)) = reader.read_event() {
-                            if let Ok(s) = t.unescape() {
-                                text.push_str(&s);
-                            }
-                        }
+                        start_t = true;
                     }
                     _ => {}
                 }
@@ -685,10 +1171,25 @@ fn parse_text_run(reader: &mut Reader<&[u8]>, rels: &Rels, end_tag: Option<&[u8]
                 }
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == end_name => {
-                break;
+                done = true;
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_rpr {
+            // Parse children for hyperlinks
+            parse_run_props_children(reader, buf, &mut link_url, rels);
+        } else if start_t {
+            if let Ok(Event::Text(t)) = reader.read_event_into(buf) {
+                if let Ok(s) = t.unescape() {
+                    text.push_str(&s);
+                }
+            }
+            buf.clear();
         }
     }
 
@@ -723,20 +1224,23 @@ fn read_rpr_attrs(
 }
 
 /// Parse children of `<a:rPr>` to find hyperlink references.
-fn parse_run_props_children(
-    reader: &mut Reader<&[u8]>,
+fn parse_run_props_children<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     link_url: &mut Option<String>,
     rels: &Rels,
 ) {
     let mut depth = 1u32;
 
     loop {
-        match reader.read_event() {
+        let mut hlink: Option<String> = None;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 if e.local_name().as_ref() == b"hlinkClick" {
                     if let Some(rid) = get_attr(e, b"r:id") {
                         if let Some(url) = rels.get(&rid) {
-                            *link_url = Some(url.clone());
+                            hlink = Some(url.clone());
                         }
                     }
                 }
@@ -745,21 +1249,29 @@ fn parse_run_props_children(
             Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"hlinkClick" => {
                 if let Some(rid) = get_attr(e, b"r:id") {
                     if let Some(url) = rels.get(&rid) {
-                        *link_url = Some(url.clone());
+                        hlink = Some(url.clone());
                     }
                 }
             }
             Ok(Event::End(ref e)) => {
                 if e.local_name().as_ref() == b"rPr" {
-                    break;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    break;
+                    done = true;
+                } else {
+                    depth -= 1;
+                    if depth == 0 {
+                        done = true;
+                    }
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if let Some(url) = hlink {
+            *link_url = Some(url);
         }
     }
 }
@@ -1837,5 +2349,218 @@ mod tests {
         assert!(plain.contains("--- Notes ---"), "plain: {plain:?}");
         assert!(plain.contains("[Slide 1]"), "plain: {plain:?}");
         assert!(plain.contains("Speak slowly"), "plain: {plain:?}");
+    }
+
+    // ── streaming vs buffered equivalence ─────────────────────────
+
+    /// Wrap raw `<p:spTree>` children in a full `<p:sld>` document.
+    fn slide_xml(inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree>{inner}</p:spTree></p:cSld>
+</p:sld>"#
+        )
+    }
+
+    /// Build an N-slide deck from fully-specified slide XML bodies.
+    fn minimal_pptx_multi(slides: &[String]) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut z = ZipWriter::new(buf);
+        zip_entry(
+            &mut z,
+            "[Content_Types].xml",
+            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#,
+        );
+
+        let mut sld_ids = String::new();
+        let mut rels = String::from(
+            r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for i in 0..slides.len() {
+            sld_ids.push_str(&format!(
+                r#"<p:sldId id="{}" r:id="rId{}"/>"#,
+                256 + i,
+                i + 1
+            ));
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide{}.xml"/>"#,
+                i + 1,
+                i + 1
+            ));
+        }
+        rels.push_str("</Relationships>");
+
+        let pres = format!(
+            r#"<?xml version="1.0"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst>{sld_ids}</p:sldIdLst>
+</p:presentation>"#
+        );
+        zip_entry(&mut z, "ppt/presentation.xml", &pres);
+        zip_entry(&mut z, "ppt/_rels/presentation.xml.rels", &rels);
+
+        for (i, slide) in slides.iter().enumerate() {
+            zip_entry(&mut z, &format!("ppt/slides/slide{}.xml", i + 1), slide);
+        }
+
+        z.finish().unwrap().into_inner()
+    }
+
+    /// The buffered reference output for the markdown extractor: the same
+    /// `parse_pptx` → `render_markdown` → image definitions pipeline that
+    /// `extract_markdown` used before the streaming rewrite.
+    fn buffered_markdown(data: &[u8], opts: crate::ExtractOptions) -> String {
+        let (slides, image_defs) = parse_pptx(data, opts).unwrap();
+        let mut md = render_markdown(&slides);
+        if !image_defs.is_empty() {
+            for def in &image_defs {
+                md.push_str(def);
+                md.push('\n');
+            }
+        }
+        md
+    }
+
+    #[test]
+    fn extract_to_equals_buffered_on_multi_slide_deck() {
+        let slide1 = slide_xml(
+            r#"<p:sp><p:txBody>
+                <a:p><a:r><a:rPr b="1" sz="2800"/><a:t>Title</a:t></a:r></a:p>
+                <a:p><a:r><a:t>Body text</a:t></a:r></a:p>
+            </p:txBody></p:sp>"#,
+        );
+        let slide2 = slide_xml(
+            r#"<p:sp><p:txBody>
+                <a:p><a:pPr lvl="0"><a:buChar char="●"/></a:pPr><a:r><a:t>Item one</a:t></a:r></a:p>
+                <a:p><a:pPr lvl="1"><a:buChar char="○"/></a:pPr><a:r><a:t>Sub item</a:t></a:r></a:p>
+            </p:txBody></p:sp>"#,
+        );
+        let data = minimal_pptx_multi(&[slide1, slide2]);
+        let opts = crate::ExtractOptions::default();
+
+        assert_eq!(buffered_markdown(&data, opts), {
+            let mut out = String::new();
+            extract_markdown_to(&data, opts, &mut out).unwrap();
+            out
+        });
+
+        let (slides, _) = parse_pptx(
+            &data,
+            crate::ExtractOptions {
+                images: false,
+                ..opts
+            },
+        )
+        .unwrap();
+        let ref_plain = render_plain(&slides);
+        let mut plain = String::new();
+        extract_plain_to(&data, opts, &mut plain).unwrap();
+        assert_eq!(ref_plain, plain);
+
+        let md = buffered_markdown(&data, opts);
+        assert!(md.contains("## Slide 1"), "md: {md:?}");
+        assert!(md.contains("### **Title**"), "md: {md:?}");
+        assert!(md.contains("## Slide 2"), "md: {md:?}");
+        assert!(md.contains("- Item one"), "md: {md:?}");
+        assert!(md.contains("  - Sub item"), "md: {md:?}");
+        assert!(plain.contains("--- Slide 1 ---"), "plain: {plain:?}");
+        assert!(plain.contains("--- Slide 2 ---"), "plain: {plain:?}");
+    }
+
+    /// Two-slide deck; each slide has a text shape and one PNG image (`rId5`).
+    fn minimal_pptx_with_images() -> Vec<u8> {
+        const CONTENT_TYPES: &str = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>"#;
+        const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+        const SLIDE_TYPE: &str =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+        const IMAGE_TYPE: &str =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+        const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+        let slide = |text: &str| -> String {
+            format!(
+                r#"<?xml version="1.0"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld><p:spTree>
+    <p:sp><p:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>
+    <p:pic><p:blipFill><a:blip r:embed="rId5"/></p:blipFill></p:pic>
+  </p:spTree></p:cSld>
+</p:sld>"#
+            )
+        };
+
+        let buf = Cursor::new(Vec::new());
+        let mut z = ZipWriter::new(buf);
+        zip_entry(&mut z, "[Content_Types].xml", CONTENT_TYPES);
+        zip_entry(
+            &mut z,
+            "ppt/presentation.xml",
+            r#"<?xml version="1.0"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst>
+    <p:sldId id="256" r:id="rId1"/>
+    <p:sldId id="257" r:id="rId2"/>
+  </p:sldIdLst>
+</p:presentation>"#,
+        );
+        zip_entry(
+            &mut z,
+            "ppt/_rels/presentation.xml.rels",
+            &format!(
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="{RELS_NS}">
+  <Relationship Id="rId1" Type="{SLIDE_TYPE}" Target="slides/slide1.xml"/>
+  <Relationship Id="rId2" Type="{SLIDE_TYPE}" Target="slides/slide2.xml"/>
+</Relationships>"#
+            ),
+        );
+        zip_entry(&mut z, "ppt/slides/slide1.xml", &slide("One"));
+        zip_entry(&mut z, "ppt/slides/slide2.xml", &slide("Two"));
+        for n in 1..=2 {
+            zip_entry(
+                &mut z,
+                &format!("ppt/slides/_rels/slide{n}.xml.rels"),
+                &format!(
+                    r#"<?xml version="1.0"?>
+<Relationships xmlns="{RELS_NS}">
+  <Relationship Id="rId5" Type="{IMAGE_TYPE}" Target="../media/image1.png"/>
+</Relationships>"#
+                ),
+            );
+        }
+        z.start_file("ppt/media/image1.png", SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(&PNG_SIGNATURE).unwrap();
+        z.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn extract_markdown_to_equals_buffered_on_images() {
+        let data = minimal_pptx_with_images();
+        let opts = crate::ExtractOptions {
+            images: true,
+            ..crate::ExtractOptions::default()
+        };
+
+        let expected = buffered_markdown(&data, opts);
+        let mut actual = String::new();
+        extract_markdown_to(&data, opts, &mut actual).unwrap();
+
+        assert_eq!(expected, actual);
+        assert!(
+            actual.contains("[image1]: <data:image/png;base64,iVBORw0KGgo=>"),
+            "actual: {actual:?}"
+        );
+        assert!(
+            actual.contains("[image2]: <data:image/png;base64,iVBORw0KGgo=>"),
+            "actual: {actual:?}"
+        );
     }
 }

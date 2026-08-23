@@ -3,16 +3,20 @@
 //! Reads the `Workbook` (or `Book`) stream from the OLE2 compound file,
 //! parses the BIFF8 record stream to extract the Shared String Table (SST),
 //! sheet metadata (`BoundSheet8`), and cell records (LABELSST, NUMBER, RK,
-//! MULRK, FORMULA, LABEL, BOOLERR). Produces the same `Sheet` type used
-//! by the `.xlsx` parser for rendering.
+//! MULRK, FORMULA, LABEL, BOOLERR). Emits rows through the shared sheet writers.
 
 use cfb::CompoundFile;
 use std::io::{Cursor, Read};
 
+use crate::arena::StringArena;
 use crate::codepage;
 use crate::dateconv;
 use crate::error::BatdocError;
-use crate::sheet::Sheet;
+use crate::sheet::{
+    write_markdown_data_row, write_markdown_header, write_markdown_separator, write_plain_row,
+    TableShape, MAX_COLS,
+};
+use crate::ExtractSink;
 
 // ── BIFF8 record types ────────────────────────────────────────────
 
@@ -37,14 +41,86 @@ const REC_CODEPAGE: u16 = 0x0042;
 
 /// Extract plain text (TSV) from a BIFF8 .xls file.
 pub(crate) fn extract_plain(data: &[u8]) -> crate::error::Result<String> {
-    let sheets = parse_xls(data)?;
-    Ok(crate::sheet::render_plain(&sheets))
+    let mut out = String::new();
+    extract_plain_to(data, &mut out)?;
+    Ok(out)
+}
+
+/// Stream plain text (TSV) from a BIFF8 .xls file into `sink`.
+pub(crate) fn extract_plain_to(
+    data: &[u8],
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let wb = open_workbook(data)?;
+    let visible: Vec<&SheetEntry> = wb
+        .sheets
+        .iter()
+        .filter(|e| e.sheet_type == 0 && e.visibility == 0)
+        .collect();
+    let mut emitted_any = false;
+    for entry in visible {
+        emit_sheet_plain(
+            &wb.buf,
+            entry,
+            &wb.sst,
+            &wb.xf_styles,
+            wb.cp,
+            &mut emitted_any,
+            sink,
+        )?;
+    }
+    Ok(())
 }
 
 /// Extract markdown-formatted text from a BIFF8 .xls file.
 pub(crate) fn extract_markdown(data: &[u8]) -> crate::error::Result<String> {
-    let sheets = parse_xls(data)?;
-    Ok(crate::sheet::render_markdown(&sheets))
+    let mut out = String::new();
+    extract_markdown_to(data, &mut out)?;
+    Ok(out)
+}
+
+/// Stream markdown from a BIFF8 .xls file into `sink`.
+pub(crate) fn extract_markdown_to(
+    data: &[u8],
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let wb = open_workbook(data)?;
+    let visible: Vec<&SheetEntry> = wb
+        .sheets
+        .iter()
+        .filter(|e| e.sheet_type == 0 && e.visibility == 0)
+        .collect();
+    let mut shapes = Vec::with_capacity(visible.len());
+    for entry in &visible {
+        shapes.push(scan_sheet_shape(
+            &wb.buf,
+            entry.bof_offset,
+            &wb.sst,
+            &wb.xf_styles,
+            wb.cp,
+        )?);
+    }
+    let multiple = shapes.iter().filter(|s| s.is_some()).count() > 1;
+    for (entry, shape) in visible.iter().zip(shapes.iter()) {
+        let Some(shape) = shape else {
+            continue;
+        };
+        if multiple {
+            sink.write_str("## ")?;
+            sink.write_str(&entry.name)?;
+            sink.write_str("\n\n")?;
+        }
+        emit_sheet_markdown(
+            &wb.buf,
+            entry.bof_offset,
+            shape,
+            &wb.sst,
+            &wb.xf_styles,
+            wb.cp,
+            sink,
+        )?;
+    }
+    Ok(())
 }
 
 // ── Record-level types ─────────────────────────────────────────────
@@ -65,21 +141,20 @@ struct SheetEntry {
     sheet_type: u8,
 }
 
-/// A cell being placed into the grid.
-#[derive(Debug)]
-struct Cell {
-    row: u16,
-    col: u16,
-    value: String,
-}
-
 // ── Main parser ────────────────────────────────────────────────────
 
-fn parse_xls(data: &[u8]) -> crate::error::Result<Vec<Sheet>> {
+struct Workbook {
+    buf: Vec<u8>,
+    sst: StringArena,
+    sheets: Vec<SheetEntry>,
+    xf_styles: XfStyles,
+    cp: u16,
+}
+
+fn open_workbook(data: &[u8]) -> crate::error::Result<Workbook> {
     let cursor = Cursor::new(data);
     let mut cfb = CompoundFile::open(cursor)?;
 
-    // Try "Workbook" first (BIFF8), then "Book" (BIFF5 compat)
     let stream_name = if cfb.exists("/Workbook") {
         "/Workbook"
     } else if cfb.exists("/Book") {
@@ -94,32 +169,15 @@ fn parse_xls(data: &[u8]) -> crate::error::Result<Vec<Sheet>> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
 
-    // Parse all records
     let records = parse_records(&buf);
-
-    // Phase 1: Parse workbook globals (SST + sheet entries + XF styles + codepage)
-    // This also detects encryption (FILEPASS record) early.
-    let (sst, sheet_entries, xf_styles, cp) = parse_globals(&records)?;
-
-    // Phase 2: Parse each worksheet substream
-    let mut sheets = Vec::new();
-    for entry in &sheet_entries {
-        // Skip non-worksheet types (charts, macros, VB modules)
-        if entry.sheet_type != 0 {
-            continue;
-        }
-        // Skip hidden sheets
-        if entry.visibility != 0 {
-            continue;
-        }
-        let rows = parse_sheet_substream(&buf, entry.bof_offset, &sst, &xf_styles, cp);
-        sheets.push(Sheet {
-            name: entry.name.clone(),
-            rows,
-        });
-    }
-
-    Ok(sheets)
+    let (sst, sheets, xf_styles, cp) = parse_globals(&records)?;
+    Ok(Workbook {
+        buf,
+        sst,
+        sheets,
+        xf_styles,
+        cp,
+    })
 }
 
 /// Maximum number of BIFF8 records to parse (defense-in-depth against
@@ -186,8 +244,8 @@ impl XfStyles {
 /// an error before doing any further parsing.
 fn parse_globals(
     records: &[Record<'_>],
-) -> crate::error::Result<(Vec<String>, Vec<SheetEntry>, XfStyles, u16)> {
-    let mut sst = Vec::new();
+) -> crate::error::Result<(StringArena, Vec<SheetEntry>, XfStyles, u16)> {
+    let mut sst = StringArena::new();
     let mut sheet_entries = Vec::new();
     // Custom FORMAT records: numFmtId → format string
     let mut custom_formats: Vec<(u16, String)> = Vec::new();
@@ -229,7 +287,8 @@ fn parse_globals(
                     combined.extend_from_slice(records[j].data);
                     j += 1;
                 }
-                sst = parse_sst(&combined, &continue_boundaries, cp);
+                sst = StringArena::new();
+                parse_sst(&combined, &continue_boundaries, cp, &mut sst);
                 i = j;
                 continue;
             }
@@ -279,13 +338,12 @@ fn parse_format_record(data: &[u8], cp: u16) -> Option<(u16, String)> {
 /// BIFF8 strings that span a CONTINUE boundary have a special encoding:
 /// at the CONTINUE boundary, a new "grbit" byte indicates whether the
 /// remaining characters are compressed (0) or uncompressed (1).
-fn parse_sst(data: &[u8], continue_boundaries: &[usize], cp: u16) -> Vec<String> {
+fn parse_sst(data: &[u8], continue_boundaries: &[usize], cp: u16, arena: &mut StringArena) {
     if data.len() < 8 {
-        return Vec::new();
+        return;
     }
 
     let unique_count = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let mut strings = Vec::with_capacity(unique_count.min(65536));
     let mut pos = 8;
 
     for _ in 0..unique_count {
@@ -294,11 +352,9 @@ fn parse_sst(data: &[u8], continue_boundaries: &[usize], cp: u16) -> Vec<String>
         }
 
         let (s, new_pos) = read_biff8_string(data, pos, continue_boundaries, cp);
-        strings.push(s);
+        arena.push(&s);
         pos = new_pos;
     }
-
-    strings
 }
 
 /// Read a BIFF8 unicode string from a buffer, handling CONTINUE boundaries.
@@ -464,194 +520,421 @@ fn parse_boundsheet(data: &[u8], cp: u16) -> Option<SheetEntry> {
 
 // ── Sheet substream parsing ────────────────────────────────────────
 
-/// Accumulator for collecting cells while parsing a sheet substream.
-struct GridBuilder {
-    cells: Vec<Cell>,
-    max_row: usize,
-    max_col: usize,
+struct CurrentRow {
+    row: Option<u16>,
+    cells: Vec<(u16, String)>,
 }
 
-impl GridBuilder {
+impl CurrentRow {
     const fn new() -> Self {
         Self {
+            row: None,
             cells: Vec::new(),
-            max_row: 0,
-            max_col: 0,
         }
     }
 
-    fn push(&mut self, row: u16, col: u16, value: String) {
-        let r = usize::from(row);
-        let c = usize::from(col);
-        if r + 1 > self.max_row {
-            self.max_row = r + 1;
+    fn push(
+        &mut self,
+        row: u16,
+        col: u16,
+        value: String,
+    ) -> crate::error::Result<Option<Vec<(u16, String)>>> {
+        check_col(col)?;
+        if self.row.is_some_and(|r| r != row) {
+            let flushed = std::mem::take(&mut self.cells);
+            self.row = Some(row);
+            self.cells.push((col, value));
+            return Ok(Some(flushed));
         }
-        if c + 1 > self.max_col {
-            self.max_col = c + 1;
-        }
-        self.cells.push(Cell { row, col, value });
+        self.row = Some(row);
+        self.cells.push((col, value));
+        Ok(None)
     }
 
-    fn into_grid(self) -> Vec<Vec<String>> {
-        cells_to_grid(self.cells, self.max_row, self.max_col)
+    fn take(&mut self) -> Vec<(u16, String)> {
+        self.row = None;
+        std::mem::take(&mut self.cells)
     }
 }
 
-/// Parse a sheet substream starting at `bof_offset` in the raw data,
-/// extracting cell values into a 2D grid.
-fn parse_sheet_substream(
-    data: &[u8],
-    bof_offset: u32,
-    sst: &[String],
-    xf_styles: &XfStyles,
-    cp: u16,
-) -> Vec<Vec<String>> {
-    let mut grid = GridBuilder::new();
-    let mut offset = bof_offset as usize; // u32 → usize: lossless on 32+ bit
-    let mut pending_string_cell: Option<(u16, u16)> = None;
+fn check_col(col: u16) -> crate::error::Result<()> {
+    if usize::from(col) >= MAX_COLS {
+        Err(BatdocError::Document("sheet exceeds 512 columns".into()))
+    } else {
+        Ok(())
+    }
+}
 
-    // Verify BOF
+fn skip_sheet_bof(data: &[u8], bof_offset: u32) -> Option<usize> {
+    let offset = bof_offset as usize;
     if offset + 4 > data.len() {
-        return Vec::new();
+        return None;
     }
     let rec_type = u16::from_le_bytes([data[offset], data[offset + 1]]);
     if rec_type != REC_BOF {
-        return Vec::new();
+        return None;
+    }
+    let rec_len = usize::from(u16::from_le_bytes([data[offset + 2], data[offset + 3]]));
+    Some(offset + 4 + rec_len)
+}
+
+struct SheetWalk<'a> {
+    data: &'a [u8],
+    offset: usize,
+    pending_string_cell: Option<(u16, u16)>,
+    pending_cells: Vec<(u16, u16, String)>,
+}
+
+impl<'a> SheetWalk<'a> {
+    fn start(data: &'a [u8], bof_offset: u32) -> Option<Self> {
+        Some(Self {
+            data,
+            offset: skip_sheet_bof(data, bof_offset)?,
+            pending_string_cell: None,
+            pending_cells: Vec::new(),
+        })
     }
 
-    // Skip BOF record
-    let rec_len = usize::from(u16::from_le_bytes([data[offset + 2], data[offset + 3]]));
-    offset += 4 + rec_len;
+    #[allow(clippy::unnecessary_wraps)]
+    fn next_cell(
+        &mut self,
+        sst: &StringArena,
+        xf_styles: &XfStyles,
+        cp: u16,
+    ) -> crate::error::Result<Option<(u16, u16, String)>> {
+        if !self.pending_cells.is_empty() {
+            return Ok(Some(self.pending_cells.remove(0)));
+        }
+        while self.offset + 4 <= self.data.len() {
+            let rec_type = u16::from_le_bytes([self.data[self.offset], self.data[self.offset + 1]]);
+            let rec_len = usize::from(u16::from_le_bytes([
+                self.data[self.offset + 2],
+                self.data[self.offset + 3],
+            ]));
+            let rec_end = (self.offset + 4 + rec_len).min(self.data.len());
+            let rec_data = &self.data[self.offset + 4..rec_end];
+            self.offset = rec_end;
 
-    while offset + 4 <= data.len() {
-        let rec_type = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        let rec_len = usize::from(u16::from_le_bytes([data[offset + 2], data[offset + 3]]));
-        let rec_end = (offset + 4 + rec_len).min(data.len());
-        let rec_data = &data[offset + 4..rec_end];
-
-        match rec_type {
-            REC_EOF => break,
-            REC_LABELSST => handle_labelsst(rec_data, sst, &mut grid),
-            REC_LABEL | REC_RSTRING => handle_label(rec_data, &mut grid, cp),
-            REC_NUMBER => handle_number(rec_data, &mut grid, xf_styles),
-            REC_RK => handle_rk(rec_data, &mut grid, xf_styles),
-            REC_MULRK => handle_mulrk(rec_data, &mut grid, xf_styles),
-            REC_FORMULA => {
-                handle_formula(rec_data, &mut grid, &mut pending_string_cell, xf_styles);
-            }
-            REC_STRING => handle_string(rec_data, &mut grid, &mut pending_string_cell, cp),
-            REC_BOOLERR => handle_boolerr(rec_data, &mut grid),
-            _ => {
-                // Clear pending string cell on any non-STRING record
-                // (STRING must immediately follow FORMULA)
-                if rec_type != REC_CONTINUE {
-                    pending_string_cell = None;
+            let emitted = match rec_type {
+                REC_EOF => return Ok(None),
+                REC_LABELSST => handle_labelsst(rec_data, sst),
+                REC_LABEL | REC_RSTRING => handle_label(rec_data, cp),
+                REC_NUMBER => handle_number(rec_data, xf_styles),
+                REC_RK => handle_rk(rec_data, xf_styles),
+                REC_MULRK => {
+                    let mut cells = handle_mulrk(rec_data, xf_styles);
+                    if cells.is_empty() {
+                        None
+                    } else {
+                        let first = cells.remove(0);
+                        self.pending_cells = cells;
+                        Some(first)
+                    }
                 }
+                REC_FORMULA => handle_formula(rec_data, &mut self.pending_string_cell, xf_styles),
+                REC_STRING => handle_string(rec_data, &mut self.pending_string_cell, cp),
+                REC_BOOLERR => handle_boolerr(rec_data),
+                _ => {
+                    if rec_type != REC_CONTINUE {
+                        self.pending_string_cell = None;
+                    }
+                    None
+                }
+            };
+            if emitted.is_some() {
+                return Ok(emitted);
             }
         }
+        Ok(None)
+    }
+}
 
-        offset = rec_end;
+fn densify_plain_row(cells: &[(u16, String)]) -> Vec<String> {
+    let Some(max_col) = cells.iter().map(|(col, _)| *col).max() else {
+        return Vec::new();
+    };
+    let mut dense = vec![String::new(); usize::from(max_col) + 1];
+    for (col, value) in cells {
+        let idx = usize::from(*col);
+        if idx < dense.len() {
+            dense[idx].clone_from(value);
+        }
+    }
+    dense
+}
+
+fn densify_markdown_row(cells: &[(u16, String)], shape: &TableShape) -> Vec<String> {
+    let ncols = shape.last_col - shape.first_col + 1;
+    let mut dense = vec![String::new(); ncols];
+    for (col, value) in cells {
+        let col = usize::from(*col);
+        if col < shape.first_col || col > shape.last_col {
+            continue;
+        }
+        dense[col - shape.first_col].clone_from(value);
+    }
+    dense
+}
+
+fn row_has_content(cells: &[(u16, String)]) -> bool {
+    cells.iter().any(|(_, v)| !v.trim().is_empty())
+}
+
+fn emit_sheet_plain(
+    data: &[u8],
+    entry: &SheetEntry,
+    sst: &StringArena,
+    xf_styles: &XfStyles,
+    cp: u16,
+    emitted_any: &mut bool,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let Some(mut walk) = SheetWalk::start(data, entry.bof_offset) else {
+        return Ok(());
+    };
+    let mut current = CurrentRow::new();
+    let mut wrote_header = false;
+
+    while let Some((row, col, value)) = walk.next_cell(sst, xf_styles, cp)? {
+        if let Some(prev) = current.push(row, col, value)? {
+            flush_plain_row(&prev, entry, &mut wrote_header, emitted_any, sink)?;
+        }
+    }
+    let last = current.take();
+    if !last.is_empty() {
+        flush_plain_row(&last, entry, &mut wrote_header, emitted_any, sink)?;
+    }
+    Ok(())
+}
+
+fn flush_plain_row(
+    cells: &[(u16, String)],
+    entry: &SheetEntry,
+    wrote_header: &mut bool,
+    emitted_any: &mut bool,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let dense = densify_plain_row(cells);
+    let mut line = String::new();
+    write_plain_row(&mut line, dense.iter().map(String::as_str))?;
+    if line.is_empty() {
+        return Ok(());
+    }
+    if !*wrote_header {
+        if *emitted_any {
+            sink.write_str("\n--- ")?;
+            sink.write_str(&entry.name)?;
+            sink.write_str(" ---\n")?;
+        }
+        *wrote_header = true;
+        *emitted_any = true;
+    }
+    sink.write_str(&line)
+}
+
+fn scan_sheet_shape(
+    data: &[u8],
+    bof_offset: u32,
+    sst: &StringArena,
+    xf_styles: &XfStyles,
+    cp: u16,
+) -> crate::error::Result<Option<TableShape>> {
+    let Some(mut walk) = SheetWalk::start(data, bof_offset) else {
+        return Ok(None);
+    };
+    let mut current = CurrentRow::new();
+    let mut used = vec![false; MAX_COLS];
+    let mut last_nonempty_row = None;
+    let mut row_idx = 0usize;
+
+    let mut mark = |cells: &[(u16, String)]| {
+        if !row_has_content(cells) {
+            row_idx += 1;
+            return;
+        }
+        for (col, value) in cells {
+            if !value.trim().is_empty() {
+                used[usize::from(*col)] = true;
+            }
+        }
+        last_nonempty_row = Some(row_idx);
+        row_idx += 1;
+    };
+
+    while let Some((row, col, value)) = walk.next_cell(sst, xf_styles, cp)? {
+        if let Some(prev) = current.push(row, col, value)? {
+            mark(&prev);
+        }
+    }
+    let last = current.take();
+    if !last.is_empty() {
+        mark(&last);
     }
 
-    grid.into_grid()
+    let Some(last_row) = last_nonempty_row else {
+        return Ok(None);
+    };
+    let Some(first_col) = used.iter().position(|&u| u) else {
+        return Ok(None);
+    };
+    let last_col = used.iter().rposition(|&u| u).unwrap_or(first_col);
+    Ok(Some(TableShape {
+        first_col,
+        last_col,
+        last_row,
+    }))
+}
+
+fn emit_sheet_markdown(
+    data: &[u8],
+    bof_offset: u32,
+    shape: &TableShape,
+    sst: &StringArena,
+    xf_styles: &XfStyles,
+    cp: u16,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let Some(mut walk) = SheetWalk::start(data, bof_offset) else {
+        return Ok(());
+    };
+    let mut current = CurrentRow::new();
+    let mut row_idx = 0usize;
+    let mut is_header = true;
+    let ncols = shape.last_col - shape.first_col + 1;
+
+    while let Some((row, col, value)) = walk.next_cell(sst, xf_styles, cp)? {
+        if let Some(prev) = current.push(row, col, value)? {
+            emit_markdown_row(&prev, shape, ncols, &mut row_idx, &mut is_header, sink)?;
+        }
+    }
+    let last = current.take();
+    if !last.is_empty() {
+        emit_markdown_row(&last, shape, ncols, &mut row_idx, &mut is_header, sink)?;
+    }
+    sink.write_str("\n")
+}
+
+fn emit_markdown_row(
+    cells: &[(u16, String)],
+    shape: &TableShape,
+    ncols: usize,
+    row_idx: &mut usize,
+    is_header: &mut bool,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    if *row_idx > shape.last_row {
+        return Ok(());
+    }
+    let slice = densify_markdown_row(cells, shape);
+    if *is_header {
+        write_markdown_header(sink, &slice)?;
+        write_markdown_separator(sink, ncols)?;
+        *is_header = false;
+    } else {
+        write_markdown_data_row(sink, &slice)?;
+    }
+    *row_idx += 1;
+    Ok(())
 }
 
 // ── Cell record handlers ───────────────────────────────────────────
 
-fn handle_labelsst(rec_data: &[u8], sst: &[String], grid: &mut GridBuilder) {
-    if rec_data.len() >= 10 {
-        let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
-        let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
-        let sst_idx =
-            u32::from_le_bytes([rec_data[6], rec_data[7], rec_data[8], rec_data[9]]) as usize;
-        let value = sst.get(sst_idx).cloned().unwrap_or_default();
-        grid.push(row, col, value);
+fn handle_labelsst(rec_data: &[u8], sst: &StringArena) -> Option<(u16, u16, String)> {
+    if rec_data.len() < 10 {
+        return None;
     }
+    let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
+    let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
+    let sst_idx = u32::from_le_bytes([rec_data[6], rec_data[7], rec_data[8], rec_data[9]]) as usize;
+    let value = sst.get(sst_idx).unwrap_or("").to_string();
+    Some((row, col, value))
 }
 
-fn handle_label(rec_data: &[u8], grid: &mut GridBuilder, cp: u16) {
-    if rec_data.len() >= 8 {
-        let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
-        let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
-        let (s, _) = read_biff8_string(rec_data, 6, &[], cp);
-        grid.push(row, col, s);
+fn handle_label(rec_data: &[u8], cp: u16) -> Option<(u16, u16, String)> {
+    if rec_data.len() < 8 {
+        return None;
     }
+    let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
+    let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
+    let (s, _) = read_biff8_string(rec_data, 6, &[], cp);
+    Some((row, col, s))
 }
 
-fn handle_number(rec_data: &[u8], grid: &mut GridBuilder, xf_styles: &XfStyles) {
-    if rec_data.len() >= 14 {
-        let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
-        let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
-        let ixfe = u16::from_le_bytes([rec_data[4], rec_data[5]]);
-        let val = f64::from_le_bytes([
-            rec_data[6],
-            rec_data[7],
-            rec_data[8],
-            rec_data[9],
-            rec_data[10],
-            rec_data[11],
-            rec_data[12],
-            rec_data[13],
-        ]);
-        grid.push(row, col, format_maybe_date(val, ixfe, xf_styles));
+fn handle_number(rec_data: &[u8], xf_styles: &XfStyles) -> Option<(u16, u16, String)> {
+    if rec_data.len() < 14 {
+        return None;
     }
+    let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
+    let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
+    let ixfe = u16::from_le_bytes([rec_data[4], rec_data[5]]);
+    let val = f64::from_le_bytes([
+        rec_data[6],
+        rec_data[7],
+        rec_data[8],
+        rec_data[9],
+        rec_data[10],
+        rec_data[11],
+        rec_data[12],
+        rec_data[13],
+    ]);
+    Some((row, col, format_maybe_date(val, ixfe, xf_styles)))
 }
 
-fn handle_rk(rec_data: &[u8], grid: &mut GridBuilder, xf_styles: &XfStyles) {
-    if rec_data.len() >= 10 {
-        let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
-        let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
-        let ixfe = u16::from_le_bytes([rec_data[4], rec_data[5]]);
-        let rk = u32::from_le_bytes([rec_data[6], rec_data[7], rec_data[8], rec_data[9]]);
-        grid.push(row, col, format_maybe_date(decode_rk(rk), ixfe, xf_styles));
+fn handle_rk(rec_data: &[u8], xf_styles: &XfStyles) -> Option<(u16, u16, String)> {
+    if rec_data.len() < 10 {
+        return None;
     }
+    let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
+    let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
+    let ixfe = u16::from_le_bytes([rec_data[4], rec_data[5]]);
+    let rk = u32::from_le_bytes([rec_data[6], rec_data[7], rec_data[8], rec_data[9]]);
+    Some((row, col, format_maybe_date(decode_rk(rk), ixfe, xf_styles)))
 }
 
-fn handle_mulrk(rec_data: &[u8], grid: &mut GridBuilder, xf_styles: &XfStyles) {
-    if rec_data.len() >= 6 {
-        let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
-        let first_col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
-        let last_col =
-            u16::from_le_bytes([rec_data[rec_data.len() - 2], rec_data[rec_data.len() - 1]]);
-        let mut pos = 4;
-        for c in first_col..=last_col {
-            if pos + 6 > rec_data.len() - 2 {
-                break;
-            }
-            // Each MULRK entry: 2 bytes ixfe + 4 bytes RK value
-            let ixfe = u16::from_le_bytes([rec_data[pos], rec_data[pos + 1]]);
-            let rk = u32::from_le_bytes([
-                rec_data[pos + 2],
-                rec_data[pos + 3],
-                rec_data[pos + 4],
-                rec_data[pos + 5],
-            ]);
-            grid.push(row, c, format_maybe_date(decode_rk(rk), ixfe, xf_styles));
-            pos += 6;
+fn handle_mulrk(rec_data: &[u8], xf_styles: &XfStyles) -> Vec<(u16, u16, String)> {
+    let mut cells = Vec::new();
+    if rec_data.len() < 6 {
+        return cells;
+    }
+    let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
+    let first_col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
+    let last_col = u16::from_le_bytes([rec_data[rec_data.len() - 2], rec_data[rec_data.len() - 1]]);
+    let mut pos = 4;
+    for c in first_col..=last_col {
+        if pos + 6 > rec_data.len() - 2 {
+            break;
         }
+        let ixfe = u16::from_le_bytes([rec_data[pos], rec_data[pos + 1]]);
+        let rk = u32::from_le_bytes([
+            rec_data[pos + 2],
+            rec_data[pos + 3],
+            rec_data[pos + 4],
+            rec_data[pos + 5],
+        ]);
+        cells.push((row, c, format_maybe_date(decode_rk(rk), ixfe, xf_styles)));
+        pos += 6;
     }
+    cells
 }
 
 fn handle_formula(
     rec_data: &[u8],
-    grid: &mut GridBuilder,
     pending_string_cell: &mut Option<(u16, u16)>,
     xf_styles: &XfStyles,
-) {
+) -> Option<(u16, u16, String)> {
     if rec_data.len() < 20 {
-        return;
+        return None;
     }
     let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
     let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
     let ixfe = u16::from_le_bytes([rec_data[4], rec_data[5]]);
     let result_bytes = &rec_data[6..14];
 
-    // Special type (string, bool, error, empty) indicated by 0xFFFF marker
     if result_bytes[6] == 0xFF && result_bytes[7] == 0xFF {
         match result_bytes[0] {
             0 => {
-                // String result — follows in a STRING record
                 *pending_string_cell = Some((row, col));
+                None
             }
             1 => {
                 let val = if result_bytes[2] != 0 {
@@ -659,11 +942,10 @@ fn handle_formula(
                 } else {
                     "FALSE"
                 };
-                grid.push(row, col, val.to_string());
+                Some((row, col, val.to_string()))
             }
-            // 2 = error, skip. 3 = empty string.
-            3 => grid.push(row, col, String::new()),
-            _ => {}
+            3 => Some((row, col, String::new())),
+            _ => None,
         }
     } else {
         let val = f64::from_le_bytes([
@@ -676,63 +958,35 @@ fn handle_formula(
             result_bytes[6],
             result_bytes[7],
         ]);
-        grid.push(row, col, format_maybe_date(val, ixfe, xf_styles));
+        Some((row, col, format_maybe_date(val, ixfe, xf_styles)))
     }
 }
 
 fn handle_string(
     rec_data: &[u8],
-    grid: &mut GridBuilder,
     pending_string_cell: &mut Option<(u16, u16)>,
     cp: u16,
-) {
-    if let Some((row, col)) = pending_string_cell.take() {
-        if rec_data.len() >= 3 {
-            let (s, _) = read_biff8_string(rec_data, 0, &[], cp);
-            grid.push(row, col, s);
-        }
+) -> Option<(u16, u16, String)> {
+    let (row, col) = pending_string_cell.take()?;
+    if rec_data.len() < 3 {
+        return None;
     }
+    let (s, _) = read_biff8_string(rec_data, 0, &[], cp);
+    Some((row, col, s))
 }
 
-fn handle_boolerr(rec_data: &[u8], grid: &mut GridBuilder) {
-    if rec_data.len() >= 8 {
-        let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
-        let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
-        let is_error = rec_data[7];
-        if is_error == 0 {
-            let val = if rec_data[6] != 0 { "TRUE" } else { "FALSE" };
-            grid.push(row, col, val.to_string());
-        }
+fn handle_boolerr(rec_data: &[u8]) -> Option<(u16, u16, String)> {
+    if rec_data.len() < 8 {
+        return None;
     }
-}
-
-/// Maximum grid cells to allocate (defense-in-depth against crafted files
-/// with extreme row/col indices that would cause OOM).
-const MAX_GRID_CELLS: usize = 1_000_000;
-
-/// Convert sparse cell list into a dense 2D grid.
-///
-/// Returns an empty grid if the dimensions would exceed `MAX_GRID_CELLS`.
-fn cells_to_grid(cells: Vec<Cell>, max_row: usize, max_col: usize) -> Vec<Vec<String>> {
-    if max_row
-        .checked_mul(max_col)
-        .is_none_or(|n| n > MAX_GRID_CELLS)
-    {
-        // Dimensions too large — return empty rather than OOM
-        return Vec::new();
+    let row = u16::from_le_bytes([rec_data[0], rec_data[1]]);
+    let col = u16::from_le_bytes([rec_data[2], rec_data[3]]);
+    let is_error = rec_data[7];
+    if is_error != 0 {
+        return None;
     }
-
-    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); max_col]; max_row];
-
-    for cell in cells {
-        let r = usize::from(cell.row);
-        let c = usize::from(cell.col);
-        if r < max_row && c < max_col {
-            grid[r][c] = cell.value;
-        }
-    }
-
-    grid
+    let val = if rec_data[6] != 0 { "TRUE" } else { "FALSE" };
+    Some((row, col, val.to_string()))
 }
 
 // ── Date-aware number formatting ────────────────────────────────────
@@ -1018,50 +1272,6 @@ mod tests {
         assert!(parse_boundsheet(&data, 1252).is_none());
     }
 
-    // ── cells_to_grid ─────────────────────────────────────────────
-
-    #[test]
-    fn grid_basic() {
-        let cells = vec![
-            Cell {
-                row: 0,
-                col: 0,
-                value: "A".into(),
-            },
-            Cell {
-                row: 0,
-                col: 1,
-                value: "B".into(),
-            },
-            Cell {
-                row: 1,
-                col: 0,
-                value: "C".into(),
-            },
-        ];
-        let grid = cells_to_grid(cells, 2, 2);
-        assert_eq!(grid.len(), 2);
-        assert_eq!(grid[0], vec!["A", "B"]);
-        assert_eq!(grid[1], vec!["C", ""]);
-    }
-
-    #[test]
-    fn grid_sparse() {
-        let cells = vec![Cell {
-            row: 0,
-            col: 2,
-            value: "X".into(),
-        }];
-        let grid = cells_to_grid(cells, 1, 3);
-        assert_eq!(grid[0], vec!["", "", "X"]);
-    }
-
-    #[test]
-    fn grid_empty() {
-        let grid = cells_to_grid(Vec::new(), 0, 0);
-        assert!(grid.is_empty());
-    }
-
     // ── parse_sst ─────────────────────────────────────────────────
 
     #[test]
@@ -1074,8 +1284,11 @@ mod tests {
             0x02, 0x00, 0x00, b'H', b'i', // String 2: "Go" compressed
             0x02, 0x00, 0x00, b'G', b'o',
         ];
-        let strings = parse_sst(&data, &[data.len()], 1252);
-        assert_eq!(strings, vec!["Hi", "Go"]);
+        let mut arena = StringArena::new();
+        parse_sst(&data, &[data.len()], 1252, &mut arena);
+        assert_eq!(arena.get(0), Some("Hi"));
+        assert_eq!(arena.get(1), Some("Go"));
+        assert_eq!(arena.len(), 2);
     }
 
     #[test]
@@ -1086,15 +1299,18 @@ mod tests {
             // String: "A" in unicode
             0x01, 0x00, 0x01, 0x41, 0x00,
         ];
-        let strings = parse_sst(&data, &[data.len()], 1252);
-        assert_eq!(strings, vec!["A"]);
+        let mut arena = StringArena::new();
+        parse_sst(&data, &[data.len()], 1252, &mut arena);
+        assert_eq!(arena.get(0), Some("A"));
+        assert_eq!(arena.len(), 1);
     }
 
     #[test]
     fn sst_empty() {
         let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let strings = parse_sst(&data, &[data.len()], 1252);
-        assert!(strings.is_empty());
+        let mut arena = StringArena::new();
+        parse_sst(&data, &[data.len()], 1252, &mut arena);
+        assert_eq!(arena.len(), 0);
     }
 
     // ── SST with CONTINUE boundary ────────────────────────────────
@@ -1114,8 +1330,9 @@ mod tests {
         data.push(0x00);
         data.extend_from_slice(b"llo");
 
-        let strings = parse_sst(&data, &[boundary], 1252);
-        assert_eq!(strings, vec!["Hello"]);
+        let mut arena = StringArena::new();
+        parse_sst(&data, &[boundary], 1252, &mut arena);
+        assert_eq!(arena.get(0), Some("Hello"));
     }
 
     #[test]
@@ -1133,7 +1350,174 @@ mod tests {
         // "BC" in UTF-16LE
         data.extend_from_slice(&[0x42, 0x00, 0x43, 0x00]);
 
-        let strings = parse_sst(&data, &[boundary], 1252);
-        assert_eq!(strings, vec!["ABC"]);
+        let mut arena = StringArena::new();
+        parse_sst(&data, &[boundary], 1252, &mut arena);
+        assert_eq!(arena.get(0), Some("ABC"));
+    }
+
+    // ── streaming extract (OLE fixtures) ──────────────────────────
+
+    use std::io::Write;
+
+    fn rec(rec_type: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&rec_type.to_le_bytes());
+        out.extend_from_slice(&(u16::try_from(data.len()).unwrap()).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn bof(dt: u16) -> Vec<u8> {
+        let mut data = vec![0; 16];
+        data[0..2].copy_from_slice(&0x0600u16.to_le_bytes());
+        data[2..4].copy_from_slice(&dt.to_le_bytes());
+        rec(REC_BOF, &data)
+    }
+
+    fn eof() -> Vec<u8> {
+        rec(REC_EOF, &[])
+    }
+
+    fn boundsheet(bof_offset: u32, name: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&bof_offset.to_le_bytes());
+        data.push(0);
+        data.push(0);
+        data.push(u8::try_from(name.len()).unwrap());
+        data.push(0);
+        data.extend_from_slice(name.as_bytes());
+        rec(REC_BOUNDSHEET, &data)
+    }
+
+    fn label(row: u16, col: u16, text: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&row.to_le_bytes());
+        data.extend_from_slice(&col.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&(u16::try_from(text.len()).unwrap()).to_le_bytes());
+        data.push(0);
+        data.extend_from_slice(text.as_bytes());
+        rec(REC_LABEL, &data)
+    }
+
+    fn ole_workbook(workbook: &[u8]) -> Vec<u8> {
+        let mut cfb = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+        {
+            let mut stream = cfb.create_stream("/Workbook").unwrap();
+            stream.write_all(workbook).unwrap();
+        }
+        cfb.flush().unwrap();
+        cfb.into_inner().into_inner()
+    }
+
+    fn xls_with_label(row: u16, col: u16, text: &str) -> Vec<u8> {
+        xls_with_sheets(&[("Sheet1", vec![label(row, col, text)])])
+    }
+
+    fn xls_with_sheets(sheets: &[(&str, Vec<Vec<u8>>)]) -> Vec<u8> {
+        let sheet_payloads: Vec<Vec<u8>> = sheets
+            .iter()
+            .map(|(_, cells)| {
+                let mut sheet = bof(0x0010);
+                for cell in cells {
+                    sheet.extend_from_slice(cell);
+                }
+                sheet.extend_from_slice(&eof());
+                sheet
+            })
+            .collect();
+
+        let boundsheet_lens: Vec<usize> = sheets.iter().map(|(name, _)| 12 + name.len()).collect();
+        let globals_len: usize = 20 + boundsheet_lens.iter().sum::<usize>() + 4;
+
+        let mut workbook = bof(0x0005);
+        let mut offset = globals_len;
+        for ((name, _), payload) in sheets.iter().zip(sheet_payloads.iter()) {
+            workbook.extend_from_slice(&boundsheet(u32::try_from(offset).unwrap(), name));
+            offset += payload.len();
+        }
+        workbook.extend_from_slice(&eof());
+        for payload in &sheet_payloads {
+            workbook.extend_from_slice(payload);
+        }
+        ole_workbook(&workbook)
+    }
+
+    fn two_row_xls() -> Vec<u8> {
+        xls_with_sheets(&[(
+            "Sheet1",
+            vec![
+                label(0, 0, "Name"),
+                label(0, 1, "Age"),
+                label(1, 0, "Alice"),
+                label(1, 1, "30"),
+            ],
+        )])
+    }
+
+    #[test]
+    fn xls_plain_rejects_col_512() {
+        let data = xls_with_label(0, 512, "X");
+        let err = crate::extract_plain(&data, crate::Format::Xls)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "sheet exceeds 512 columns");
+    }
+
+    #[test]
+    fn xls_plain_accepts_col_511() {
+        let data = xls_with_label(0, 511, "X");
+        let text = crate::extract_plain(&data, crate::Format::Xls).unwrap();
+        assert!(text.contains("X"));
+    }
+
+    #[test]
+    fn xls_plain_to_equals_extract_plain_on_current_fixtures() {
+        let data = two_row_xls();
+        let buffered = extract_plain(&data).unwrap();
+        let mut streamed = String::new();
+        extract_plain_to(&data, &mut streamed).unwrap();
+        assert_eq!(buffered, streamed);
+        assert_eq!(buffered, "Name\tAge\nAlice\t30\n");
+    }
+
+    #[test]
+    fn xls_markdown_two_rows_locked() {
+        let data = two_row_xls();
+        let md = extract_markdown(&data).unwrap();
+        assert_eq!(md, "| Name | Age |\n| --- | --- |\n| Alice | 30 |\n\n");
+    }
+
+    #[test]
+    fn xls_plain_multi_sheet_headers() {
+        let data = xls_with_sheets(&[
+            ("People", vec![label(0, 0, "Alice")]),
+            ("Places", vec![label(0, 0, "NYC")]),
+        ]);
+        let text = extract_plain(&data).unwrap();
+        assert_eq!(text, "Alice\n\n--- Places ---\nNYC\n");
+    }
+
+    #[test]
+    fn xls_markdown_multi_sheet_headings() {
+        let data = xls_with_sheets(&[
+            ("People", vec![label(0, 0, "Alice")]),
+            ("Places", vec![label(0, 0, "NYC")]),
+        ]);
+        let md = extract_markdown(&data).unwrap();
+        assert_eq!(
+            md,
+            "## People\n\n| Alice |\n| --- |\n\n## Places\n\n| NYC |\n| --- |\n\n"
+        );
+    }
+
+    #[test]
+    fn xls_markdown_skips_empty_sheet_and_omits_single_heading() {
+        let data = xls_with_sheets(&[
+            ("Empty", vec![label(0, 0, "  ")]),
+            ("Data", vec![label(0, 0, "Hello")]),
+        ]);
+        let md = extract_markdown(&data).unwrap();
+        assert_eq!(md, "| Hello |\n| --- |\n\n");
     }
 }

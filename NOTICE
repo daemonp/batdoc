@@ -1,0 +1,10 @@
+batdoc includes or derives from:
+
+- pdf-extract 0.10 (https://github.com/jrmuizel/pdf-extract), MIT license,
+  Jeff Muizelaar and Mozilla contributors — vendored with modifications
+  under crates/pdf-extract (panic-free decoding, glyph recovery).
+- liteparse (https://github.com/run-llama/liteparse), Apache-2.0 — PDF
+  layout algorithms (reading order, columns, headings, tables, OCR merge)
+  reimplemented in batdoc-core/src/pdf_layout.rs, pdf_ocr.rs, and
+  crates/pdf-extract/src/font_cmap.rs. No liteparse code or data tables
+  were copied.

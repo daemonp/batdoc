@@ -2,7 +2,8 @@
 //!
 //! Reads legacy OLE2 `.doc` and `.xls`, modern OOXML `.docx`, `.xlsx`, and
 //! `.pptx`, PDF, and raster image files and dumps their text to stdout. Image
-//! files are always OCR'd; embedded images and textless PDF pages are OCR'd
+//! files are always OCR'd; textless PDF pages are OCR'd automatically as a
+//! fallback (a textless PDF is a scan). Embedded images in DOCX/PPTX are OCR'd
 //! with `--ocr`. When stdout is a terminal the output is pretty-printed as
 //! syntax-highlighted markdown via `bat`; when piped, plain text is emitted.
 
@@ -24,7 +25,7 @@ Options:
   -p, --plain       Force plain text output (no colors, no decorations)
   -m, --markdown    Output as markdown (default when terminal detected)
   -i, --images      Embed images as inline base64 data URIs in markdown
-      --ocr         OCR text from images (embedded doc images, textless PDF pages)
+      --ocr         OCR embedded images (docx/pptx); textless PDFs already auto-OCR
   -h, --help        Show this help
 
 When stdout is a terminal, output is pretty-printed as syntax-highlighted
@@ -37,8 +38,9 @@ Ignored in plain text mode and for formats without image support (.doc, .xls, .p
 
 --ocr uses the ocrs engine (models downloaded on first use to
 $BATDOC_MODELS_DIR, $XDG_CACHE_HOME/batdoc/models, or ~/.cache/batdoc/models).
-For .docx/.pptx, embedded images are OCR'd; for .pdf, pages without a text
-layer are OCR'd from their embedded images. Image files (.png/.jpg/.gif/
+For .docx/.pptx, embedded images are OCR'd. PDFs need no flag: any page
+without a text layer is OCR'd automatically from its embedded images as a
+fallback (a textless PDF is a scan). Image files (.png/.jpg/.gif/
 .webp/.bmp) are always OCR'd, with or without --ocr.
 
 Multiple files can be specified and will be processed in order.
@@ -156,7 +158,11 @@ fn run(
         io::stdout().write_all(b"\n")?;
     }
 
-    let opts = ExtractOptions { images, ocr };
+    let opts = ExtractOptions {
+        images,
+        ocr,
+        ..Default::default()
+    };
 
     // OCR input (flagged, or image input which is always OCR'd) downloads
     // models on first use; say so once per process, before it happens.
@@ -172,15 +178,16 @@ fn run(
 
     match mode {
         Mode::Plain => {
-            let text = batdoc_core::extract_plain_with(data, format, opts)?;
-            io::stdout().write_all(text.as_bytes())?;
+            let mut sink = batdoc_core::IoSink(io::stdout());
+            batdoc_core::extract_plain_to(data, format, opts, &mut sink)?;
         }
         Mode::Markdown => {
-            let md = batdoc_core::extract_markdown_with(data, format, opts)?;
             if is_tty && format != Format::Image {
+                let md = batdoc_core::extract_markdown_with(data, format, opts)?;
                 pretty_print(&md, filename)?;
             } else {
-                io::stdout().write_all(md.as_bytes())?;
+                let mut sink = batdoc_core::IoSink(io::stdout());
+                batdoc_core::extract_markdown_to(data, format, opts, &mut sink)?;
             }
         }
         Mode::Auto => {
@@ -188,8 +195,8 @@ fn run(
                 let md = batdoc_core::extract_markdown_with(data, format, opts)?;
                 pretty_print(&md, filename)?;
             } else {
-                let text = batdoc_core::extract_plain_with(data, format, opts)?;
-                io::stdout().write_all(text.as_bytes())?;
+                let mut sink = batdoc_core::IoSink(io::stdout());
+                batdoc_core::extract_plain_to(data, format, opts, &mut sink)?;
             }
         }
     }

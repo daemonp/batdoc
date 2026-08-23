@@ -201,6 +201,17 @@ fn normalize_zip_path(path: &str) -> String {
     parts.join("/")
 }
 
+pub(crate) type XmlReader<'a> = Reader<std::io::BufReader<zip::read::ZipFile<'a>>>;
+
+/// Open a ZIP entry as a streaming `quick_xml` reader.
+pub(crate) fn open_xml<'arc>(
+    archive: &'arc mut ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> crate::error::Result<XmlReader<'arc>> {
+    let entry = archive.by_name(path)?;
+    Ok(Reader::from_reader(std::io::BufReader::new(entry)))
+}
+
 /// Compute the `_rels` file path for a given OOXML part path.
 ///
 /// For `xl/worksheets/sheet1.xml`, returns `xl/worksheets/_rels/sheet1.xml.rels`.
@@ -369,5 +380,51 @@ mod tests {
             normalize_zip_path("xl/media/image1.png"),
             "xl/media/image1.png"
         );
+    }
+
+    // ── open_xml ──────────────────────────────────────────────────
+
+    #[test]
+    fn open_xml_reads_streamed_entry() {
+        use std::io::{Cursor, Write};
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            zw.start_file("hi.xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(br#"<root><item id="1"/></root>"#).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        let mut reader = open_xml(&mut archive, "hi.xml").unwrap();
+        let mut buf = Vec::new();
+        let mut found = false;
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Empty(ref e)) if e.local_name().as_ref() == b"item" => {
+                    assert_eq!(get_attr(e, b"id").as_deref(), Some("1"));
+                    found = true;
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn open_xml_missing_entry_is_err() {
+        use std::io::{Cursor, Write};
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            zw.start_file("other.xml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"<x/>").unwrap();
+            zw.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        assert!(open_xml(&mut archive, "hi.xml").is_err());
     }
 }

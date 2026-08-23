@@ -253,6 +253,7 @@ fn ocr_docx_embedded_image_markdown() {
         ExtractOptions {
             images: true,
             ocr: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -267,6 +268,7 @@ fn ocr_docx_embedded_image_markdown() {
         ExtractOptions {
             images: true,
             ocr: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -278,20 +280,36 @@ fn ocr_docx_embedded_image_markdown() {
 #[ignore = "requires OCR models (downloaded on first use)"]
 fn ocr_pdf_embedded_image_page() {
     let pdf = build_pdf_with_image(&render_test_image());
-    // Today's behavior: no --ocr → clean error.
-    let err = batdoc_core::extract_plain_with(&pdf, Format::Pdf, ExtractOptions::default())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("scanned/image-only"), "got: {err}");
-    // With --ocr → OCR'd text.
+    // A textless PDF auto-falls back to OCR even without --ocr…
+    let auto =
+        batdoc_core::extract_plain_with(&pdf, Format::Pdf, ExtractOptions::default()).unwrap();
+    assert!(auto.contains("123"), "auto OCR text missing: {auto:?}");
+    // …and an explicit --ocr behaves identically.
     let text = batdoc_core::extract_plain_with(
         &pdf,
         Format::Pdf,
         ExtractOptions {
             ocr: true,
             images: false,
+            ..Default::default()
         },
     )
     .unwrap();
     assert!(text.contains("123"), "OCR text missing: {text:?}");
+}
+
+#[test]
+#[ignore = "requires OCR models (downloaded on first use)"]
+fn ocr_pdf_markdown_mode_region_merge() {
+    let pdf = build_pdf_with_image(&render_test_image());
+    // Markdown mode on a textless PDF must also run OCR and include the
+    // recognized text via the region-merge path. (Note this is *not* shared
+    // with plain mode: `extract_plain` textless pages fall back to the
+    // page-end `ocr_page` append instead.)
+    let md = batdoc_core::extract_markdown(&pdf, Format::Pdf, false).unwrap();
+    assert!(md.contains("123"), "OCR text missing in markdown: {md:?}");
+    assert!(
+        md.contains("BATDOC"),
+        "OCR text missing in markdown: {md:?}"
+    );
 }

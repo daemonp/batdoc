@@ -6,9 +6,11 @@
 
 use crate::error::{BatdocError, Result};
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams};
+#[cfg(feature = "net")]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(feature = "net")]
 use std::time::Duration;
 
 /// Detection model (text regions). 2.4 MB.
@@ -21,11 +23,14 @@ const DETECTION_MODEL_FILE: &str = "text-detection.rten";
 const RECOGNITION_MODEL_FILE: &str = "text-recognition.rten";
 
 /// Network timeout for model downloads.
+#[cfg(feature = "net")]
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(2);
 /// Maximum accepted model download size (the real models are 2.4 MB and
 /// 9.3 MB; a larger response means a compromised/redirected URL).
+#[cfg(feature = "net")]
 const MAX_MODEL_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Age after which leftover `*.tmp.<pid>` download files are swept.
+#[cfg(feature = "net")]
 const STALE_TMP_AGE: Duration = Duration::from_hours(1);
 
 /// Resolve the model cache directory, in priority order. Injectable for testing.
@@ -55,6 +60,7 @@ fn cache_dir() -> PathBuf {
 ///
 /// Writes to a `.tmp` sibling and renames, so concurrent processes cannot
 /// observe a partially written model.
+#[cfg(feature = "net")]
 fn ensure_file(path: &Path, url: &str) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -107,9 +113,25 @@ fn ensure_file(path: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Without network support (no `net` feature), model files must already be
+/// present locally — e.g. pre-seeded via `$BATDOC_MODELS_DIR` or embedded by
+/// the caller. Loading and inference still work; only acquisition is gated.
+#[cfg(not(feature = "net"))]
+fn ensure_file(path: &Path, _url: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    Err(BatdocError::Document(format!(
+        "OCR model {} not found; this build has no network support — \
+         seed it via BATDOC_MODELS_DIR or embed it before use",
+        path.display()
+    )))
+}
+
 /// Remove stale `*.tmp.<pid>` download leftovers in `dir` (from interrupted
 /// runs). Only files older than [`STALE_TMP_AGE`] are touched, so an active
 /// concurrent download is never disturbed. Best-effort: errors ignored.
+#[cfg(feature = "net")]
 fn sweep_stale_tmp_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -127,6 +149,7 @@ fn sweep_stale_tmp_files(dir: &Path) {
 }
 
 /// `true` for `*.tmp.<pid>` download leftovers older than [`STALE_TMP_AGE`].
+#[cfg(feature = "net")]
 fn is_stale_tmp_file(name: &str, modified: Option<std::time::SystemTime>) -> bool {
     name.contains(".tmp.")
         && modified
@@ -143,6 +166,7 @@ struct ModelPaths {
 /// Ensure both model files exist locally, downloading when needed.
 fn ensure_models() -> Result<ModelPaths> {
     let dir = cache_dir();
+    #[cfg(feature = "net")]
     sweep_stale_tmp_files(&dir);
     let detection = dir.join(DETECTION_MODEL_FILE);
     let recognition = dir.join(RECOGNITION_MODEL_FILE);
@@ -212,6 +236,106 @@ pub(crate) fn ocr_rgb_image(img: &image::RgbImage) -> Result<Option<String>> {
     } else {
         Ok(Some(text.to_string()))
     }
+}
+
+/// One recognized OCR line with its pixel-space bounding box (top-left
+/// origin, y-down, same orientation as the input image).
+pub(crate) struct OcrTextLine {
+    pub text: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Minimum glyphs for an OCR line to be kept (junk filter replacing the
+/// confidence gate ocrs 0.12 doesn't provide, spec §6).
+const MIN_OCR_LINE_CHARS: usize = 2;
+/// Minimum pixel area of an OCR line's bounding box.
+const MIN_OCR_LINE_AREA: u64 = 16;
+
+/// One glyph and its (x, y, width, height) pixel box, as extracted from
+/// an ocrs `TextChar.rect`. A plain tuple keeps the pure core testable
+/// without depending on rten-imageproc types.
+type GlyphRun = Vec<(char, (i32, i32, u32, u32))>;
+
+/// Pure core of [`ocr_rgb_image_lines`]: glyph runs → boxed, filtered
+/// lines. Takes tuples so tests need no rten-imageproc types.
+fn lines_to_boxes(lines: Vec<GlyphRun>) -> Vec<OcrTextLine> {
+    let mut out = Vec::new();
+    for line in lines {
+        let text: String = line.iter().map(|(c, _)| c).collect();
+        if text.trim().chars().count() < MIN_OCR_LINE_CHARS {
+            continue;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for (_, (x, y, w, h)) in &line {
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            // `saturating_add_unsigned` keeps w u32 without wrap semantics.
+            x1 = x1.max(x.saturating_add_unsigned(*w));
+            y1 = y1.max(y.saturating_add_unsigned(*h));
+        }
+        // Bounds are `>= 0` for a valid box; a defensive `0` on an
+        // impossible inverted box fails the area filter below.
+        let (w, h) = (
+            u32::try_from(x1 - x0).unwrap_or_default(),
+            u32::try_from(y1 - y0).unwrap_or_default(),
+        );
+        if u64::from(w) * u64::from(h) < MIN_OCR_LINE_AREA {
+            continue;
+        }
+        out.push(OcrTextLine {
+            text: text.trim().to_string(),
+            x: x0,
+            y: y0,
+            width: w,
+            height: h,
+        });
+    }
+    out
+}
+
+/// OCR an already-decoded RGB image, returning recognized lines with
+/// pixel-space bounding boxes (in reading order, as `find_text_lines`
+/// orders them). Empty when no text was detected.
+pub(crate) fn ocr_rgb_image_lines(img: &image::RgbImage) -> Result<Vec<OcrTextLine>> {
+    use ocrs::TextItem as _;
+    let source = ImageSource::from_bytes(img.as_raw(), img.dimensions())
+        .map_err(|e| BatdocError::Document(format!("OCR input preparation failed: {e}")))?;
+    let engine = engine()?;
+    let input = engine
+        .prepare_input(source)
+        .map_err(|e| BatdocError::Document(format!("OCR preprocessing failed: {e}")))?;
+    let word_rects = engine
+        .detect_words(&input)
+        .map_err(|e| BatdocError::Document(format!("OCR failed: {e}")))?;
+    let line_rects = engine.find_text_lines(&input, &word_rects);
+    let lines = engine
+        .recognize_text(&input, &line_rects)
+        .map_err(|e| BatdocError::Document(format!("OCR failed: {e}")))?;
+    let glyph_runs = lines
+        .into_iter()
+        .flatten()
+        .map(|line| {
+            line.chars()
+                .iter()
+                .map(|c| {
+                    let r = &c.rect;
+                    (
+                        c.char,
+                        (
+                            r.left(),
+                            r.top(),
+                            u32::try_from(r.width()).unwrap_or_default(),
+                            u32::try_from(r.height()).unwrap_or_default(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    Ok(lines_to_boxes(glyph_runs))
 }
 
 /// Maximum width/height accepted when decoding images for OCR. Strict
@@ -332,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "net")]
     fn stale_tmp_file_detection() {
         use std::time::SystemTime;
         // Fresh download in progress: recent mtime → keep.
@@ -363,5 +488,23 @@ mod tests {
         std::fs::write(tmp.join(RECOGNITION_MODEL_FILE), b"x").unwrap();
         assert!(models_present_in(&tmp));
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ── ocr_rgb_image_lines / lines_to_boxes ────────────────────────
+
+    #[test]
+    fn lines_to_boxes_filters_and_bounds() {
+        let lines = vec![
+            // (char, (x, y, w, h)) per glyph
+            vec![('H', (10, 20, 8, 12)), ('i', (19, 20, 4, 12))],
+            vec![('x', (0, 0, 5, 5))], // 1 char — too short
+            vec![(' ', (0, 0, 2, 2)), (' ', (3, 0, 2, 2))], // whitespace-only
+        ];
+        let out = super::lines_to_boxes(lines);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "Hi");
+        assert_eq!((out[0].x, out[0].y), (10, 20));
+        assert_eq!(out[0].width, 13); // union of glyph boxes (10..18)+(19..23)
+        assert_eq!(out[0].height, 12);
     }
 }

@@ -1,20 +1,23 @@
 //! OOXML `.docx` (Office Open XML) format parser.
 //!
-//! Unzips the `.docx` archive, parses `word/document.xml` with `quick-xml`
-//! into structured [`Block`] types (paragraphs with heading/list styles and
-//! runs with bold/italic/hyperlink, tables with rows and cells), then renders
-//! to either plain text or markdown.
+//! Unzips the `.docx` archive and streams `word/document.xml` with `quick-xml`.
+//! Paragraphs and table rows are rendered as they close and then dropped.
+//! Comments, footnotes, and endnotes are still parsed into [`Block`] trees
+//! for the trailers.
 
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::io::{Cursor, Read};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{BufRead, Cursor};
 use zip::ZipArchive;
 
 use crate::markup;
 use crate::xml_util::{self, get_attr, Rels};
 use crate::ExtractOptions;
+use crate::ExtractSink;
 
 /// Extracted document structure for rich output.
 #[derive(Debug)]
@@ -211,16 +214,26 @@ fn assign_display_indexes(notes: Vec<Note>, index: &NoteIndex) -> Vec<Note> {
 
 /// Extract plain text from a .docx file.
 pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
-    let (blocks, _, comments, footnotes, endnotes) = parse_docx(
+    let mut out = String::new();
+    extract_plain_to(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// Stream plain text from a .docx file into `sink`.
+pub(crate) fn extract_plain_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    extract_to(
         data,
         ExtractOptions {
             images: false,
             ..opts
         },
-    )?;
-    let mut out = render_plain(&blocks);
-    append_extras_plain(&mut out, &comments, &footnotes, &endnotes);
-    Ok(out)
+        Mode::Plain,
+        sink,
+    )
 }
 
 /// Extract markdown-formatted text from a .docx file.
@@ -230,16 +243,608 @@ pub(crate) fn extract_plain(data: &[u8], opts: ExtractOptions) -> crate::error::
 /// appended at the end of the document. When `opts.ocr` is set, embedded images
 /// are OCR'd and their text is rendered as a blockquote after the image.
 pub(crate) fn extract_markdown(data: &[u8], opts: ExtractOptions) -> crate::error::Result<String> {
+    let mut out = String::new();
+    extract_markdown_to(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// Stream markdown from a .docx file into `sink`.
+pub(crate) fn extract_markdown_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    extract_to(data, opts, Mode::Markdown, sink)
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Plain,
+    Markdown,
+}
+
+fn xml_error(err: quick_xml::Error) -> crate::error::BatdocError {
+    match err {
+        quick_xml::Error::Io(io) => {
+            crate::error::BatdocError::Io(std::io::Error::new(io.kind(), io.to_string()))
+        }
+        other => crate::error::BatdocError::Document(other.to_string()),
+    }
+}
+
+fn extract_to(
+    data: &[u8],
+    opts: ExtractOptions,
+    mode: Mode,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    if opts.ocr {
+        return extract_to_buffered(data, opts, mode, sink);
+    }
+    extract_to_streaming(data, opts, mode, sink)
+}
+
+fn extract_to_buffered(
+    data: &[u8],
+    opts: ExtractOptions,
+    mode: Mode,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
     let (blocks, image_defs, comments, footnotes, endnotes) = parse_docx(data, opts)?;
-    let mut md = render_markdown(&blocks);
-    append_extras_markdown(&mut md, &comments, &footnotes, &endnotes);
-    if !image_defs.is_empty() {
-        for def in &image_defs {
-            md.push_str(def);
-            md.push('\n');
+    let out = match mode {
+        Mode::Plain => {
+            let mut out = render_plain(&blocks);
+            append_extras_plain(&mut out, &comments, &footnotes, &endnotes);
+            out
+        }
+        Mode::Markdown => {
+            let mut out = render_markdown(&blocks);
+            append_extras_markdown(&mut out, &comments, &footnotes, &endnotes);
+            if !image_defs.is_empty() {
+                for def in &image_defs {
+                    out.push_str(def);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+    };
+    sink.write_str(&out)
+}
+
+struct StreamOut<'a, S: ExtractSink> {
+    sink: &'a mut S,
+    trailing_newlines: u8,
+    wrote: bool,
+    plain_first: bool,
+    image_counter: usize,
+    image_queue: Vec<(String, String)>,
+}
+
+impl<'a, S: ExtractSink> StreamOut<'a, S> {
+    const fn new(sink: &'a mut S) -> Self {
+        Self {
+            sink,
+            trailing_newlines: 0,
+            wrote: false,
+            plain_first: true,
+            image_counter: 0,
+            image_queue: Vec::new(),
         }
     }
-    Ok(md)
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn write_str(&mut self, s: &str) -> crate::error::Result<()> {
+        if s.is_empty() {
+            return Ok(());
+        }
+        self.sink.write_str(s)?;
+        self.wrote = true;
+        let bytes = s.as_bytes();
+        let mut n = 0u8;
+        for &b in bytes.iter().rev() {
+            if b == b'\n' {
+                n = n.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        // `bytes.len() < 256` makes the cast safe; n is already u8 and
+        // bounded by the trailing-newline count of the input string.
+        if n == bytes.len() as u8 && bytes.len() < 256 {
+            self.trailing_newlines = self.trailing_newlines.saturating_add(n);
+        } else {
+            self.trailing_newlines = n;
+        }
+        Ok(())
+    }
+
+    fn ensure_trailer_blank_line(&mut self) -> crate::error::Result<()> {
+        if !self.wrote || self.trailing_newlines >= 2 {
+            return Ok(());
+        }
+        if self.trailing_newlines == 1 {
+            self.write_str("\n")
+        } else {
+            self.write_str("\n\n")
+        }
+    }
+}
+
+fn extract_to_streaming(
+    data: &[u8],
+    opts: ExtractOptions,
+    mode: Mode,
+    sink: &mut impl ExtractSink,
+) -> crate::error::Result<()> {
+    let markdown = matches!(mode, Mode::Markdown);
+    let cursor = Cursor::new(data);
+    let mut archive = ZipArchive::new(cursor)?;
+
+    let rels = xml_util::load_rels(&mut archive, "word/_rels/document.xml.rels");
+    let image_rels = if opts.images {
+        xml_util::load_image_rels(&mut archive, "word/_rels/document.xml.rels")
+    } else {
+        xml_util::Rels::new()
+    };
+
+    let comments = parse_comments_part(&mut archive)?;
+    let footnotes = parse_notes_part(&mut archive, "word/footnotes.xml", b"footnote")?;
+    let endnotes = parse_notes_part(&mut archive, "word/endnotes.xml", b"endnote")?;
+
+    let mut footnotes_idx = NoteIndex::new();
+    let mut endnotes_idx = NoteIndex::new();
+    for note in &footnotes {
+        if blocks_have_text(&note.blocks) {
+            footnotes_idx.add_defined(&note.id);
+        }
+    }
+    for note in &endnotes {
+        if blocks_have_text(&note.blocks) {
+            endnotes_idx.add_defined(&note.id);
+        }
+    }
+
+    let mut images = ZipArchive::new(Cursor::new(data))?;
+    let mut out = StreamOut::new(sink);
+    {
+        let mut reader = xml_util::open_xml(&mut archive, "word/document.xml")?;
+        let mut buf = Vec::new();
+        emit_body(
+            &mut reader,
+            &mut buf,
+            &rels,
+            &image_rels,
+            &mut footnotes_idx,
+            &mut endnotes_idx,
+            markdown,
+            opts,
+            &mut images,
+            &mut out,
+        )?;
+    }
+
+    let footnotes = assign_display_indexes(footnotes, &footnotes_idx);
+    let endnotes = assign_display_indexes(endnotes, &endnotes_idx);
+
+    let mut extras = String::new();
+    match mode {
+        Mode::Plain => append_extras_plain(&mut extras, &comments, &footnotes, &endnotes),
+        Mode::Markdown => append_extras_markdown(&mut extras, &comments, &footnotes, &endnotes),
+    }
+    if !extras.is_empty() {
+        out.ensure_trailer_blank_line()?;
+        out.write_str(&extras)?;
+    }
+
+    if opts.images {
+        let queue = std::mem::take(&mut out.image_queue);
+        write_image_defs(&mut images, &queue, &mut out)?;
+    }
+
+    Ok(())
+}
+
+fn write_image_defs<S: ExtractSink>(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    queue: &[(String, String)],
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    for (id, path) in queue {
+        if let Some(data) = xml_util::read_image_from_zip(archive, path, "") {
+            if let Some(img_ref) = crate::markup::image_to_base64_ref(&data, id) {
+                out.write_str(&img_ref.definition)?;
+                out.write_str("\n")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_notes_part(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+    note_tag: &[u8],
+) -> crate::error::Result<Vec<Note>> {
+    match xml_util::open_xml(archive, path) {
+        Ok(mut reader) => {
+            let mut buf = Vec::new();
+            parse_notes_reader(&mut reader, &mut buf, note_tag)
+        }
+        Err(crate::error::BatdocError::Zip(zip::result::ZipError::FileNotFound)) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_comments_part(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+) -> crate::error::Result<Vec<Comment>> {
+    match xml_util::open_xml(archive, "word/comments.xml") {
+        Ok(mut reader) => {
+            let mut buf = Vec::new();
+            parse_comments_reader(&mut reader, &mut buf)
+        }
+        Err(crate::error::BatdocError::Zip(zip::result::ZipError::FileNotFound)) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_body<R: BufRead, S: ExtractSink>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    image_rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+    markdown: bool,
+    opts: ExtractOptions,
+    images: &mut ZipArchive<Cursor<&[u8]>>,
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    loop {
+        let kind = match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"body" => 1u8,
+            Ok(Event::Eof) | Err(_) => 2,
+            _ => 0,
+        };
+        buf.clear();
+        match kind {
+            1 => {
+                emit_block_children(
+                    reader, buf, b"body", rels, image_rels, footnotes, endnotes, markdown, opts,
+                    images, out,
+                )?;
+            }
+            2 => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_block_children<R: BufRead, S: ExtractSink>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    stop: &[u8],
+    rels: &Rels,
+    image_rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+    markdown: bool,
+    opts: ExtractOptions,
+    images: &mut ZipArchive<Cursor<&[u8]>>,
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    loop {
+        let mut start_p = false;
+        let mut start_tbl = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"p" => start_p = true,
+                b"tbl" => start_tbl = true,
+                _ => {}
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == stop => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
+            _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_p {
+            let blocks = parse_paragraph(reader, buf, rels, image_rels, footnotes, endnotes);
+            emit_parsed_blocks(blocks, markdown, opts, images, out)?;
+        } else if start_tbl {
+            emit_table(reader, buf, rels, footnotes, endnotes, markdown, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_parsed_blocks<S: ExtractSink>(
+    blocks: Vec<Block>,
+    markdown: bool,
+    opts: ExtractOptions,
+    images: &mut ZipArchive<Cursor<&[u8]>>,
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    for block in blocks {
+        match block {
+            Block::Paragraph { style, runs } => {
+                emit_paragraph(&style, &runs, markdown, out)?;
+            }
+            Block::Image { path, .. } => {
+                emit_image(&path, opts, images, out)?;
+            }
+            Block::Table { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn emit_paragraph<S: ExtractSink>(
+    style: &ParaStyle,
+    runs: &[Run],
+    markdown: bool,
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    if markdown {
+        let text = render_runs_markdown(runs);
+        let text = text.trim_end();
+        if text.is_empty() {
+            return Ok(());
+        }
+        if style.heading_level > 0 && style.heading_level <= 6 {
+            for _ in 0..style.heading_level {
+                out.write_str("#")?;
+            }
+            out.write_str(" ")?;
+            out.write_str(text)?;
+            out.write_str("\n\n")?;
+        } else if let Some(level) = style.list_level {
+            let indent = "  ".repeat(usize::from(level));
+            out.write_str(&indent)?;
+            out.write_str("- ")?;
+            out.write_str(text)?;
+            out.write_str("\n")?;
+        } else {
+            out.write_str(text)?;
+            out.write_str("\n\n")?;
+        }
+    } else {
+        let text: String = runs.iter().map(run_plain_text).collect();
+        let text = text.trim_end();
+        if text.is_empty() {
+            return Ok(());
+        }
+        if !out.plain_first {
+            out.write_str("\n")?;
+        }
+        out.write_str(text)?;
+        out.write_str("\n")?;
+        out.plain_first = false;
+    }
+    Ok(())
+}
+
+fn emit_image<S: ExtractSink>(
+    path: &str,
+    opts: ExtractOptions,
+    images: &mut ZipArchive<Cursor<&[u8]>>,
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    let Some(data) = xml_util::read_image_from_zip(images, path, "") else {
+        return Ok(());
+    };
+    if opts.images {
+        out.image_counter += 1;
+        let id = format!("image{}", out.image_counter);
+        if crate::markup::image_to_base64_ref(&data, &id).is_some() {
+            out.write_str("![][")?;
+            out.write_str(&id)?;
+            out.write_str("]\n\n")?;
+            out.image_queue.push((id, path.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn emit_table<R: BufRead, S: ExtractSink>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+    markdown: bool,
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    if markdown {
+        // Buffer just this table's rows (a table is a bounded unit), compute
+        // the maximum width, then emit all rows padded to that width — the
+        // same shape the buffered `render_block_markdown` produces for ragged
+        // tables (later rows wider than the header).
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        loop {
+            let mut start_tr = false;
+            let mut done = false;
+            match reader.read_event_into(buf) {
+                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tr" => start_tr = true,
+                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tbl" => done = true,
+                Ok(Event::Eof) | Err(_) => done = true,
+                _ => {}
+            }
+            buf.clear();
+            if done {
+                break;
+            }
+            if start_tr {
+                rows.push(parse_table_row_text(
+                    reader, buf, rels, footnotes, endnotes, markdown,
+                ));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+        if ncols == 0 {
+            return Ok(());
+        }
+
+        let mut md_rows: Vec<Vec<String>> = Vec::new();
+        for row in rows {
+            let mut md_row: Vec<String> = row
+                .into_iter()
+                .map(|cell| cell.replace('|', "\\|"))
+                .collect();
+            while md_row.len() < ncols {
+                md_row.push(String::new());
+            }
+            md_rows.push(md_row);
+        }
+
+        if let Some(header) = md_rows.first() {
+            out.write_str("| ")?;
+            out.write_str(&header.join(" | "))?;
+            out.write_str(" |\n")?;
+
+            out.write_str("|")?;
+            for _ in 0..ncols {
+                out.write_str(" --- |")?;
+            }
+            out.write_str("\n")?;
+
+            for row in md_rows.iter().skip(1) {
+                out.write_str("| ")?;
+                out.write_str(&row.join(" | "))?;
+                out.write_str(" |\n")?;
+            }
+            out.write_str("\n")?;
+        }
+        return Ok(());
+    }
+
+    loop {
+        let mut start_tr = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tr" => start_tr = true,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tbl" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
+            _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_tr {
+            let cells = parse_table_row_text(reader, buf, rels, footnotes, endnotes, markdown);
+            emit_table_row(&cells, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_table_row<S: ExtractSink>(
+    cells: &[String],
+    out: &mut StreamOut<'_, S>,
+) -> crate::error::Result<()> {
+    let line = cells.join("\t");
+    let line = line.trim_end();
+    if !line.is_empty() {
+        if !out.plain_first {
+            out.write_str("\n")?;
+        }
+        out.write_str(line)?;
+        out.write_str("\n")?;
+        out.plain_first = false;
+    }
+    Ok(())
+}
+
+fn parse_table_row_text<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+    markdown: bool,
+) -> Vec<String> {
+    let mut cells = Vec::new();
+    loop {
+        let mut start_tc = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tc" => start_tc = true,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tr" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
+            _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_tc {
+            cells.push(parse_table_cell_text(
+                reader, buf, rels, footnotes, endnotes, markdown,
+            ));
+        }
+    }
+    cells
+}
+
+fn parse_table_cell_text<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    rels: &Rels,
+    footnotes: &mut NoteIndex,
+    endnotes: &mut NoteIndex,
+    markdown: bool,
+) -> String {
+    let empty_image_rels = xml_util::Rels::new();
+    let mut parts = Vec::new();
+    loop {
+        let mut start_p = false;
+        let mut start_tbl = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"p" => start_p = true,
+                b"tbl" => start_tbl = true,
+                _ => {}
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tc" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
+            _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_p {
+            let blocks = parse_paragraph(reader, buf, rels, &empty_image_rels, footnotes, endnotes);
+            for block in blocks {
+                if let Block::Paragraph { runs, .. } = block {
+                    let t = if markdown {
+                        render_runs_markdown(&runs)
+                    } else {
+                        runs.iter().map(run_plain_text).collect::<String>()
+                    };
+                    let t = t.trim().to_string();
+                    if !t.is_empty() {
+                        parts.push(t);
+                    }
+                }
+            }
+        } else if start_tbl {
+            skip_element(reader, buf);
+        }
+    }
+    parts.join(" ")
 }
 
 /// What [`parse_docx`] produces: body blocks, image reference definitions,
@@ -254,6 +859,7 @@ type DocxOutput = (Vec<Block>, Vec<String>, Vec<Comment>, Vec<Note>, Vec<Note>);
 /// (corrupt deflate data, truncated entry, archive I/O failure) fails the
 /// extract with a [`crate::error::BatdocError`]; it is NOT treated as
 /// missing.
+#[cfg(test)]
 fn read_optional_part(
     archive: &mut ZipArchive<Cursor<&[u8]>>,
     name: &str,
@@ -295,22 +901,10 @@ fn parse_docx(data: &[u8], opts: ExtractOptions) -> crate::error::Result<DocxOut
 
     // Optional extras parts: missing parts parse to empty vectors, keeping
     // docs without comments/footnotes/endnotes identical to before.
-    let comments = read_optional_part(&mut archive, "word/comments.xml")?
-        .map(|xml| parse_comments_xml(&xml))
-        .unwrap_or_default();
-    let footnotes = read_optional_part(&mut archive, "word/footnotes.xml")?
-        .map(|xml| parse_footnotes_xml(&xml))
-        .unwrap_or_default();
-    let endnotes = read_optional_part(&mut archive, "word/endnotes.xml")?
-        .map(|xml| parse_endnotes_xml(&xml))
-        .unwrap_or_default();
+    let comments = parse_comments_part(&mut archive)?;
+    let footnotes = parse_notes_part(&mut archive, "word/footnotes.xml", b"footnote")?;
+    let endnotes = parse_notes_part(&mut archive, "word/endnotes.xml", b"endnote")?;
 
-    let mut xml = String::new();
-    archive
-        .by_name("word/document.xml")?
-        .read_to_string(&mut xml)?;
-
-    let mut reader = Reader::from_str(&xml);
     let mut blocks = Vec::new();
 
     // Seed the note indexes with the parsed definitions so body references
@@ -333,14 +927,19 @@ fn parse_docx(data: &[u8], opts: ExtractOptions) -> crate::error::Result<DocxOut
             endnotes_idx.add_defined(&note.id);
         }
     }
-    parse_body(
-        &mut reader,
-        &mut blocks,
-        &rels,
-        &image_rels,
-        &mut footnotes_idx,
-        &mut endnotes_idx,
-    );
+    {
+        let mut reader = xml_util::open_xml(&mut archive, "word/document.xml")?;
+        let mut buf = Vec::new();
+        parse_body(
+            &mut reader,
+            &mut buf,
+            &mut blocks,
+            &rels,
+            &image_rels,
+            &mut footnotes_idx,
+            &mut endnotes_idx,
+        );
+    }
 
     // Record the display indexes the body walk assigned to each definition;
     // notes never referenced keep 0.
@@ -363,8 +962,9 @@ fn parse_docx(data: &[u8], opts: ExtractOptions) -> crate::error::Result<DocxOut
 ///
 /// The block children of `<w:body>` are collected via the shared
 /// [`parse_block_children`] walker; anything outside the body is ignored.
-fn parse_body(
-    reader: &mut Reader<&[u8]>,
+fn parse_body<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     blocks: &mut Vec<Block>,
     rels: &Rels,
     image_rels: &Rels,
@@ -372,13 +972,19 @@ fn parse_body(
     endnotes: &mut NoteIndex,
 ) {
     loop {
-        match &reader.read_event() {
-            Ok(Event::Start(e)) if e.local_name().as_ref() == b"body" => {
+        let kind = match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"body" => 1u8,
+            Ok(Event::Eof) | Err(_) => 2,
+            _ => 0,
+        };
+        buf.clear();
+        match kind {
+            1 => {
                 blocks.extend(parse_block_children(
-                    reader, b"body", rels, image_rels, footnotes, endnotes,
+                    reader, buf, b"body", rels, image_rels, footnotes, endnotes,
                 ));
             }
-            Ok(Event::Eof) | Err(_) => break,
+            2 => break,
             _ => {}
         }
     }
@@ -393,8 +999,9 @@ fn parse_body(
 /// paragraph/table machinery. Extra parts pass empty `Rels` and empty note
 /// indexes: hyperlinks are not resolved inside definitions and nested note
 /// references produce no markers there.
-fn parse_block_children(
-    reader: &mut Reader<&[u8]>,
+fn parse_block_children<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     stop: &[u8],
     rels: &Rels,
     image_rels: &Rels,
@@ -403,21 +1010,29 @@ fn parse_block_children(
 ) -> Vec<Block> {
     let mut blocks = Vec::new();
     loop {
-        match &reader.read_event() {
-            Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                b"p" => {
-                    let mut para_blocks =
-                        parse_paragraph(reader, rels, image_rels, footnotes, endnotes);
-                    blocks.append(&mut para_blocks);
-                }
-                b"tbl" => {
-                    blocks.push(parse_table(reader, rels, footnotes, endnotes));
-                }
+        let mut start_p = false;
+        let mut start_tbl = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"p" => start_p = true,
+                b"tbl" => start_tbl = true,
                 _ => {}
             },
-            Ok(Event::End(e)) if e.local_name().as_ref() == stop => break,
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == stop => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_p {
+            let mut para_blocks =
+                parse_paragraph(reader, buf, rels, image_rels, footnotes, endnotes);
+            blocks.append(&mut para_blocks);
+        } else if start_tbl {
+            blocks.push(parse_table(reader, buf, rels, footnotes, endnotes));
         }
     }
     blocks
@@ -431,20 +1046,25 @@ fn parse_block_children(
 /// ends only when the opened element itself closes, so nested elements
 /// reusing the same local name are swallowed as part of the subtree instead
 /// of ending the skip early.
-fn skip_element(reader: &mut Reader<&[u8]>) {
+fn skip_element<R: BufRead>(reader: &mut Reader<R>, buf: &mut Vec<u8>) {
     let mut depth = 1u32;
     loop {
-        match &reader.read_event() {
+        match reader.read_event_into(buf) {
             Ok(Event::Start(_)) => depth += 1,
             Ok(Event::End(_)) => {
                 depth -= 1;
                 if depth == 0 {
+                    buf.clear();
                     break;
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => {
+                buf.clear();
+                break;
+            }
             _ => {}
         }
+        buf.clear();
     }
 }
 
@@ -459,8 +1079,18 @@ fn skip_element(reader: &mut Reader<&[u8]>) {
 ///   (`w:footnoteRef`/`w:endnoteRef`) are skipped by `parse_run` so they
 ///   never leak text, and nested note references produce no markers (the
 ///   indexes passed here are empty by design).
+#[cfg(test)]
 fn parse_notes_xml(xml: &str, note_tag: &[u8]) -> Vec<Note> {
     let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    parse_notes_reader(&mut reader, &mut buf, note_tag).unwrap_or_default()
+}
+
+fn parse_notes_reader<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    note_tag: &[u8],
+) -> crate::error::Result<Vec<Note>> {
     let mut notes = Vec::new();
     let mut seen = HashSet::new();
     // Empty rels and empty note indexes: no hyperlink resolution and no
@@ -470,48 +1100,59 @@ fn parse_notes_xml(xml: &str, note_tag: &[u8]) -> Vec<Note> {
     let mut endnotes = NoteIndex::new();
 
     loop {
-        match &reader.read_event() {
-            Ok(Event::Start(e)) if e.local_name().as_ref() == note_tag => {
-                let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) else {
-                    // Missing id: consume the element without interpreting it.
-                    skip_element(&mut reader);
-                    continue;
-                };
-                if id == "-1" || id == "0" || !seen.insert(id.clone()) {
-                    // Separator (-1), continuation (0), or duplicate id
-                    // (first wins): skip.
-                    skip_element(&mut reader);
-                    continue;
+        let mut id_opt = None;
+        let mut skip = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == note_tag => {
+                match get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
+                    None => skip = true,
+                    Some(id) if id == "-1" || id == "0" || !seen.insert(id.clone()) => {
+                        skip = true;
+                    }
+                    Some(id) => id_opt = Some(id),
                 }
-                let blocks = parse_block_children(
-                    &mut reader,
-                    note_tag,
-                    &empty_rels,
-                    &empty_rels,
-                    &mut footnotes,
-                    &mut endnotes,
-                );
-                notes.push(Note {
-                    id,
-                    display_index: 0,
-                    blocks,
-                });
-                // parse_block_children consumed through End(note_tag).
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                buf.clear();
+                break;
+            }
+            Err(e) => return Err(xml_error(e)),
             _ => {}
         }
+        buf.clear();
+        if skip {
+            skip_element(reader, buf);
+            continue;
+        }
+        if let Some(id) = id_opt {
+            let blocks = parse_block_children(
+                reader,
+                buf,
+                note_tag,
+                &empty_rels,
+                &empty_rels,
+                &mut footnotes,
+                &mut endnotes,
+            );
+            notes.push(Note {
+                id,
+                display_index: 0,
+                blocks,
+            });
+        }
     }
-    notes
+    Ok(notes)
 }
 
 /// Parse `word/footnotes.xml` into note definitions in document order.
+#[cfg(test)]
 fn parse_footnotes_xml(xml: &str) -> Vec<Note> {
     parse_notes_xml(xml, b"footnote")
 }
 
 /// Parse `word/endnotes.xml` into note definitions (same shape and rules as
 /// [`parse_footnotes_xml`]).
+#[cfg(test)]
 fn parse_endnotes_xml(xml: &str) -> Vec<Note> {
     parse_notes_xml(xml, b"endnote")
 }
@@ -522,8 +1163,17 @@ fn parse_endnotes_xml(xml: &str) -> Vec<Note> {
 /// whose body has no non-whitespace text are dropped; duplicate ids keep the
 /// first occurrence. The `w:annotationRef` glyph inside comment bodies is
 /// skipped by `parse_run`.
+#[cfg(test)]
 fn parse_comments_xml(xml: &str) -> Vec<Comment> {
     let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    parse_comments_reader(&mut reader, &mut buf).unwrap_or_default()
+}
+
+fn parse_comments_reader<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+) -> crate::error::Result<Vec<Comment>> {
     let mut comments = Vec::new();
     let mut seen = HashSet::new();
     let empty_rels = Rels::new();
@@ -531,42 +1181,53 @@ fn parse_comments_xml(xml: &str) -> Vec<Comment> {
     let mut endnotes = NoteIndex::new();
 
     loop {
-        match &reader.read_event() {
-            Ok(Event::Start(e)) if e.local_name().as_ref() == b"comment" => {
-                let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) else {
-                    // Comment without an id: nothing to key it by, drop it.
-                    skip_element(&mut reader);
-                    continue;
-                };
-                if !seen.insert(id.clone()) {
-                    // Duplicate id: first wins; consume the body unparsed so
-                    // it can never leak text or markers.
-                    skip_element(&mut reader);
-                    continue;
-                }
-                let mut author = get_attr(e, b"w:author")
-                    .or_else(|| get_attr(e, b"author"))
-                    .unwrap_or_default();
-                if author.trim().is_empty() {
-                    author = "Anonymous".to_string();
-                }
-                let blocks = parse_block_children(
-                    &mut reader,
-                    b"comment",
-                    &empty_rels,
-                    &empty_rels,
-                    &mut footnotes,
-                    &mut endnotes,
-                );
-                if blocks_have_text(&blocks) {
-                    comments.push(Comment { id, author, blocks });
+        let mut id_opt = None;
+        let mut author = String::new();
+        let mut skip = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"comment" => {
+                match get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
+                    None => skip = true,
+                    Some(id) if !seen.insert(id.clone()) => skip = true,
+                    Some(id) => {
+                        author = get_attr(e, b"w:author")
+                            .or_else(|| get_attr(e, b"author"))
+                            .unwrap_or_default();
+                        if author.trim().is_empty() {
+                            author = "Anonymous".to_string();
+                        }
+                        id_opt = Some(id);
+                    }
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => {
+                buf.clear();
+                break;
+            }
+            Err(e) => return Err(xml_error(e)),
             _ => {}
         }
+        buf.clear();
+        if skip {
+            skip_element(reader, buf);
+            continue;
+        }
+        if let Some(id) = id_opt {
+            let blocks = parse_block_children(
+                reader,
+                buf,
+                b"comment",
+                &empty_rels,
+                &empty_rels,
+                &mut footnotes,
+                &mut endnotes,
+            );
+            if blocks_have_text(&blocks) {
+                comments.push(Comment { id, author, blocks });
+            }
+        }
     }
-    comments
+    Ok(comments)
 }
 
 /// Parse a `<w:p>` element into blocks.
@@ -575,8 +1236,9 @@ fn parse_comments_xml(xml: &str) -> Vec<Comment> {
 /// is active, any `<w:drawing>` elements (which live inside `<w:r>` runs)
 /// produce additional `Block::Image` entries. The paragraph is always first,
 /// followed by any images found.
-fn parse_paragraph(
-    reader: &mut Reader<&[u8]>,
+fn parse_paragraph<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     rels: &Rels,
     image_rels: &Rels,
     footnotes: &mut NoteIndex,
@@ -587,60 +1249,71 @@ fn parse_paragraph(
     let mut image_blocks: Vec<Block> = Vec::new();
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let name = e.local_name();
-                match name.as_ref() {
-                    b"pPr" => parse_para_props(reader, &mut style),
-                    b"r" => {
-                        let (run_runs, img_opt) =
-                            parse_run(reader, image_rels, footnotes, endnotes);
-                        runs.extend(run_runs);
-                        if let Some(blk) = img_opt {
-                            image_blocks.push(blk);
-                        }
-                    }
-                    b"hyperlink" => {
-                        // Resolve the hyperlink URL from r:id → rels map
-                        let url = get_attr(e, b"r:id").and_then(|rid| rels.get(&rid).cloned());
-                        parse_hyperlink_runs(
-                            reader,
-                            &mut runs,
-                            url.as_deref(),
-                            image_rels,
-                            &mut image_blocks,
-                            footnotes,
-                            endnotes,
-                        );
-                    }
-                    _ => {}
+        let mut start_ppr = false;
+        let mut start_r = false;
+        let mut start_hyperlink = false;
+        let mut hyperlink_url: Option<String> = None;
+        let mut empty_tab = false;
+        let mut empty_br = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"pPr" => start_ppr = true,
+                b"r" => start_r = true,
+                b"hyperlink" => {
+                    start_hyperlink = true;
+                    hyperlink_url = get_attr(e, b"r:id").and_then(|rid| rels.get(&rid).cloned());
                 }
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
-                break;
-            }
-            Ok(Event::Empty(ref e)) => {
-                let name = e.local_name();
-                if name.as_ref() == b"tab" {
-                    runs.push(Run {
-                        text: "\t".into(),
-                        bold: false,
-                        italic: false,
-                        link_url: None,
-                        marker: None,
-                    });
-                } else if name.as_ref() == b"br" {
-                    runs.push(Run {
-                        text: "\n".into(),
-                        bold: false,
-                        italic: false,
-                        link_url: None,
-                        marker: None,
-                    });
-                }
-            }
-            Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => done = true,
+            Ok(Event::Empty(ref e)) => match e.local_name().as_ref() {
+                b"tab" => empty_tab = true,
+                b"br" => empty_br = true,
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_ppr {
+            parse_para_props(reader, buf, &mut style);
+        } else if start_r {
+            let (run_runs, img_opt) = parse_run(reader, buf, image_rels, footnotes, endnotes);
+            runs.extend(run_runs);
+            if let Some(blk) = img_opt {
+                image_blocks.push(blk);
+            }
+        } else if start_hyperlink {
+            parse_hyperlink_runs(
+                reader,
+                buf,
+                &mut runs,
+                hyperlink_url.as_deref(),
+                image_rels,
+                &mut image_blocks,
+                footnotes,
+                endnotes,
+            );
+        } else if empty_tab {
+            runs.push(Run {
+                text: "\t".into(),
+                bold: false,
+                italic: false,
+                link_url: None,
+                marker: None,
+            });
+        } else if empty_br {
+            runs.push(Run {
+                text: "\n".into(),
+                bold: false,
+                italic: false,
+                link_url: None,
+                marker: None,
+            });
         }
     }
 
@@ -650,10 +1323,10 @@ fn parse_paragraph(
 }
 
 /// Parse `<w:pPr>` to extract heading level and list info.
-fn parse_para_props(reader: &mut Reader<&[u8]>, style: &mut ParaStyle) {
+fn parse_para_props<R: BufRead>(reader: &mut Reader<R>, buf: &mut Vec<u8>, style: &mut ParaStyle) {
     let mut depth = 1u32;
     loop {
-        match reader.read_event() {
+        match reader.read_event_into(buf) {
             Ok(Event::Start(_)) => {
                 depth += 1;
             }
@@ -680,12 +1353,17 @@ fn parse_para_props(reader: &mut Reader<&[u8]>, style: &mut ParaStyle) {
             Ok(Event::End(_)) => {
                 depth -= 1;
                 if depth == 0 {
+                    buf.clear();
                     break;
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => {
+                buf.clear();
+                break;
+            }
             _ => {}
         }
+        buf.clear();
     }
 }
 
@@ -746,8 +1424,10 @@ fn push_note_marker(
 /// bodies) are skipped entirely. When `image_rels` is non-empty and a
 /// `<w:drawing>` is found inside the run, the image reference is extracted
 /// and returned as a `Block::Image`.
-fn parse_run(
-    reader: &mut Reader<&[u8]>,
+#[allow(clippy::too_many_lines)]
+fn parse_run<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     image_rels: &Rels,
     footnotes: &mut NoteIndex,
     endnotes: &mut NoteIndex,
@@ -770,88 +1450,105 @@ fn parse_run(
     };
 
     loop {
-        match reader.read_event() {
+        let mut start_rpr = false;
+        let mut start_t = false;
+        let mut start_drawing = false;
+        let mut start_note: Option<(Vec<u8>, Option<String>)> = None;
+        let mut start_glyph = false;
+        let mut empty_tab = false;
+        let mut empty_br = false;
+        let mut empty_note: Option<(Vec<u8>, Option<String>)> = None;
+        let mut empty_b = false;
+        let mut empty_i = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
-                    b"rPr" => parse_run_props(reader, &mut bold, &mut italic),
-                    b"t" => {
-                        // Read text content
-                        if let Ok(Event::Text(t)) = reader.read_event() {
-                            if let Ok(s) = t.unescape() {
-                                text.push_str(&s);
-                            }
-                        }
-                        // Note: the </w:t> end tag will be consumed below
-                    }
-                    b"drawing" if !image_rels.is_empty() => {
-                        if let Some(blk) = parse_drawing(reader, image_rels) {
-                            image_block = Some(blk);
-                        }
-                    }
-                    // Defensive Start form: note references are empty
-                    // elements in practice, but consume through the end tag
-                    // if a non-empty one appears.
+                    b"rPr" => start_rpr = true,
+                    b"t" => start_t = true,
+                    b"drawing" if !image_rels.is_empty() => start_drawing = true,
                     b"footnoteReference" | b"endnoteReference" => {
-                        if let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
-                            flush_text(&mut runs, &mut text, bold, italic);
-                            push_note_marker(&mut runs, name.as_ref(), &id, footnotes, endnotes);
-                        }
-                        loop {
-                            match reader.read_event() {
-                                Ok(Event::End(ref e))
-                                    if e.local_name().as_ref() == name.as_ref() =>
-                                {
-                                    break;
-                                }
-                                Ok(Event::Eof) | Err(_) => break,
-                                _ => {}
-                            }
-                        }
+                        start_note = Some((
+                            name.as_ref().to_vec(),
+                            get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")),
+                        ));
                     }
-                    // Ref glyphs (`w:footnoteRef`, `w:endnoteRef`,
-                    // `w:annotationRef`): empty elements without an id that
-                    // mark a reference site inside the note/comment bodies.
-                    // Skipped (also in the Empty arm below) so they never
-                    // leak text or produce marker runs. The Empty form needs
-                    // no consumption; this defensive Start form swallows the
-                    // whole subtree if a non-empty one ever appears.
-                    b"footnoteRef" | b"endnoteRef" | b"annotationRef" => {
-                        skip_element(reader);
-                    }
+                    b"footnoteRef" | b"endnoteRef" | b"annotationRef" => start_glyph = true,
                     _ => {}
                 }
             }
             Ok(Event::Empty(ref e)) => {
                 let name = e.local_name();
                 if name.as_ref() == b"tab" {
-                    text.push('\t');
+                    empty_tab = true;
                 } else if name.as_ref() == b"br" {
-                    text.push('\n');
+                    empty_br = true;
                 } else if name.as_ref() == b"footnoteReference"
                     || name.as_ref() == b"endnoteReference"
                 {
-                    if let Some(id) = get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")) {
-                        flush_text(&mut runs, &mut text, bold, italic);
-                        push_note_marker(&mut runs, name.as_ref(), &id, footnotes, endnotes);
-                    }
+                    empty_note = Some((
+                        name.as_ref().to_vec(),
+                        get_attr(e, b"w:id").or_else(|| get_attr(e, b"id")),
+                    ));
                 } else if name.as_ref() == b"b" || name.as_ref() == b"bCs" {
-                    // Self-closing <w:b/> in rPr means bold on
-                    bold = true;
+                    empty_b = true;
                 } else if name.as_ref() == b"i" || name.as_ref() == b"iCs" {
-                    italic = true;
-                } else if name.as_ref() == b"footnoteRef"
-                    || name.as_ref() == b"endnoteRef"
-                    || name.as_ref() == b"annotationRef"
-                {
-                    // Ref glyph (empty form): skipped; never text or marker.
+                    empty_i = true;
                 }
             }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"r" => {
-                break;
-            }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"r" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_rpr {
+            parse_run_props(reader, buf, &mut bold, &mut italic);
+        } else if start_t {
+            if let Ok(Event::Text(t)) = reader.read_event_into(buf) {
+                if let Ok(s) = t.unescape() {
+                    text.push_str(&s);
+                }
+            }
+            buf.clear();
+        } else if start_drawing {
+            if let Some(blk) = parse_drawing(reader, buf, image_rels) {
+                image_block = Some(blk);
+            }
+        } else if let Some((name, id)) = start_note {
+            if let Some(id) = id {
+                flush_text(&mut runs, &mut text, bold, italic);
+                push_note_marker(&mut runs, &name, &id, footnotes, endnotes);
+            }
+            loop {
+                let ended = match reader.read_event_into(buf) {
+                    Ok(Event::End(ref e)) if e.local_name().as_ref() == name.as_slice() => true,
+                    Ok(Event::Eof) | Err(_) => true,
+                    _ => false,
+                };
+                buf.clear();
+                if ended {
+                    break;
+                }
+            }
+        } else if start_glyph {
+            skip_element(reader, buf);
+        } else if empty_tab {
+            text.push('\t');
+        } else if empty_br {
+            text.push('\n');
+        } else if let Some((name, id)) = empty_note {
+            if let Some(id) = id {
+                flush_text(&mut runs, &mut text, bold, italic);
+                push_note_marker(&mut runs, &name, &id, footnotes, endnotes);
+            }
+        } else if empty_b {
+            bold = true;
+        } else if empty_i {
+            italic = true;
         }
     }
 
@@ -861,10 +1558,15 @@ fn parse_run(
 }
 
 /// Parse <w:rPr> to extract bold/italic.
-fn parse_run_props(reader: &mut Reader<&[u8]>, bold: &mut bool, italic: &mut bool) {
+fn parse_run_props<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    bold: &mut bool,
+    italic: &mut bool,
+) {
     let mut depth = 1u32;
     loop {
-        match reader.read_event() {
+        match reader.read_event_into(buf) {
             Ok(Event::Start(_)) => {
                 depth += 1;
             }
@@ -872,7 +1574,6 @@ fn parse_run_props(reader: &mut Reader<&[u8]>, bold: &mut bool, italic: &mut boo
                 let name = e.local_name();
                 match name.as_ref() {
                     b"b" | b"bCs" => {
-                        // Check for val="false" or val="0"
                         let val = get_val_attr(e);
                         *bold = !matches!(val.as_deref(), Some("false" | "0"));
                     }
@@ -886,18 +1587,25 @@ fn parse_run_props(reader: &mut Reader<&[u8]>, bold: &mut bool, italic: &mut boo
             Ok(Event::End(_)) => {
                 depth -= 1;
                 if depth == 0 {
+                    buf.clear();
                     break;
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => {
+                buf.clear();
+                break;
+            }
             _ => {}
         }
+        buf.clear();
     }
 }
 
 /// Parse runs inside a `<w:hyperlink>` element, tagging each run with the URL.
-fn parse_hyperlink_runs(
-    reader: &mut Reader<&[u8]>,
+#[allow(clippy::too_many_arguments)]
+fn parse_hyperlink_runs<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     runs: &mut Vec<Run>,
     url: Option<&str>,
     image_rels: &Rels,
@@ -906,22 +1614,27 @@ fn parse_hyperlink_runs(
     endnotes: &mut NoteIndex,
 ) {
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"r" => {
-                let (run_runs, img_opt) = parse_run(reader, image_rels, footnotes, endnotes);
-                for mut run in run_runs {
-                    run.link_url = url.map(String::from);
-                    runs.push(run);
-                }
-                if let Some(blk) = img_opt {
-                    image_blocks.push(blk);
-                }
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"hyperlink" => {
-                break;
-            }
-            Ok(Event::Eof) | Err(_) => break,
+        let mut start_r = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"r" => start_r = true,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"hyperlink" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_r {
+            let (run_runs, img_opt) = parse_run(reader, buf, image_rels, footnotes, endnotes);
+            for mut run in run_runs {
+                run.link_url = url.map(String::from);
+                runs.push(run);
+            }
+            if let Some(blk) = img_opt {
+                image_blocks.push(blk);
+            }
         }
     }
 }
@@ -932,12 +1645,16 @@ fn parse_hyperlink_runs(
 /// `<a:graphicData>` → `<pic:blipFill>` → `<a:blip r:embed="rIdN"/>`.
 /// Returns a `Block::Image` with the image's ZIP path (to be resolved later)
 /// stored in the `path` field.
-fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block> {
+fn parse_drawing<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
+    image_rels: &Rels,
+) -> Option<Block> {
     let mut embed_rid: Option<String> = None;
     let mut depth = 1u32;
 
     loop {
-        match reader.read_event() {
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 depth += 1;
                 if e.local_name().as_ref() == b"blip" {
@@ -953,16 +1670,22 @@ fn parse_drawing(reader: &mut Reader<&[u8]>, image_rels: &Rels) -> Option<Block>
             }
             Ok(Event::End(ref e)) => {
                 if e.local_name().as_ref() == b"drawing" {
+                    buf.clear();
                     break;
                 }
                 depth -= 1;
                 if depth == 0 {
+                    buf.clear();
                     break;
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) | Err(_) => {
+                buf.clear();
+                break;
+            }
             _ => {}
         }
+        buf.clear();
     }
 
     let rid = embed_rid?;
@@ -1032,8 +1755,9 @@ fn resolve_images(
 }
 
 /// Parse a `<w:tbl>` element into a `Block::Table`.
-fn parse_table(
-    reader: &mut Reader<&[u8]>,
+fn parse_table<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     rels: &Rels,
     footnotes: &mut NoteIndex,
     endnotes: &mut NoteIndex,
@@ -1041,19 +1765,20 @@ fn parse_table(
     let mut rows: Vec<Row> = Vec::new();
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let name = e.local_name();
-                if name.as_ref() == b"tr" {
-                    let row = parse_table_row(reader, rels, footnotes, endnotes);
-                    rows.push(row);
-                }
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tbl" => {
-                break;
-            }
-            Ok(Event::Eof) | Err(_) => break,
+        let mut start_tr = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tr" => start_tr = true,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tbl" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_tr {
+            rows.push(parse_table_row(reader, buf, rels, footnotes, endnotes));
         }
     }
 
@@ -1061,8 +1786,9 @@ fn parse_table(
 }
 
 /// Parse a `<w:tr>` element into a row of cells.
-fn parse_table_row(
-    reader: &mut Reader<&[u8]>,
+fn parse_table_row<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     rels: &Rels,
     footnotes: &mut NoteIndex,
     endnotes: &mut NoteIndex,
@@ -1070,19 +1796,20 @@ fn parse_table_row(
     let mut cells: Row = Vec::new();
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let name = e.local_name();
-                if name.as_ref() == b"tc" {
-                    let cell = parse_table_cell(reader, rels, footnotes, endnotes);
-                    cells.push(cell);
-                }
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tr" => {
-                break;
-            }
-            Ok(Event::Eof) | Err(_) => break,
+        let mut start_tc = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"tc" => start_tc = true,
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tr" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_tc {
+            cells.push(parse_table_cell(reader, buf, rels, footnotes, endnotes));
         }
     }
 
@@ -1093,8 +1820,9 @@ fn parse_table_row(
 ///
 /// Images inside table cells are not extracted (impractical in markdown
 /// tables), so an empty `image_rels` is used for paragraph parsing.
-fn parse_table_cell(
-    reader: &mut Reader<&[u8]>,
+fn parse_table_cell<R: BufRead>(
+    reader: &mut Reader<R>,
+    buf: &mut Vec<u8>,
     rels: &Rels,
     footnotes: &mut NoteIndex,
     endnotes: &mut NoteIndex,
@@ -1103,27 +1831,29 @@ fn parse_table_cell(
     let mut blocks = Vec::new();
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                let name = e.local_name();
-                match name.as_ref() {
-                    b"p" => {
-                        let mut para_blocks =
-                            parse_paragraph(reader, rels, &empty_image_rels, footnotes, endnotes);
-                        blocks.append(&mut para_blocks);
-                    }
-                    b"tbl" => {
-                        blocks.push(parse_table(reader, rels, footnotes, endnotes));
-                        // nested table
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tc" => {
-                break;
-            }
-            Ok(Event::Eof) | Err(_) => break,
+        let mut start_p = false;
+        let mut start_tbl = false;
+        let mut done = false;
+        match reader.read_event_into(buf) {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"p" => start_p = true,
+                b"tbl" => start_tbl = true,
+                _ => {}
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"tc" => done = true,
+            Ok(Event::Eof) | Err(_) => done = true,
             _ => {}
+        }
+        buf.clear();
+        if done {
+            break;
+        }
+        if start_p {
+            let mut para_blocks =
+                parse_paragraph(reader, buf, rels, &empty_image_rels, footnotes, endnotes);
+            blocks.append(&mut para_blocks);
+        } else if start_tbl {
+            blocks.push(parse_table(reader, buf, rels, footnotes, endnotes));
         }
     }
 
@@ -1928,8 +2658,13 @@ mod tests {
     ) -> (Vec<Run>, Option<Block>) {
         let full = format!("<w:r>{xml}</w:r>");
         let mut reader = Reader::from_str(&full);
-        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:r>
-        parse_run(&mut reader, &Rels::new(), footnotes, endnotes)
+        let mut buf = Vec::new();
+        assert!(matches!(
+            reader.read_event_into(&mut buf),
+            Ok(Event::Start(_))
+        ));
+        buf.clear();
+        parse_run(&mut reader, &mut buf, &Rels::new(), footnotes, endnotes)
     }
 
     #[test]
@@ -2036,9 +2771,15 @@ mod tests {
         let xml = "<w:p><w:r><w:footnoteReference w:id=\"1\"/></w:r><w:r><w:t>X</w:t></w:r></w:p>";
         let full = format!("<w:body>{xml}</w:body>");
         let mut reader = Reader::from_str(&full);
-        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:body>
+        let mut buf = Vec::new();
+        assert!(matches!(
+            reader.read_event_into(&mut buf),
+            Ok(Event::Start(_))
+        ));
+        buf.clear();
         let blocks = parse_paragraph(
             &mut reader,
+            &mut buf,
             &Rels::new(),
             &Rels::new(),
             &mut footnotes,
@@ -2069,11 +2810,17 @@ mod tests {
                    <w:r><w:footnoteReference w:id=\"1\"/></w:r></w:hyperlink></w:p>";
         let full = format!("<w:body>{xml}</w:body>");
         let mut reader = Reader::from_str(&full);
-        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:body>
+        let mut buf = Vec::new();
+        assert!(matches!(
+            reader.read_event_into(&mut buf),
+            Ok(Event::Start(_))
+        ));
+        buf.clear();
         let mut rels = Rels::new();
         rels.insert("rId9".into(), "https://example.com".into());
         let blocks = parse_paragraph(
             &mut reader,
+            &mut buf,
             &rels,
             &Rels::new(),
             &mut footnotes,
@@ -2108,8 +2855,19 @@ mod tests {
                    <w:t>note</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
         let full = format!("<w:body>{xml}</w:body>");
         let mut reader = Reader::from_str(&full);
-        assert!(matches!(reader.read_event(), Ok(Event::Start(_)))); // consume <w:body>
-        let table = parse_table(&mut reader, &Rels::new(), &mut footnotes, &mut endnotes);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            reader.read_event_into(&mut buf),
+            Ok(Event::Start(_))
+        ));
+        buf.clear();
+        let table = parse_table(
+            &mut reader,
+            &mut buf,
+            &Rels::new(),
+            &mut footnotes,
+            &mut endnotes,
+        );
 
         assert!(matches!(&table, Block::Table { rows } if rows.len() == 1));
         let md = render_markdown(std::slice::from_ref(&table));
@@ -2707,6 +3465,62 @@ mod tests {
     }
 
     #[test]
+    fn extract_markdown_ragged_table_matches_block_renderer() {
+        // A ragged table (a later row has more cells than the header) must
+        // match the buffered block renderer byte-for-byte: `ncols` is the max
+        // row width and every row (including the header) is padded with empty
+        // cells instead of the streaming path truncating to the first row.
+        let body_tbl = r#"
+<w:tbl>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>Age</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>Alice</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>30</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>Extra</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>"#;
+
+        let data = minimal_docx(&[("word/document.xml", &document_xml(body_tbl))]);
+
+        let table = Block::Table {
+            rows: vec![
+                vec![
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Name", false, false)],
+                    }],
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Age", false, false)],
+                    }],
+                ],
+                vec![
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Alice", false, false)],
+                    }],
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("30", false, false)],
+                    }],
+                    vec![Block::Paragraph {
+                        style: ParaStyle::default(),
+                        runs: vec![run("Extra", false, false)],
+                    }],
+                ],
+            ],
+        };
+        let mut reference = String::new();
+        render_block_markdown(&table, &mut reference);
+
+        let streamed = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert_eq!(streamed, reference);
+    }
+
+    #[test]
     fn extract_markdown_empty_defined_note_no_marker_no_section() {
         // A defined note whose blocks render empty must not be seeded: the
         // body emits no marker and the trailer omits the whole section (no
@@ -3051,5 +3865,64 @@ mod tests {
             got.is_err(),
             "a present-but-unreadable part must fail the extract"
         );
+    }
+
+    #[test]
+    fn extract_markdown_to_equals_extract_markdown_on_locked_strings() {
+        let opts = crate::ExtractOptions::default();
+        let data = minimal_docx(&[(
+            "word/document.xml",
+            &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
+        )]);
+        let a = extract_markdown(&data, opts).unwrap();
+        assert_eq!(a, "Body only\n\n");
+        let mut b = String::new();
+        extract_markdown_to(&data, opts, &mut b).unwrap();
+        assert_eq!(a, b);
+
+        let plain_a = extract_plain(&data, opts).unwrap();
+        assert_eq!(plain_a, "Body only\n");
+        let mut plain_b = String::new();
+        extract_plain_to(&data, opts, &mut plain_b).unwrap();
+        assert_eq!(plain_a, plain_b);
+    }
+
+    #[test]
+    fn extract_markdown_to_equals_extract_markdown_on_image_locked_string() {
+        let data = image_docx(
+            r#"<w:p><w:r><w:t>Pic</w:t></w:r><w:r><w:drawing><a:blip r:embed="rId5"/></w:drawing></w:r></w:p>"#,
+            &[],
+        );
+        let opts = crate::ExtractOptions {
+            images: true,
+            ..crate::ExtractOptions::default()
+        };
+        let a = extract_markdown(&data, opts).unwrap();
+        assert_eq!(
+            a,
+            "Pic\n\n![][image1]\n\n[image1]: <data:image/png;base64,iVBORw0KGgo=>\n"
+        );
+        let mut b = String::new();
+        extract_markdown_to(&data, opts, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn extract_to_equals_extract_on_hi_locked_strings() {
+        let data = minimal_docx(&[(
+            "word/document.xml",
+            &document_xml(r#"<w:p><w:r><w:t>Hi</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#),
+        )]);
+        let opts = crate::ExtractOptions::default();
+        let a = extract_markdown(&data, opts).unwrap();
+        assert_eq!(a, "Hi\n\n");
+        let mut b = String::new();
+        extract_markdown_to(&data, opts, &mut b).unwrap();
+        assert_eq!(a, b);
+        let plain_a = extract_plain(&data, opts).unwrap();
+        assert_eq!(plain_a, "Hi\n");
+        let mut plain_b = String::new();
+        extract_plain_to(&data, opts, &mut plain_b).unwrap();
+        assert_eq!(plain_a, plain_b);
     }
 }

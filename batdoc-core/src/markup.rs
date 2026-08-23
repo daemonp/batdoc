@@ -24,6 +24,47 @@ pub(crate) trait InlineRun {
     fn link_url(&self) -> Option<&str>;
 }
 
+/// Escape markdown inline specials in extracted text: `\` `` ` `` `*` `_`
+/// `[` `]`. Applied to run text and link text so document content cannot
+/// break out of the markdown we generate.
+pub(crate) fn escape_md_inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' | '`' | '*' | '_' | '[' | ']' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Make a URL safe to embed in `[text](url)`, or `None` to render the link
+/// text without link syntax. Schemes are allowlisted to http/https/mailto/
+/// ftp (scheme-less relative/fragment URLs pass), and `(`, `)`, and space
+/// are percent-encoded so they cannot terminate the destination early.
+pub(crate) fn safe_link_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(i) = lower.find(':') {
+        if !matches!(&lower[..i], "http" | "https" | "mailto" | "ftp") {
+            return None;
+        }
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        match c {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            ' ' => out.push_str("%20"),
+            _ => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// Render a slice of runs as markdown with inline formatting and grouped
 /// hyperlinks.
 ///
@@ -51,11 +92,17 @@ pub(crate) fn render_runs_markdown<R: InlineRun>(runs: &[R]) -> String {
             }
             let link_text = link_text.trim();
             if !link_text.is_empty() {
-                out.push('[');
-                out.push_str(link_text);
-                out.push_str("](");
-                out.push_str(url);
-                out.push(')');
+                match safe_link_url(url) {
+                    Some(url) => {
+                        out.push('[');
+                        out.push_str(link_text);
+                        out.push_str("](");
+                        out.push_str(&url);
+                        out.push(')');
+                    }
+                    // Unsafe scheme: emit the text without link syntax.
+                    None => out.push_str(link_text),
+                }
             }
             continue;
         }
@@ -82,24 +129,25 @@ pub(crate) fn format_run_inline<R: InlineRun>(run: &R, out: &mut String) {
         return;
     }
 
+    let text = escape_md_inline(run.text());
     match (run.bold(), run.italic()) {
         (true, true) => {
             out.push_str("***");
-            out.push_str(run.text());
+            out.push_str(&text);
             out.push_str("***");
         }
         (true, false) => {
             out.push_str("**");
-            out.push_str(run.text());
+            out.push_str(&text);
             out.push_str("**");
         }
         (false, true) => {
             out.push('*');
-            out.push_str(run.text());
+            out.push_str(&text);
             out.push('*');
         }
         (false, false) => {
-            out.push_str(run.text());
+            out.push_str(&text);
         }
     }
 }
@@ -450,5 +498,53 @@ mod tests {
         assert_eq!(out, "a\n\nb\n");
         push_ocr_plain(&mut out, "c", &mut first);
         assert_eq!(out, "a\n\nb\n\nc\n");
+    }
+
+    // ── escaping / URL safety ─────────────────────────────────
+
+    #[test]
+    fn escape_md_inline_escapes_specials() {
+        assert_eq!(
+            escape_md_inline("a*b_c[d]e\\f`g"),
+            "a\\*b\\_c\\[d\\]e\\\\f\\`g"
+        );
+        assert_eq!(escape_md_inline("plain text"), "plain text");
+    }
+
+    #[test]
+    fn format_escapes_text_but_not_markers() {
+        let mut out = String::new();
+        format_run_inline(&run("5 * 3", true, false), &mut out);
+        assert_eq!(out, "**5 \\* 3**");
+    }
+
+    #[test]
+    fn link_text_is_escaped() {
+        let runs = vec![link_run("a [b]", false, false, "https://example.com")];
+        assert_eq!(
+            render_runs_markdown(&runs),
+            "[a \\[b\\]](https://example.com)"
+        );
+    }
+
+    #[test]
+    fn unsafe_scheme_renders_as_plain_text() {
+        let runs = vec![link_run("click", false, false, "javascript:alert(1)")];
+        assert_eq!(render_runs_markdown(&runs), "click");
+    }
+
+    #[test]
+    fn url_parens_and_spaces_are_encoded() {
+        let runs = vec![link_run("t", false, false, "https://x.org/a (b)")];
+        assert_eq!(
+            render_runs_markdown(&runs),
+            "[t](https://x.org/a%20%28b%29)"
+        );
+    }
+
+    #[test]
+    fn scheme_less_urls_are_kept() {
+        let runs = vec![link_run("rel", false, false, "/docs/page#frag")];
+        assert_eq!(render_runs_markdown(&runs), "[rel](/docs/page#frag)");
     }
 }

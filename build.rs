@@ -63,6 +63,11 @@ fn main() {
                      .bmp).",
                 )
                 .paragraph(
+                    "PDF glyph recovery depends on the vendored pdf-extract fork \
+                     under crates/pdf-extract; crates.io installs use upstream \
+                     pdf-extract and do not recover garbled fonts.",
+                )
+                .paragraph(
                     "When stdout is a terminal, output is pretty-printed as \
                      syntax-highlighted markdown via bat(1) with paging. When \
                      piped, plain text is emitted.",

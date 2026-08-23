@@ -44,7 +44,7 @@ too.
 
 ## When to use
 
-- PDF, text layer or scanned → `batdoc --ocr paper.pdf`
+- PDF, text layer or scanned → `batdoc paper.pdf` (textless pages auto-OCR)
 - Office documents (doc/docx/xls/xlsx/pptx) → `batdoc report.docx`
 - Images or scans of text → `batdoc photo.png` (image files are always OCR'd)
 
@@ -52,15 +52,16 @@ too.
 
     batdoc report.docx                  # markdown, highlighted, paged on a tty
     batdoc --plain legacy.doc > out.txt # plain text
-    batdoc --ocr scanned.pdf            # OCR pages with no text layer
+    batdoc scanned.pdf                  # textless PDF pages auto-OCR
+    batdoc --ocr report.docx            # OCR docx/pptx embedded images
     batdoc --images report.docx         # embed images as base64 data URIs
     cat mystery.bin | batdoc            # format detected from magic bytes
 
 ## Notes
 
 - `--plain` for text-only output; markdown is the default on a tty.
-- OCR needs no flag for image files; `--ocr` also covers docx/pptx embedded
-  images and textless PDF pages.
+- OCR needs no flag for PDFs or image files; `--ocr` covers docx/pptx
+  embedded images and is a no-op for PDF/image input.
 - OCR models (~12 MB) download on first use; pre-seed `$BATDOC_MODELS_DIR`
   for offline or package-managed installs.
 - Use a release build — OCR is much slower in debug builds.
@@ -69,26 +70,31 @@ too.
 ## Install
 
 **Arch Linux (AUR):**
+
 ```
 yay -S batdoc
 ```
 
 **Homebrew:**
+
 ```
 brew install daemonp/tap/batdoc
 ```
 
 **Linux (x86_64, static musl):**
+
 ```
 curl -sL https://github.com/daemonp/batdoc/releases/latest/download/batdoc-linux-x86_64.zst | zstd -d > batdoc && chmod +x batdoc
 ```
 
 **macOS (Apple Silicon):**
+
 ```
 curl -sL https://github.com/daemonp/batdoc/releases/latest/download/batdoc-darwin-aarch64.zst | zstd -d > batdoc && chmod +x batdoc
 ```
 
 **From source:**
+
 ```
 cargo build --release
 cp target/release/batdoc ~/.local/bin/
@@ -119,11 +125,21 @@ markdown links. Multi-slide decks get `## Slide N` headings. Speaker
 notes are appended after the deck under `## Notes` when present.
 
 `.pdf` extracts text from text-based PDFs using `pdf-extract`. Multi-page
-documents get `## Page N` headings in markdown mode. With `--ocr`, pages
-whose text layer is empty are OCR'd from their embedded images (scanned
-documents). Scanned/image-only PDFs that yield no text at all get a clean
-error message. Malformed PDFs that would crash the underlying library are
-caught and reported as errors rather than panics.
+documents get `## Page N` headings in markdown mode. When a PDF has no text
+layer at all (a scan), batdoc automatically falls back to OCR'ing its embedded
+page images — no `--ocr` flag needed. A scanned PDF whose OCR also finds
+nothing gets a clean error message. Malformed PDFs that would crash the
+underlying library are caught and reported as errors rather than panics.
+
+### PDF extraction notes
+
+PDFs with broken or missing font mappings (garbled CID fonts) are recovered
+via a vendored fork of `pdf-extract` under `crates/pdf-extract`, wired in with
+`[patch.crates-io]`. Builds from this repository — releases, AUR, deb/rpm,
+Homebrew — include the fix. `cargo install batdoc` resolves `pdf-extract` from
+crates.io instead and gets upstream behavior: still safe (panics are caught), but
+garbled documents stay garbled. Publishing the fork to close this gap is a
+deferred follow-up.
 
 ## Options
 
@@ -134,8 +150,7 @@ cat FILE | batdoc [OPTIONS]
   -p, --plain       plain text, no highlighting
   -m, --markdown    force markdown (default on tty)
   -i, --images      embed images as inline base64 data URIs
-      --ocr         OCR text from images: docx/pptx embedded images and
-                    textless PDF pages; image files are always OCR'd
+      --ocr         OCR embedded images (docx/pptx); textless PDFs auto-OCR
   -h, --help        help
 ```
 
@@ -168,23 +183,22 @@ and for formats without OOXML image support (`.doc`, `.xls`, `.pdf`).
 
 ## OCR
 
-`--ocr` runs the [ocrs](https://github.com/robertknight/ocrs) engine (pure
+OCR runs the [ocrs](https://github.com/robertknight/ocrs) engine (pure
 Rust, rten backend) over:
 
 - **Image files** — `batdoc photo.png` always OCRs (no flag needed; text is
   the only output an image can produce). PNG, JPEG, GIF, WebP, and BMP.
 - **DOCX/PPTX embedded images** — `batdoc --ocr report.docx` renders OCR'd
   text as a blockquote after each image (paragraphs in `--plain` mode).
-- **PDF pages without a text layer** — `batdoc --ocr scan.pdf` OCRs the
-  embedded page images (typical one-image-per-page scans). Text-bearing
-  pages are never OCR'd.
+- **PDF pages without a text layer** — automatic: a scanned PDF whose pages
+  have no text is OCR'd from its embedded page images (typical one-image-per-
+  page scans). Text-bearing pages and text-bearing documents are never OCR'd.
 
 Models (~12 MB, two `.rten` files) are downloaded on first OCR use from the
 ocrs upstream distribution and cached in `$BATDOC_MODELS_DIR`, else
 `$XDG_CACHE_HOME/batdoc/models`, else `~/.cache/batdoc/models`. Set
 `BATDOC_MODELS_DIR` to a pre-seeded directory for offline or
-package-managed installs. Without `--ocr`, output is identical to older
-versions. OCR takes roughly 0.5–2 s per image on CPU.
+package-managed installs. OCR takes roughly 0.5–2 s per image on CPU.
 
 Note: ocrs runs much slower in debug builds; always use a release build
 (`cargo build --release`) when testing OCR.
