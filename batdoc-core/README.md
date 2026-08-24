@@ -67,7 +67,7 @@ let text = batdoc_core::extract_plain_with(&png, Format::Image, ExtractOptions::
 ## Supported formats
 
 | Format | Detection | Parser |
-|--------|-----------|--------|
+| -------- | ----------- | -------- |
 | `.doc` | OLE2 magic + `/WordDocument` stream | Binary Word 97+ (BIFF-like) |
 | `.xls` | OLE2 magic + `/Workbook` stream | BIFF8 (Excel 97+) |
 | `.docx` | ZIP magic + `word/document.xml` | OOXML |

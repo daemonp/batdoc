@@ -63,10 +63,12 @@ reading dependency READMEs.
    - `getrandom 0.2` — pulled via `ring → rustls → ureq` (gone with `net` off).
    - `getrandom 0.3` — pulled via `rand → lopdf`.
    Both reject wasm unless you pass a config flag *and* enable a feature:
+
    ```toml
    [target.wasm32-unknown-unknown]
    rustflags = "--cfg getrandom_backend=\"wasm_js\""
    ```
+
    plus the `wasm_js` feature (0.3) / `js` feature (0.2) enabled on the
    dependency. Now wired up in `.cargo/config.toml` and the `batdoc-core`
    manifest (see State 2).
@@ -145,7 +147,7 @@ through `extract_*_to(IoSink(stdout))`. Measured on a synthetic 13.45 MB XLSX
 peak RSS via `VmHWM` (`/proc/self/status`):
 
 | path | plain RSS | markdown RSS |
-|------|----------:|-------------:|
+| ------ | ----------: | -------------: |
 | pre-streaming CLI (dense grid + `String`) | 326.5 MiB | 694.1 MiB |
 | `extract_*` → `String` (library, streaming internals) | 109 MiB | 114 MiB |
 | CLI / `extract_*_to` → `IoSink` | 19.9 MiB | 19.8 MiB |
