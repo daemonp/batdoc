@@ -36,10 +36,11 @@ pub enum Format { Doc, Xls, Docx, Xlsx, Pptx, Pdf, Image }
 pub enum BatdocError { Io, Zip, Document, Render }
 pub type Result<T> = std::result::Result<T, BatdocError>;
 
-#[derive(Default)]
 pub struct ExtractOptions {
-    pub images: bool, // embed images as base64 data URIs (markdown mode only)
-    pub ocr: bool,    // OCR embedded images (DOCX/PPTX) and textless PDF pages
+    pub images: bool,            // embed images as base64 data URIs (markdown mode only)
+    pub ocr: bool,               // OCR embedded images (DOCX/PPTX)
+    pub auto_ocr: bool,          // textless/garbled PDF fallback (default true)
+    pub max_output_bytes: Option<u64>,
 }
 
 pub fn detect_format(data: &[u8]) -> Result<Format>;
@@ -53,6 +54,10 @@ pub fn to_markdown(data: &[u8], images: bool) -> Result<String>;
 
 `extract_markdown` with `images: true` embeds images from DOCX/XLSX/PPTX as
 base64 data URIs. Has no effect on DOC, XLS, PDF, or Image.
+
+Set `ExtractOptions.auto_ocr = false` to disable the automatic
+textless/garbled-PDF OCR fallback (no model download or requirement).
+`Format::Image` is always OCR'd.
 
 ```rust
 // Raster images are always OCR'd — no options needed for `Format::Image`.

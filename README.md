@@ -193,6 +193,9 @@ Rust, rten backend) over:
 - **PDF pages without a text layer** — automatic: a scanned PDF whose pages
   have no text is OCR'd from its embedded page images (typical one-image-per-
   page scans). Text-bearing pages and text-bearing documents are never OCR'd.
+  Library callers can disable this fallback by setting
+  `ExtractOptions.auto_ocr = false` (the textless document then reports the
+  existing "may be scanned/image-only" no-text error).
 
 Models (~12 MB, two `.rten` files) are downloaded on first OCR use from the
 ocrs upstream distribution and cached in `$BATDOC_MODELS_DIR`, else

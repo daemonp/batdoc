@@ -160,6 +160,22 @@ incremental sink rather than the `String` API, and set
 `ExtractOptions.max_output_bytes` to bound output (the budget error is
 `"output exceeded {n} bytes"`).
 
+Vault's runtime options pin keeps OCR out of the isolate by disabling the
+textless/garbled PDF fallback:
+
+```rust
+ExtractOptions {
+    images: false,
+    ocr: false,
+    auto_ocr: false,
+    max_output_bytes: Some(2 * 1024 * 1024),
+}
+```
+
+Empty native text + `auto_ocr: false` returns the existing no-text error
+(`"PDF contains no extractable text (may be scanned/image-only)"`), which
+Vault maps to `OcrNeeded`. No models are downloaded or required.
+
 ### Workers (compile shape)
 
 Worker **compile** shape (Vault pin):
