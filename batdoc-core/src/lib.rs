@@ -24,7 +24,7 @@ mod pdf_text;
 mod pptx;
 mod sheet;
 mod sink;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 mod wasm;
 mod xls;
 mod xlsx;
@@ -153,16 +153,31 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
 }
 
 /// Extraction options.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ExtractOptions {
     /// Include embedded images as base64 markdown (markdown mode only).
     pub images: bool,
-    /// OCR embedded images (DOCX/PPTX). Textless PDF pages are OCR'd
-    /// automatically as a fallback regardless of this flag. Has no effect on
-    /// `Format::Image` — image input is always OCR'd.
+    /// OCR embedded images (DOCX/PPTX). Has no effect on `Format::Image` —
+    /// image input is always OCR'd.
     pub ocr: bool,
+    /// Textless or garbled PDF pages fall back to OCR when `true` (the
+    /// default), even if `ocr` is `false`. Set `false` to disable that
+    /// fallback (Worker-safe / Vault). Ignored when `ocr` is `true`; no
+    /// models are downloaded or required when `false`.
+    pub auto_ocr: bool,
     /// Stop writing after this many output bytes. `None` means unlimited.
     pub max_output_bytes: Option<u64>,
+}
+
+impl Default for ExtractOptions {
+    fn default() -> Self {
+        Self {
+            images: false,
+            ocr: false,
+            auto_ocr: true,
+            max_output_bytes: None,
+        }
+    }
 }
 
 /// Extract plain text from a document.
@@ -178,9 +193,10 @@ pub fn extract_plain(data: &[u8], format: Format) -> Result<String> {
 /// Extract plain text with explicit options.
 ///
 /// `opts.ocr` enables OCR for DOCX/PPTX embedded images; the `images` option
-/// is ignored in plain mode. Textless PDF pages are OCR'd automatically as
-/// a fallback, with or without `opts.ocr`. `Format::Image` input is always
-/// OCR'd regardless of options and returns plain OCR text.
+/// is ignored in plain mode. Textless PDF pages are OCR'd as a fallback when
+/// `opts.auto_ocr` is enabled (the default), with or without `opts.ocr`.
+/// `Format::Image` input is always OCR'd regardless of options and returns
+/// plain OCR text.
 ///
 /// # Errors
 ///
@@ -224,9 +240,9 @@ pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<Str
 ///
 /// `opts.images` embeds DOCX/XLSX/PPTX images as base64 markdown;
 /// `opts.ocr` OCRs DOCX/PPTX embedded images, rendered as blockquotes.
-/// Textless PDF pages are OCR'd automatically as a fallback. `Format::Image`
-/// input is always OCR'd regardless of options and returns plain OCR text
-/// (no markdown).
+/// Textless/garbled PDF pages fall back to OCR when `opts.auto_ocr` is
+/// enabled (the default). `Format::Image` input is always OCR'd regardless
+/// of options and returns plain OCR text (no markdown).
 ///
 /// # Errors
 ///

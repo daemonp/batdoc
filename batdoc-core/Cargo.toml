@@ -31,14 +31,16 @@ default = ["net"]
 # Model download over HTTP. Disable (--no-default-features) for offline,
 # embedded, or wasm targets where there is no socket/clock.
 net = ["dep:ureq"]
+# Browser JS glue + `src/wasm.rs` exports (`detect` / `to_plain` / `to_markdown`).
+# Worker / rlib consumers leave this off.
+wasm-bindgen = ["dep:wasm-bindgen"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # lopdf pulls getrandom 0.3 transitively (via rand); enable its wasm backend
 # (see .cargo/config.toml for the matching `getrandom_backend="wasm_js"` cfg).
 getrandom = { version = "0.3", features = ["wasm_js"] }
-# wasm-bindgen is only needed for the browser-facing entry points in
-# src/wasm.rs; it is compiled out of native builds.
-wasm-bindgen = "0.2"
+# Only needed when the `wasm-bindgen` feature is on (browser demo).
+wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

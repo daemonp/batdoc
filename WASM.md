@@ -1,10 +1,10 @@
 # Compiling batdoc to WebAssembly
 
-Status: **implemented.** `batdoc-core` builds a browser-loadable
-`cdylib` for `wasm32-unknown-unknown` with `--no-default-features`, exposes
-`wasm-bindgen` entry points (`detect`, `to_plain`, `to_markdown`), and ships a
-working browser demo in `web/` (see [Demo](#demo)). Native builds are
-unchanged.
+Status: **implemented.** `batdoc-core` builds for `wasm32-unknown-unknown`
+with `--no-default-features`. The browser `cdylib` + JS glue
+(`detect`, `to_plain`, `to_markdown`) is **opt-in** via the `wasm-bindgen`
+cargo feature. Worker / rlib consumers leave that feature off and call the
+Rust API (`detect_format`, `extract_*_to`). Native builds are unchanged.
 
 ## Why you'd care
 
@@ -34,9 +34,10 @@ reading dependency READMEs.
    `batdoc-core` manifest enables `getrandom/0.3`'s `wasm_js` feature on the
    wasm target only. `getrandom 0.2` disappears with `ring` (state 1).
 3. **Done — wasm-facing entry points + browser demo.** `batdoc-core` is now a
-   `rlib`+`cdylib`; `src/wasm.rs` (wasm32-only) exports `detect`, `to_plain`,
-   and `to_markdown` via `wasm-bindgen`. The `web/` demo builds the `.wasm`,
-   generates the JS glue, and runs entirely in the browser (see [Demo](#demo)).
+   `rlib`+`cdylib`; `src/wasm.rs` (compiled only on `wasm32` with the
+   `wasm-bindgen` feature) exports `detect`, `to_plain`, and `to_markdown` via
+   `wasm-bindgen`. The `web/` demo builds the `.wasm`, generates the JS glue,
+   and runs entirely in the browser (see [Demo](#demo)).
 
 ### Good news
 
@@ -62,10 +63,12 @@ reading dependency READMEs.
    - `getrandom 0.2` — pulled via `ring → rustls → ureq` (gone with `net` off).
    - `getrandom 0.3` — pulled via `rand → lopdf`.
    Both reject wasm unless you pass a config flag *and* enable a feature:
+
    ```toml
    [target.wasm32-unknown-unknown]
    rustflags = "--cfg getrandom_backend=\"wasm_js\""
    ```
+
    plus the `wasm_js` feature (0.3) / `js` feature (0.2) enabled on the
    dependency. Now wired up in `.cargo/config.toml` and the `batdoc-core`
    manifest (see State 2).
@@ -88,10 +91,10 @@ rustup target add wasm32-unknown-unknown
 # compile the library for wasm (model download is feature-gated off)
 cargo check --target wasm32-unknown-unknown -p batdoc-core --no-default-features
 
-# produce the rlib (links; verifies codegen end-to-end)
+# Worker-shaped library build (no JS exports, no direct wasm-bindgen dependency)
 cargo build --target wasm32-unknown-unknown --release -p batdoc-core --no-default-features
 
-# build the browser demo (wasm-bindgen glue + .wasm into web/pkg/)
+# Browser demo (JS glue) — web/build.sh passes --features wasm-bindgen
 ./web/build.sh
 ```
 
@@ -114,10 +117,11 @@ Ordered so each step is independently shippable and keeps the native CLI intact.
    `ring`; only the 0.3 one (via `lopdf`) remains.
 
 3. **Expose a library entry point — DONE.** `batdoc-core` is now
-   `crate-type = ["rlib", "cdylib"]`, and `src/wasm.rs` (compiled only for
-   `wasm32`) exports `detect`, `to_plain`, and `to_markdown` via `wasm-bindgen`,
-   each delegating to the existing `detect_format` / `extract_plain_with` /
-   `extract_markdown_with` API. Native builds never compile `wasm-bindgen`.
+   `crate-type = ["rlib", "cdylib"]`, and `src/wasm.rs` (compiled only on
+   `wasm32` with the `wasm-bindgen` feature) exports `detect`, `to_plain`, and
+   `to_markdown` via `wasm-bindgen`, each delegating to the existing
+   `detect_format` / `extract_plain_with` / `extract_markdown_with` API.
+   Native builds never compile `wasm-bindgen`.
 
 4. **Verify + demo — DONE.** `web/build.sh` builds the wasm cdylib and runs
    `wasm-bindgen --target web`; `web/index.html` + `web/demo.js` load it and
@@ -143,7 +147,7 @@ through `extract_*_to(IoSink(stdout))`. Measured on a synthetic 13.45 MB XLSX
 peak RSS via `VmHWM` (`/proc/self/status`):
 
 | path | plain RSS | markdown RSS |
-|------|----------:|-------------:|
+| ------ | ----------: | -------------: |
 | pre-streaming CLI (dense grid + `String`) | 326.5 MiB | 694.1 MiB |
 | `extract_*` → `String` (library, streaming internals) | 109 MiB | 114 MiB |
 | CLI / `extract_*_to` → `IoSink` | 19.9 MiB | 19.8 MiB |
@@ -157,6 +161,37 @@ For Workers (128 MiB default memory limit), use `extract_*_to` with an
 incremental sink rather than the `String` API, and set
 `ExtractOptions.max_output_bytes` to bound output (the budget error is
 `"output exceeded {n} bytes"`).
+
+Vault's runtime options pin keeps OCR out of the isolate by disabling the
+textless/garbled PDF fallback:
+
+```rust
+ExtractOptions {
+    images: false,
+    ocr: false,
+    auto_ocr: false,
+    max_output_bytes: Some(2 * 1024 * 1024),
+}
+```
+
+Empty native text + `auto_ocr: false` returns the existing no-text error
+(`"PDF contains no extractable text (may be scanned/image-only)"`), which
+Vault maps to `OcrNeeded`. No models are downloaded or required.
+
+### Workers (compile shape)
+
+Worker **compile** shape (Vault pin):
+
+```toml
+batdoc-core = { git = "https://github.com/daemonp/batdoc", default-features = false }
+```
+
+Do not enable the `wasm-bindgen` feature. Vault is the consumer.
+`ocrs` and `rten` remain in the graph — `--no-default-features` only drops
+`ureq`. CI fails the build if `batdoc_core.wasm` exceeds 10 MB or if
+`wasm-bindgen` is a *direct* dependency of `batdoc-core` (it stays
+present transitively via `getrandom`). An optional `ocr` feature to strip
+`ocrs`/`rten` is out of scope unless the size gate fails later.
 
 Known streaming behavior changes (vs. the buffered path, both non-OCR only):
 

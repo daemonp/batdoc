@@ -86,19 +86,24 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Extract per-page text, transparently falling back to OCR when the user did
-/// not pass `--ocr` but the document has no text layer at all.
+/// Extract per-page text, transparently falling back to OCR when every page
+/// is textless and `auto_ocr` is enabled (and `ocr` was not requested).
+/// With `auto_ocr: false` the textless pages are returned as-is (no OCR).
 ///
 /// Returns the per-page text and whether OCR was actually performed (which
 /// drives the wording of the no-text error if OCR also finds nothing).
-fn extract_pages_with_fallback(data: &[u8], ocr: bool) -> Result<(Vec<String>, bool)> {
-    let pages = extract_pages_with_ocr(data, ocr)?;
-    if ocr || pages.iter().any(|p| !p.is_empty()) {
-        return Ok((pages, ocr));
+fn extract_pages_with_fallback(data: &[u8], opts: ExtractOptions) -> Result<(Vec<String>, bool)> {
+    let pages = extract_pages_with_ocr(data, opts.ocr)?;
+    if opts.ocr || pages.iter().any(|p| !p.is_empty()) {
+        return Ok((pages, opts.ocr));
     }
-    // Every page is textless and OCR wasn't requested: this is a scan, so
-    // retry with OCR. A textless-but-empty document (no images) costs only a
-    // re-parse here; `ocr_page` finds nothing and reports it at the call site.
+    // Every page is textless and OCR wasn't requested. Unless `auto_ocr` is
+    // disabled (Vault), this is a scan: retry with OCR. A textless-but-empty
+    // document (no images) costs only a re-parse here; `ocr_page` finds
+    // nothing and reports it at the call site.
+    if !opts.auto_ocr {
+        return Ok((pages, false));
+    }
     let ocr_pages = extract_pages_with_ocr(data, true)?;
     Ok((ocr_pages, true))
 }
@@ -162,7 +167,7 @@ pub(crate) fn extract_plain_to(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
-    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
+    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts)?;
 
     let mut first = true;
     let mut wrote = false;
@@ -223,12 +228,17 @@ fn render_pages(
             had_native_lines = true;
         }
         if garbled {
-            native.clear(); // garbage native layer: OCR replaces it
+            // Garbage native layer: dropped unconditionally. With `auto_ocr`
+            // it is replaced by OCR below; with `auto_ocr: false` the page
+            // simply yields empty (→ no_text_error), which Vault maps to
+            // OcrNeeded rather than emitting garbage text.
+            native.clear();
         }
         // OCR when asked, when the page assembled no non-empty lines
         // (auto-fallback, mirroring `extract_pages_with_fallback`), or when
         // the native layer is garbage.
-        let need_ocr = opts.ocr || garbled || native.iter().all(|l| l.text.trim().is_empty());
+        let need_ocr = opts.ocr
+            || (opts.auto_ocr && (garbled || native.iter().all(|l| l.text.trim().is_empty())));
         let mut ocr_lines = Vec::new();
         let mut unplaced_text = String::new();
         if need_ocr {
@@ -467,7 +477,27 @@ mod tests {
     fn extract_plain_textless_pdf_auto_ocrs_and_reports() {
         // A structurally valid PDF with no page tree (so text extraction succeeds
         // but yields zero pages); large enough for `%%EOF`/`startxref` detection.
-        let data = b"%PDF-1.4\n\
+        let data = textless_pdf();
+        // The PDF falls back to OCR even without --ocr, so a textless-but-empty
+        // document reports the OCR-failed message in both the explicit and the
+        // implicit (auto-fallback) OCR cases.
+        for opts in [
+            crate::ExtractOptions::default(),
+            crate::ExtractOptions {
+                ocr: true,
+                ..crate::ExtractOptions::default()
+            },
+        ] {
+            let err = extract_plain(data, opts).unwrap_err().to_string();
+            assert!(err.contains("OCR found nothing"), "got: {err}");
+        }
+    }
+
+    /// Structurally valid PDF with an empty page tree: text extraction
+    /// succeeds but yields zero pages, so it exercises the textless/fallback
+    /// error paths without needing OCR models.
+    fn textless_pdf() -> &'static [u8] {
+        b"%PDF-1.4\n\
 1 0 obj\n\
 << /Type /Catalog /Pages 2 0 R >>\n\
 endobj\n\
@@ -483,20 +513,60 @@ trailer\n\
 << /Size 3 /Root 1 0 R >>\n\
 startxref\n\
 110\n\
-%%EOF\n";
-        // The PDF falls back to OCR even without --ocr, so a textless-but-empty
-        // document reports the OCR-failed message in both the explicit and the
-        // implicit (auto-fallback) OCR cases.
-        for opts in [
-            crate::ExtractOptions::default(),
+%%EOF\n"
+    }
+
+    #[test]
+    fn extract_plain_auto_ocr_false_does_not_ocr() {
+        let err = extract_plain(
+            textless_pdf(),
             crate::ExtractOptions {
-                ocr: true,
-                ..crate::ExtractOptions::default()
+                images: false,
+                ocr: false,
+                auto_ocr: false,
+                max_output_bytes: None,
             },
-        ] {
-            let err = extract_plain(data, opts).unwrap_err().to_string();
-            assert!(err.contains("OCR found nothing"), "got: {err}");
-        }
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("may be scanned/image-only"), "got: {err}");
+        assert!(!err.contains("OCR"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_plain_ocr_true_auto_ocr_false_still_ocrs() {
+        let err = extract_plain(
+            textless_pdf(),
+            crate::ExtractOptions {
+                images: false,
+                ocr: true,
+                auto_ocr: false,
+                max_output_bytes: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("OCR found nothing"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_markdown_auto_ocr_false_does_not_ocr() {
+        // Use a 1-page PDF with an empty text layer (not the zero-page
+        // `textless_pdf()`): page_count 0 never enters `render_pages`, which
+        // would let this pass without exercising the markdown `need_ocr` branch.
+        let err = extract_markdown(
+            &build_text_pdf(&[""]),
+            crate::ExtractOptions {
+                images: false,
+                ocr: false,
+                auto_ocr: false,
+                max_output_bytes: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no extractable text"), "got: {err}");
+        assert!(!err.contains("OCR found nothing"), "got: {err}");
     }
 
     #[test]
@@ -606,7 +676,7 @@ startxref\n\
     fn markdown_textless_pdf_reports_no_text_error() {
         // For the zero-page fixture, the markdown path emits the no-text
         // error (not the OCR wording the plain path uses after auto-OCR).
-        let data = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\nxref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n110\n%%EOF\n";
+        let data = textless_pdf();
         let err = extract_markdown(data, crate::ExtractOptions::default())
             .unwrap_err()
             .to_string();

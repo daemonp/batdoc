@@ -9,6 +9,7 @@ cargo build \
   --release \
   -p batdoc-core \
   --no-default-features \
+  --features wasm-bindgen \
   --manifest-path "$ROOT/Cargo.toml"
 
 wasm-bindgen \

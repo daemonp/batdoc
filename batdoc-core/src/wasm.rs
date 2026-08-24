@@ -5,8 +5,8 @@
 //! model files have been seeded via `BATDOC_MODELS_DIR` (or embedded by the
 //! caller before invoking these functions).
 //!
-//! This module is only compiled for `wasm32` targets; native builds never
-//! pull in `wasm-bindgen`.
+//! This module is only compiled for `wasm32` targets with the `wasm-bindgen`
+//! cargo feature enabled; native builds never pull in `wasm-bindgen`.
 
 #![cfg(target_arch = "wasm32")]
 
