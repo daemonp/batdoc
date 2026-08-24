@@ -86,8 +86,9 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Extract per-page text, transparently falling back to OCR when the user did
-/// not pass `--ocr` but the document has no text layer at all.
+/// Extract per-page text, transparently falling back to OCR when every page
+/// is textless and `auto_ocr` is enabled (and `ocr` was not requested).
+/// With `auto_ocr: false` the textless pages are returned as-is (no OCR).
 ///
 /// Returns the per-page text and whether OCR was actually performed (which
 /// drives the wording of the no-text error if OCR also finds nothing).
@@ -227,7 +228,11 @@ fn render_pages(
             had_native_lines = true;
         }
         if garbled {
-            native.clear(); // garbage native layer: OCR replaces it
+            // Garbage native layer: dropped unconditionally. With `auto_ocr`
+            // it is replaced by OCR below; with `auto_ocr: false` the page
+            // simply yields empty (→ no_text_error), which Vault maps to
+            // OcrNeeded rather than emitting garbage text.
+            native.clear();
         }
         // OCR when asked, when the page assembled no non-empty lines
         // (auto-fallback, mirroring `extract_pages_with_fallback`), or when

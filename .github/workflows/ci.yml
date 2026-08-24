@@ -85,6 +85,9 @@ jobs:
             exit 1
           fi
 
+      - name: Worker-shaped rlib compiles (exact Vault pin)
+        run: cargo check --target wasm32-unknown-unknown -p batdoc-core --no-default-features
+
       - name: Browser feature still typechecks
         run: cargo check --target wasm32-unknown-unknown -p batdoc-core --no-default-features --features wasm-bindgen
 
