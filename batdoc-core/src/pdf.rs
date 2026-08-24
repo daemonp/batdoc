@@ -91,14 +91,18 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
 ///
 /// Returns the per-page text and whether OCR was actually performed (which
 /// drives the wording of the no-text error if OCR also finds nothing).
-fn extract_pages_with_fallback(data: &[u8], ocr: bool) -> Result<(Vec<String>, bool)> {
-    let pages = extract_pages_with_ocr(data, ocr)?;
-    if ocr || pages.iter().any(|p| !p.is_empty()) {
-        return Ok((pages, ocr));
+fn extract_pages_with_fallback(data: &[u8], opts: ExtractOptions) -> Result<(Vec<String>, bool)> {
+    let pages = extract_pages_with_ocr(data, opts.ocr)?;
+    if opts.ocr || pages.iter().any(|p| !p.is_empty()) {
+        return Ok((pages, opts.ocr));
     }
-    // Every page is textless and OCR wasn't requested: this is a scan, so
-    // retry with OCR. A textless-but-empty document (no images) costs only a
-    // re-parse here; `ocr_page` finds nothing and reports it at the call site.
+    // Every page is textless and OCR wasn't requested. Unless `auto_ocr` is
+    // disabled (Vault), this is a scan: retry with OCR. A textless-but-empty
+    // document (no images) costs only a re-parse here; `ocr_page` finds
+    // nothing and reports it at the call site.
+    if !opts.auto_ocr {
+        return Ok((pages, false));
+    }
     let ocr_pages = extract_pages_with_ocr(data, true)?;
     Ok((ocr_pages, true))
 }
@@ -162,7 +166,7 @@ pub(crate) fn extract_plain_to(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
-    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts.ocr)?;
+    let (pages, ocr_attempted) = extract_pages_with_fallback(data, opts)?;
 
     let mut first = true;
     let mut wrote = false;
@@ -228,7 +232,8 @@ fn render_pages(
         // OCR when asked, when the page assembled no non-empty lines
         // (auto-fallback, mirroring `extract_pages_with_fallback`), or when
         // the native layer is garbage.
-        let need_ocr = opts.ocr || garbled || native.iter().all(|l| l.text.trim().is_empty());
+        let need_ocr = opts.ocr
+            || (opts.auto_ocr && (garbled || native.iter().all(|l| l.text.trim().is_empty())));
         let mut ocr_lines = Vec::new();
         let mut unplaced_text = String::new();
         if need_ocr {
