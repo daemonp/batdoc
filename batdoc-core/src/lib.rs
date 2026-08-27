@@ -9,6 +9,7 @@
 
 mod arena;
 mod codepage;
+mod csv;
 mod dateconv;
 mod doc;
 mod docx;
@@ -31,6 +32,7 @@ mod xls;
 mod xlsx;
 mod xml_util;
 
+pub use csv::{escape_field, to_csv_row, CsvSink};
 pub use error::{BatdocError, Result};
 pub use ocr::models_present;
 pub use sheets::{BudgetSheetSink, Sheet, SheetSink};
