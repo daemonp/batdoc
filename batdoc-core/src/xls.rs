@@ -81,7 +81,6 @@ pub(crate) fn extract_markdown(data: &[u8]) -> crate::error::Result<String> {
 }
 
 /// Stream structured sheets into `sink` (visible worksheets only).
-#[allow(dead_code)] // consumed by write_sheets entry in task 4
 pub(crate) fn extract_sheets_to(
     data: &[u8],
     sink: &mut impl SheetSink,

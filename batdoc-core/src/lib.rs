@@ -369,6 +369,80 @@ pub fn to_markdown(data: &[u8], images: bool) -> Result<String> {
     extract_markdown(data, format, images)
 }
 
+/// Extract all sheets into a `Vec<Sheet>` (collecting — O(cells) memory).
+///
+/// Prefer [`extract_sheets_to`] on large workbooks. Only `Format::Xls` and
+/// `Format::Xlsx` are supported.
+///
+/// # Errors
+///
+/// [`BatdocError::Document`] for non-spreadsheet formats or parse failures.
+pub fn extract_sheets(data: &[u8], format: Format) -> Result<Vec<Sheet>> {
+    extract_sheets_with(data, format, ExtractOptions::default())
+}
+
+/// Like [`extract_sheets`] with options. Only `max_output_bytes` is honored;
+/// `images` / `ocr` / `auto_ocr` are ignored.
+///
+/// # Errors
+///
+/// See [`extract_sheets_to`].
+pub fn extract_sheets_with(
+    data: &[u8],
+    format: Format,
+    opts: ExtractOptions,
+) -> Result<Vec<Sheet>> {
+    let mut sheets = Vec::new();
+    extract_sheets_to(data, format, opts, &mut sheets)?;
+    Ok(sheets)
+}
+
+/// Stream structured tabular data into `sink`.
+///
+/// When `opts.max_output_bytes` is `Some`, wraps `sink` in
+/// [`BudgetSheetSink`] (payload estimate: sheet name bytes + per-cell
+/// `len+1`; not wire/JS heap size). Peak process memory still includes
+/// the input buffer and shared-string table.
+///
+/// # Errors
+///
+/// `"tabular extraction is only supported for XLS and XLSX"` for other
+/// formats; budget / column / parse errors otherwise.
+pub fn extract_sheets_to(
+    data: &[u8],
+    format: Format,
+    opts: ExtractOptions,
+    sink: &mut impl SheetSink,
+) -> Result<()> {
+    match opts.max_output_bytes {
+        Some(max) => {
+            let mut limited = BudgetSheetSink::new(sink, max);
+            write_sheets(data, format, &mut limited)
+        }
+        None => write_sheets(data, format, sink),
+    }
+}
+
+fn write_sheets(data: &[u8], format: Format, sink: &mut impl SheetSink) -> Result<()> {
+    match format {
+        Format::Xlsx => xlsx::extract_sheets_to(data, sink),
+        Format::Xls => xls::extract_sheets_to(data, sink),
+        _ => Err(BatdocError::Document(
+            "tabular extraction is only supported for XLS and XLSX".into(),
+        )),
+    }
+}
+
+/// Detect format and extract sheets (collecting).
+///
+/// # Errors
+///
+/// [`detect_format`] or [`extract_sheets`] errors.
+pub fn to_sheets(data: &[u8]) -> Result<Vec<Sheet>> {
+    let format = detect_format(data)?;
+    extract_sheets(data, format)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +510,85 @@ mod tests {
             .to_string();
         assert_eq!(a, b);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn extract_sheets_rejects_non_spreadsheet() {
+        for fmt in [Format::Pdf, Format::Docx] {
+            let err = extract_sheets(b"%PDF-1.4", fmt).unwrap_err().to_string();
+            assert_eq!(err, "tabular extraction is only supported for XLS and XLSX");
+        }
+    }
+
+    #[allow(clippy::assert_is_empty)] // intentionally brief verbatim assertion
+    #[test]
+    fn extract_sheets_routes_xlsx_and_honors_budget() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, body) in [
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>Hello</t></is></c></row>
+  </sheetData>
+</worksheet>"#,
+            ),
+        ] {
+            z.start_file(name, SimpleFileOptions::default()).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        let data = z.finish().unwrap().into_inner();
+
+        // Routing: public collecting wrapper reaches the real implementation.
+        let sheets = extract_sheets(&data, Format::Xlsx).unwrap();
+        assert_eq!(sheets.len(), 1);
+        assert_eq!(sheets[0].name, "S");
+        assert_eq!(sheets[0].rows, vec![vec!["Hello"]]);
+
+        // Budget: name "S" = 1; row ["Hello"] = 5+1 = 6 → total 7 > 3.
+        let mut out = Vec::<Sheet>::new();
+        let err = extract_sheets_to(
+            &data,
+            Format::Xlsx,
+            ExtractOptions {
+                max_output_bytes: Some(3),
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "output exceeded 3 bytes");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].rows.is_empty());
+    }
+
+    #[test]
+    fn to_sheets_rejects_unrecognized() {
+        let err = to_sheets(b"hello, definitely not a document")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "not a supported document (unrecognized format)");
     }
 }

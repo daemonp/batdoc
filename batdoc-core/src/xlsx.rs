@@ -152,7 +152,6 @@ fn densify_sheet_row(cells: &[(usize, String, String)]) -> Vec<String> {
 }
 
 /// Stream structured sheets into `sink`. Does not load hyperlinks.
-#[allow(dead_code)] // consumed by write_sheets entry in task 4
 pub(crate) fn extract_sheets_to(
     data: &[u8],
     sink: &mut impl SheetSink,
