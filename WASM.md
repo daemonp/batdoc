@@ -223,9 +223,13 @@ cd web && python3 -m http.server 8000    # then open http://localhost:8000/
 Notes:
 
 - `web/pkg/` and `web/samples/` are generated and git-ignored.
-- The exported functions are `detect(data)`, `to_plain(data)`, and
-  `to_markdown(data, images, ocr)` — `data` is a `Uint8Array`; errors throw a
-  JS `Error` with the `BatdocError` message.
+- The exported functions are `detect(data)`, `to_plain(data)`,
+  `to_markdown(data, images, ocr)`, `to_sheets(data, max_output_bytes)`, and
+  `to_sheets_stream(data, max_output_bytes, on_begin_sheet, on_row,
+  on_end_sheet)` — `data` is a `Uint8Array`; errors throw a JS `Error` with
+  the `BatdocError` message.
+- `to_sheets_stream` invokes its callbacks synchronously — Promises returned
+  by the callbacks are not awaited.
 - This build disables `net`, so OCR model files are **not** downloaded — they
   must be seeded (e.g. preloaded into the cache dir the library resolves). The
   document/text pipeline (DOCX/XLSX/PPTX/DOC/XLS/PDF-text) needs no models and
@@ -236,3 +240,24 @@ Notes:
 - Source of the full dependency graph: `cargo tree -p batdoc-core`,
   `cargo tree -i getrandom`, `cargo tree -i rayon`.
 - OCR engine: [ocrs](https://github.com/robertknight/ocrs), [rten](https://github.com/robertknight/rten).
+
+## Tabular sheets API
+
+- **Worker / rlib (primary):** `extract_sheets_to` + `SheetSink`. Streaming
+  output is one row at a time. Peak still includes input bytes + shared-string
+  arena (+ full OLE workbook buffer for `.xls`).
+- **Collecting:** `extract_sheets` / `to_sheets` are O(total cells) — unsafe on
+  multi-million-cell workbooks inside a 128 MiB isolate even with
+  `max_output_bytes` (budget counts payload estimate, not heap overhead).
+- **Budget:** `begin_sheet` counts `name.len()`; each `row` counts
+  `Σ(cell.len()+1)`; error string `output exceeded {n} bytes`.
+- **Wasm (secondary):** `to_sheets` / `to_sheets_stream` behind
+  `wasm-bindgen`. Stream callbacks are synchronous; do not return Promises
+  expecting them to be awaited. Prefer per-sheet flush; never accumulate the
+  whole workbook in JS for large files.
+- **Hyperlinks:** sheet mode returns display text only (no `[text](url)`).
+- **Measurement:** no checked-in fixture/harness exists to re-run here. The
+  2026-08-18 streaming-extract run measured streaming TSV on a 13.45 MB
+  synthetic XLSX at ~19.9 MiB peak; sheet streaming is expected in the same
+  band (same shared-string arena + one densified row, and it skips plain's
+  hyperlink pass). Collecting into `Vec<Sheet>` / `to_sheets` grows O(cells).
