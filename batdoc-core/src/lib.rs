@@ -23,6 +23,7 @@ mod pdf_ocr;
 mod pdf_text;
 mod pptx;
 mod sheet;
+mod sheets;
 mod sink;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 mod wasm;
@@ -32,6 +33,7 @@ mod xml_util;
 
 pub use error::{BatdocError, Result};
 pub use ocr::models_present;
+pub use sheets::{BudgetSheetSink, Sheet, SheetSink};
 pub use sink::{BudgetSink, ExtractSink, IoSink};
 
 use std::io::Cursor;
