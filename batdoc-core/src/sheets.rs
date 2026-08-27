@@ -113,7 +113,6 @@ impl<S: SheetSink> SheetSink for BudgetSheetSink<S> {
 }
 
 /// Apply plain-mode trailing trim semantics to a densified row.
-#[allow(dead_code)] // consumed by xls/xlsx extract_sheets_to in tasks 2/3
 pub(crate) fn finalize_sheet_row(mut dense: Vec<String>) -> Option<Vec<String>> {
     while dense.last().is_some_and(|c| c.trim().is_empty()) {
         dense.pop();

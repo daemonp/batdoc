@@ -16,6 +16,7 @@ use crate::sheet::{
     write_markdown_data_row, write_markdown_header, write_markdown_separator, write_plain_row,
     TableShape, MAX_COLS,
 };
+use crate::sheets::{finalize_sheet_row, SheetSink};
 use crate::ExtractSink;
 
 // ── BIFF8 record types ────────────────────────────────────────────
@@ -77,6 +78,41 @@ pub(crate) fn extract_markdown(data: &[u8]) -> crate::error::Result<String> {
     let mut out = String::new();
     extract_markdown_to(data, &mut out)?;
     Ok(out)
+}
+
+/// Stream structured sheets into `sink` (visible worksheets only).
+#[allow(dead_code)] // consumed by write_sheets entry in task 4
+pub(crate) fn extract_sheets_to(
+    data: &[u8],
+    sink: &mut impl SheetSink,
+) -> crate::error::Result<()> {
+    let wb = open_workbook(data)?;
+    let visible: Vec<&SheetEntry> = wb
+        .sheets
+        .iter()
+        .filter(|e| e.sheet_type == 0 && e.visibility == 0)
+        .collect();
+    for entry in visible {
+        sink.begin_sheet(&entry.name)?;
+        if let Some(mut walk) = SheetWalk::start(&wb.buf, entry.bof_offset) {
+            let mut current = CurrentRow::new();
+            while let Some((row, col, value)) = walk.next_cell(&wb.sst, &wb.xf_styles, wb.cp)? {
+                if let Some(prev) = current.push(row, col, value)? {
+                    if let Some(dense) = finalize_sheet_row(densify_plain_row(&prev)) {
+                        sink.row(dense)?;
+                    }
+                }
+            }
+            let last = current.take();
+            if !last.is_empty() {
+                if let Some(dense) = finalize_sheet_row(densify_plain_row(&last)) {
+                    sink.row(dense)?;
+                }
+            }
+        }
+        sink.end_sheet()?;
+    }
+    Ok(())
 }
 
 /// Stream markdown from a BIFF8 .xls file into `sink`.
@@ -1519,5 +1555,56 @@ mod tests {
         ]);
         let md = extract_markdown(&data).unwrap();
         assert_eq!(md, "| Hello |\n| --- |\n\n");
+    }
+
+    #[test]
+    fn xls_sheets_two_rows() {
+        let data = two_row_xls();
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(sheets.len(), 1);
+        assert_eq!(sheets[0].name, "Sheet1");
+        let expected: Vec<Vec<String>> = vec![
+            vec!["Name".into(), "Age".into()],
+            vec!["Alice".into(), "30".into()],
+        ];
+        assert_eq!(sheets[0].rows, expected);
+    }
+
+    #[allow(clippy::assert_is_empty)] // intentionally brief-verbatim assertion
+    #[test]
+    fn xls_sheets_multi_and_empty_sheet_still_begins() {
+        let data = xls_with_sheets(&[
+            ("Empty", vec![label(0, 0, "  ")]),
+            ("Data", vec![label(0, 0, "Hello")]),
+        ]);
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0].name, "Empty");
+        assert!(sheets[0].rows.is_empty()); // whitespace-only row dropped
+        let expected: Vec<Vec<String>> = vec![vec!["Hello".into()]];
+        assert_eq!(sheets[1].rows, expected);
+    }
+
+    #[test]
+    fn xls_sheets_rejects_col_512() {
+        let data = xls_with_label(0, 512, "X");
+        let mut sheets = Vec::<crate::Sheet>::new();
+        let err = extract_sheets_to(&data, &mut sheets)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "sheet exceeds 512 columns");
+    }
+
+    #[test]
+    fn xls_sheets_sparse_gap() {
+        let data = xls_with_sheets(&[("S", vec![label(0, 0, "First"), label(0, 2, "Third")])]);
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(
+            sheets[0].rows,
+            vec![vec!["First".into(), String::new(), "Third".into()]]
+        );
     }
 }
