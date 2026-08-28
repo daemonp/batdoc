@@ -18,6 +18,7 @@ use crate::sheet::{
     write_markdown_data_row, write_markdown_header, write_markdown_separator, write_plain_row,
     TableShape, MAX_COLS,
 };
+use crate::sheets::{finalize_sheet_row, SheetSink};
 use crate::xml_util::{self, get_attr, Rels};
 use crate::ExtractSink;
 
@@ -133,6 +134,60 @@ pub(crate) fn extract_markdown_to(
         }
     }
 
+    Ok(())
+}
+
+/// Densify sparse XLSX cells without hyperlink wrapping.
+fn densify_sheet_row(cells: &[(usize, String, String)]) -> Vec<String> {
+    let Some(max_col) = cells.iter().map(|(col, _, _)| *col).max() else {
+        return Vec::new();
+    };
+    let mut dense = vec![String::new(); max_col + 1];
+    for (col, value, _) in cells {
+        if *col < dense.len() {
+            dense[*col].clone_from(value);
+        }
+    }
+    dense
+}
+
+/// Stream structured sheets into `sink`. Does not load hyperlinks.
+pub(crate) fn extract_sheets_to(
+    data: &[u8],
+    sink: &mut impl SheetSink,
+) -> crate::error::Result<()> {
+    let cursor = Cursor::new(data);
+    let mut archive = ZipArchive::new(cursor)?;
+    let shared_strings = parse_shared_strings_arena(&mut archive);
+    let styles = parse_styles(&mut archive);
+    let sheet_info = discover_sheets(&mut archive)?;
+
+    for (name, path) in &sheet_info {
+        sink.begin_sheet(name)?;
+        if let Ok(mut reader) = xml_util::open_xml(&mut archive, path) {
+            let mut buf = Vec::new();
+            loop {
+                let kind = match reader.read_event_into(&mut buf) {
+                    Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"row" => 1u8,
+                    Ok(Event::Eof) | Err(_) => 2,
+                    _ => 0,
+                };
+                buf.clear();
+                match kind {
+                    1 => {
+                        let cells =
+                            parse_row_arena(&mut reader, &mut buf, &shared_strings, &styles)?;
+                        if let Some(row) = finalize_sheet_row(densify_sheet_row(&cells)) {
+                            sink.row(row)?;
+                        }
+                    }
+                    2 => break,
+                    _ => {}
+                }
+            }
+        }
+        sink.end_sheet()?;
+    }
     Ok(())
 }
 
@@ -1847,5 +1902,135 @@ mod tests {
         ]);
         let md = crate::extract_markdown(&data, crate::Format::Xlsx, false).unwrap();
         assert_eq!(md, "| [Click here](https://example.com) |\n| --- |\n\n");
+    }
+
+    // ── structured sheet extraction (no hyperlink pass) ───────────
+
+    #[test]
+    fn xlsx_sheets_two_rows() {
+        let data = minimal_xlsx_two_rows();
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(sheets[0].name, "Sheet1");
+        // Type-hinted expectation: String: PartialEq<&str> and String:
+        // PartialEq<String> are both viable, so `.into()` needs an anchor.
+        let expected: Vec<Vec<String>> = vec![
+            vec!["Name".into(), "Age".into()],
+            vec!["Alice".into(), "30".into()],
+        ];
+        assert_eq!(sheets[0].rows, expected);
+    }
+
+    #[allow(clippy::assert_is_empty)] // intentionally-brief-verbatim assertion
+    #[test]
+    fn xlsx_sheets_empty_sheet_still_present() {
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            ("xl/workbook.xml", workbook_two_sheets()),
+            ("xl/_rels/workbook.xml.rels", workbook_two_sheet_rels()),
+            (
+                "xl/worksheets/sheet1.xml",
+                &sheet_xml(r#"<row r="1"><c r="A1"><v></v></c></row>"#),
+            ),
+            (
+                "xl/worksheets/sheet2.xml",
+                &sheet_xml(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>NYC</t></is></c></row>"#),
+            ),
+        ]);
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(sheets.len(), 2);
+        assert_eq!(sheets[0].name, "People");
+        assert!(sheets[0].rows.is_empty());
+        assert_eq!(sheets[1].name, "Places");
+        let expected: Vec<Vec<String>> = vec![vec!["NYC".into()]];
+        assert_eq!(sheets[1].rows, expected);
+    }
+
+    #[test]
+    fn xlsx_sheets_hyperlink_is_raw_text_not_markdown() {
+        // Same structure as xlsx_plain_hyperlink_wraps_cell fixture
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>Click here</t></is></c></row>
+  </sheetData>
+  <hyperlinks>
+    <hyperlink ref="A1" r:id="rId1"/>
+  </hyperlinks>
+</worksheet>"#,
+            ),
+        ]);
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(sheets[0].rows[0][0], "Click here");
+        // plain still wraps:
+        let plain = crate::extract_plain(&data, crate::Format::Xlsx).unwrap();
+        assert_eq!(plain, "[Click here](https://example.com)\n");
+    }
+
+    #[test]
+    fn xlsx_sheets_sparse_gap() {
+        let data = zip_xlsx(&[
+            ("[Content_Types].xml", r#"<?xml version="1.0"?><Types/>"#),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r"<sst><si><t>First</t></si><si><t>Third</t></si></sst>",
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                &sheet_xml(
+                    r#"<row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row>"#,
+                ),
+            ),
+        ]);
+        let mut sheets = Vec::<crate::Sheet>::new();
+        extract_sheets_to(&data, &mut sheets).unwrap();
+        assert_eq!(
+            sheets[0].rows[0],
+            vec!["First".into(), String::new(), "Third".into()]
+        );
     }
 }
