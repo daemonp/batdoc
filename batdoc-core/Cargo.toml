@@ -16,21 +16,24 @@ crate-type = ["rlib", "cdylib"]
 base64 = "0.22"
 cfb = "0.13"
 encoding_rs = "0.8"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"], optional = true }
 lopdf = { version = "0.38", default-features = false }
-ocrs = { version = "0.12", default-features = false }
+ocrs = { version = "0.12", default-features = false, optional = true }
 pdf-extract = "0.10"
 quick-xml = "0.37"
-rten = { version = "0.24", default-features = false }
+rten = { version = "0.24", default-features = false, optional = true }
 thiserror = "2"
 ureq = { version = "2", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
-default = ["net"]
+default = ["net", "ocr"]
 # Model download over HTTP. Disable (--no-default-features) for offline,
 # embedded, or wasm targets where there is no socket/clock.
 net = ["dep:ureq"]
+# OCR inference (ocrs + rten engine + `image` decode). Disable for lean
+# wasm/embedded builds that do not OCR images or textless PDFs.
+ocr = ["dep:ocrs", "dep:rten", "dep:image"]
 # Browser JS glue + `src/wasm.rs` exports (`detect` / `to_plain` / `to_markdown` /
 # `to_sheets` / `to_sheets_stream`). Worker / rlib consumers leave this off.
 wasm-bindgen = ["dep:wasm-bindgen", "dep:js-sys"]
