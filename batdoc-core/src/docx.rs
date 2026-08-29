@@ -1734,7 +1734,7 @@ fn resolve_images(
                     }
                 }
                 if opts.ocr {
-                    *ocr_text = crate::ocr::ocr_image_bytes(&data)?;
+                    *ocr_text = crate::ocr_image_bytes(&data)?;
                 }
             }
         }
