@@ -30,6 +30,14 @@ jobs:
       - name: test
         run: cargo test
 
+      - name: batdoc-core test suite (feature-on and feature-off)
+        run: |
+          cargo test -p batdoc-core
+          cargo test -p batdoc-core --no-default-features
+
+      - name: Feature-off clippy (lints the cfg(not(ocr)) lib code)
+        run: cargo clippy -p batdoc-core --no-default-features -- -D warnings -W clippy::pedantic -W clippy::nursery
+
       - name: build
         run: cargo build --release
 

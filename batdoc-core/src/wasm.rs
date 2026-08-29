@@ -36,8 +36,9 @@ pub fn to_plain(data: &[u8]) -> Result<String, String> {
 }
 
 /// Detect + extract Markdown. `images` embeds DOCX/XLSX/PPTX images as
-/// base64 data URIs; `ocr` OCRs DOCX/PPTX embedded images (needs seeded
-/// models). Returns the Markdown, or throws with a descriptive message.
+/// base64 data URIs; `ocr` is accepted for API compatibility but is a no-op
+/// in this build (the `ocr` feature is off). Returns the Markdown, or
+/// throws with a descriptive message.
 #[wasm_bindgen]
 pub fn to_markdown(data: &[u8], images: bool, ocr: bool) -> Result<String, String> {
     let format = detect_format(data).map_err(|e| e.to_string())?;

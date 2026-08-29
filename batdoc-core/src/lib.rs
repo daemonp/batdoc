@@ -59,6 +59,9 @@ pub(crate) const OCR_COMPILED: bool = false;
 /// With the `ocr` feature disabled there is no OCR engine, so this is
 /// always `false`.
 #[cfg(not(feature = "ocr"))]
+#[must_use]
+// Not `const`: signature parity with the feature-on re-export.
+#[allow(clippy::missing_const_for_fn)]
 pub fn models_present() -> bool {
     false
 }
@@ -233,6 +236,9 @@ pub(crate) fn ocr_image_bytes(data: &[u8]) -> Result<Option<String>> {
 }
 
 #[cfg(not(feature = "ocr"))]
+// The Result/Option shape mirrors the feature-on variant — call sites
+// use `?` on it.
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn ocr_image_bytes(_data: &[u8]) -> Result<Option<String>> {
     Ok(None)
 }
