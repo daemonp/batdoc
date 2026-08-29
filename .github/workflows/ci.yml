@@ -30,6 +30,14 @@ jobs:
       - name: test
         run: cargo test
 
+      - name: batdoc-core test suite (feature-on and feature-off)
+        run: |
+          cargo test -p batdoc-core
+          cargo test -p batdoc-core --no-default-features
+
+      - name: Feature-off clippy (lints the cfg(not(ocr)) lib code)
+        run: cargo clippy -p batdoc-core --no-default-features -- -D warnings -W clippy::pedantic -W clippy::nursery
+
       - name: build
         run: cargo build --release
 
@@ -72,14 +80,18 @@ jobs:
         with:
           key: worker-wasm
 
-      - name: Worker-shaped graph (no direct wasm-bindgen; log ocrs/rten)
+      - name: Worker-shaped graph (no direct wasm-bindgen; ocrs/rten absent)
         run: |
           set -euo pipefail
           tree="$(cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features --prefix none)"
           direct="$(cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features --prefix none --depth 1)"
           echo "$tree"
-          cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features -i ocrs || true
-          cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features -i rten || true
+          for pkg in ocrs rten; do
+            if cargo tree -p batdoc-core --target wasm32-unknown-unknown --no-default-features --prefix none -i "$pkg" 2>/dev/null | grep -q .; then
+              echo "$pkg must not be reachable in the Worker-shaped (--no-default-features) build" >&2
+              exit 1
+            fi
+          done
           if echo "$direct" | grep -q '^wasm-bindgen '; then
             echo "wasm-bindgen must not be a direct dep in the Worker-shaped build" >&2
             exit 1

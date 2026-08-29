@@ -1,9 +1,10 @@
 //! Browser-facing entry points for the `wasm32-unknown-unknown` build.
 //!
-//! Bytes in, text out — no file I/O, no terminal. The OCR *model download*
-//! path is feature-gated off (`--no-default-features`); OCR still works when
-//! model files have been seeded via `BATDOC_MODELS_DIR` (or embedded by the
-//! caller before invoking these functions).
+//! Bytes in, text out — no file I/O, no terminal. This module is only
+//! meaningful when built with `--no-default-features --features wasm-bindgen`,
+//! which also disables `net` (model download) and `ocr` (inference) — so no
+//! image OCR or textless-PDF fallback is available in the browser build. The
+//! `ocr` parameter of `to_markdown` is accepted but is a no-op here.
 //!
 //! This module is only compiled for `wasm32` targets with the `wasm-bindgen`
 //! cargo feature enabled; native builds never pull in `wasm-bindgen`.
@@ -35,8 +36,9 @@ pub fn to_plain(data: &[u8]) -> Result<String, String> {
 }
 
 /// Detect + extract Markdown. `images` embeds DOCX/XLSX/PPTX images as
-/// base64 data URIs; `ocr` OCRs DOCX/PPTX embedded images (needs seeded
-/// models). Returns the Markdown, or throws with a descriptive message.
+/// base64 data URIs; `ocr` is accepted for API compatibility but is a no-op
+/// in this build (the `ocr` feature is off). Returns the Markdown, or
+/// throws with a descriptive message.
 #[wasm_bindgen]
 pub fn to_markdown(data: &[u8], images: bool, ocr: bool) -> Result<String, String> {
     let format = detect_format(data).map_err(|e| e.to_string())?;

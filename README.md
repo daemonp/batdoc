@@ -214,7 +214,8 @@ The CLI binary depends on `batdoc-core` (document extraction library),
 The `batdoc-core` library depends on `cfb`, `encoding_rs`, `quick-xml`,
 `zip`, `pdf-extract`, `lopdf`, `base64`, and `thiserror`, plus `ocrs`,
 `image`, and `ureq` for OCR and `rten` for model inference. No C, no
-system libs.
+system libs. `ocrs`, `rten`, `image`, and `ureq` are behind the default-on
+`ocr`/`net` features; `default-features = false` removes both.
 
 ## Library
 

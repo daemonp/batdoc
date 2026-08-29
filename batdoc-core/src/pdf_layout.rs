@@ -24,6 +24,9 @@ use crate::pdf_text::{PositionedChar, PositionedPage};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LineSource {
     Native,
+    // Constructed only by the OCR merge path (and the merge tests); kept
+    // when the `ocr` feature is off for those tests.
+    #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
     Ocr,
 }
 

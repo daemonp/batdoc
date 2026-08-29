@@ -558,7 +558,7 @@ fn parse_pptx(
                             }
                         }
                         if opts.ocr {
-                            if let Some(text) = crate::ocr::ocr_image_bytes(&data)? {
+                            if let Some(text) = crate::ocr_image_bytes(&data)? {
                                 ocr_texts.push(text);
                             }
                         }

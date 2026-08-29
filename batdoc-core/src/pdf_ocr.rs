@@ -4,16 +4,22 @@
 //! New: map OCR pixel-space lines into page points, and merge them with
 //! native PDF text lines while dropping overlaps.
 
+#[cfg(feature = "ocr")]
 use crate::ocr::MAX_OCR_IMAGE_DIM;
+#[cfg(feature = "ocr")]
 use crate::pdf_geometry::{PlacedImage, PtRect};
 use crate::pdf_layout::{Line, LineSource};
+#[cfg(feature = "ocr")]
 use lopdf::xobject::PdfImage;
+#[cfg(feature = "ocr")]
 use std::io::Cursor;
 
 /// Maximum number of embedded images OCR'd per page (largest first).
+#[cfg(feature = "ocr")]
 const MAX_OCR_IMAGES_PER_PAGE: usize = 4;
 /// Maximum decoded pixels per embedded image (~100 MP ≈ 300 MB RGB).
 /// Larger images are skipped so a single image cannot exhaust memory.
+#[cfg(feature = "ocr")]
 const MAX_OCR_IMAGE_PIXELS: u64 = 100_000_000;
 
 /// Overlap tolerance in page points for OCR/native dedup (liteparse
@@ -24,6 +30,7 @@ const OVERLAP_TOLERANCE_PT: f64 = 2.0;
 /// declared pixel area first, skipping images whose decoded size would
 /// exceed [`MAX_OCR_IMAGE_PIXELS`]. The cap must bound peak memory, which
 /// the declared dimensions determine (compressed images expand when decoded).
+#[cfg(feature = "ocr")]
 pub(crate) fn ocr_candidates<'a>(images: &'a [PdfImage<'a>]) -> Vec<&'a PdfImage<'a>> {
     let mut candidates: Vec<(&PdfImage, u64)> = images
         .iter()
@@ -48,6 +55,7 @@ pub(crate) fn ocr_candidates<'a>(images: &'a [PdfImage<'a>]) -> Vec<&'a PdfImage
 /// Decode JPEG bytes with strict dimension limits, so a stream whose real
 /// dimensions exceed the PDF dictionary's claim cannot allocate beyond the
 /// OCR pixel budget.
+#[cfg(feature = "ocr")]
 pub(crate) fn decode_jpeg_bounded(bytes: &[u8]) -> Option<image::RgbImage> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes));
     reader.set_format(image::ImageFormat::Jpeg);
@@ -65,6 +73,7 @@ pub(crate) fn decode_jpeg_bounded(bytes: &[u8]) -> Option<image::RgbImage> {
 /// leaves as `None`) or `ICCBased` — component count is read from the decoded
 /// buffer length.
 /// Returns `None` for other encodings (`CCITT`, `JPX`, `JBIG2`, `Indexed`, `CMYK`).
+#[cfg(feature = "ocr")]
 pub(crate) fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
     let filters: Vec<&str> = img.filters.iter().flatten().map(String::as_str).collect();
     if filters.contains(&"DCTDecode") {
@@ -117,6 +126,7 @@ pub(crate) fn decode_pdf_image(img: &PdfImage<'_>) -> Option<image::RgbImage> {
 
 /// Map OCR pixel-space lines for one embedded image into top-down page
 /// points via its placement (spec §6: `page_pt_per_pixel` = placed / pixels).
+#[cfg(feature = "ocr")]
 pub(crate) fn map_ocr_lines(
     placed: &PlacedImage,
     img_width_px: u32,
@@ -169,9 +179,12 @@ pub(crate) fn merge(native: Vec<Line>, ocr: Vec<Line>) -> Vec<Line> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ocr")]
     use crate::ocr::OcrTextLine;
+    use crate::pdf_geometry::PtRect;
     use crate::pdf_layout::LineSource;
 
+    #[cfg(feature = "ocr")]
     fn ocr_line(text: &str, x: i32, y: i32, w: u32, h: u32) -> OcrTextLine {
         OcrTextLine {
             text: text.into(),
@@ -192,6 +205,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn maps_pixel_lines_to_page_points() {
         // 100x50 px image placed at page rect x 72..272 (200pt), y 142..192 (50pt)
@@ -323,6 +337,7 @@ mod tests {
             .any(|l| l.text == "OcrTwo" && matches!(l.source, LineSource::Ocr)));
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn ocr_candidates_caps_and_ranks() {
         let dict = lopdf::Dictionary::new();
@@ -354,6 +369,7 @@ mod tests {
         assert_eq!((picked[3].width, picked[3].height), (100, 100));
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn decode_pdf_image_raw_rgb() {
         let mut dict = lopdf::Dictionary::new();
@@ -374,6 +390,7 @@ mod tests {
         assert_eq!(rgb.get_pixel(1, 1), &image::Rgb([255, 255, 255]));
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn decode_pdf_image_flate_gray() {
         let mut dict = lopdf::Dictionary::new();
@@ -407,6 +424,7 @@ mod tests {
         assert_eq!(rgb.get_pixel(0, 1), &image::Rgb([128, 128, 128])); // Luma 128
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn decode_pdf_image_indirect_iccbased_gray() {
         let mut origin = lopdf::Dictionary::new();
@@ -436,6 +454,7 @@ mod tests {
         assert_eq!(rgb.get_pixel(0, 1), &image::Rgb([128, 128, 128])); // Luma 128
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn decode_pdf_image_no_color_space_non_byte_multiple_skipped() {
         let mut dict = lopdf::Dictionary::new();
@@ -454,6 +473,7 @@ mod tests {
         assert!(decode_pdf_image(&img).is_none());
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn decode_pdf_image_overlong_buffer_skipped() {
         let mut dict = lopdf::Dictionary::new();
@@ -471,6 +491,7 @@ mod tests {
         assert!(decode_pdf_image(&img).is_none());
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn unknown_pdf_image_encoding_is_skipped() {
         let mut dict = lopdf::Dictionary::new();
@@ -488,6 +509,7 @@ mod tests {
         assert!(decode_pdf_image(&img).is_none());
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn decode_jpeg_bounded_enforces_dim_limits() {
         let encode = |w: u32, h: u32| {
