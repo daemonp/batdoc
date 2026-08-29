@@ -6,6 +6,9 @@
 //! [`pdf_text::PositionedChar`]). This is the join key for region-aware OCR
 //! merge in later phases.
 //!
+//! This module is only exercised by the OCR path; with the `ocr` feature off
+//! everything here is compiled but unreferenced.
+#![cfg_attr(not(feature = "ocr"), allow(dead_code))]
 //! PDF coordinate rules followed here:
 //! - Image `XObjects` paint the unit square `[0,0,1,1]` (PDF 32000 §8.9.5),
 //!   transformed by the current `CTM`.

@@ -65,25 +65,34 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
     if !ocr {
         return Ok(pages.iter().map(|p| clean_page(p)).collect());
     }
-    // Parse the document with lopdf ONCE for image extraction; if that
-    // fails, empty pages fall through as "no text" (same as non-OCR).
-    let doc_pages = lopdf::Document::load_mem(data)
-        .ok()
-        .map(|doc| (doc.get_pages().into_values().collect::<Vec<_>>(), doc));
-    let mut out = Vec::with_capacity(pages.len());
-    for (i, page) in pages.iter().enumerate() {
-        let cleaned = clean_page(page);
-        if !cleaned.is_empty() {
-            out.push(cleaned);
-            continue;
+    #[cfg(feature = "ocr")]
+    {
+        // Parse the document with lopdf ONCE for image extraction; if that
+        // fails, empty pages fall through as "no text" (same as non-OCR).
+        let doc_pages = lopdf::Document::load_mem(data)
+            .ok()
+            .map(|doc| (doc.get_pages().into_values().collect::<Vec<_>>(), doc));
+        let mut out = Vec::with_capacity(pages.len());
+        for (i, page) in pages.iter().enumerate() {
+            let cleaned = clean_page(page);
+            if !cleaned.is_empty() {
+                out.push(cleaned);
+                continue;
+            }
+            let ocr_text = match &doc_pages {
+                Some((page_ids, doc)) => ocr_page(doc, page_ids, i)?,
+                None => None,
+            };
+            out.push(ocr_text.map_or_else(String::new, |t| clean_page(&t)));
         }
-        let ocr_text = match &doc_pages {
-            Some((page_ids, doc)) => ocr_page(doc, page_ids, i)?,
-            None => None,
-        };
-        out.push(ocr_text.map_or_else(String::new, |t| clean_page(&t)));
+        Ok(out)
     }
-    Ok(out)
+    #[cfg(not(feature = "ocr"))]
+    {
+        // `ocr` is only ever `true` when the `ocr` feature is enabled; this
+        // tail is unreachable but keeps the feature-off config compiling.
+        Ok(pages.iter().map(|p| clean_page(p)).collect())
+    }
 }
 
 /// Extract per-page text, transparently falling back to OCR when every page
@@ -93,15 +102,19 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
 /// Returns the per-page text and whether OCR was actually performed (which
 /// drives the wording of the no-text error if OCR also finds nothing).
 fn extract_pages_with_fallback(data: &[u8], opts: ExtractOptions) -> Result<(Vec<String>, bool)> {
-    let pages = extract_pages_with_ocr(data, opts.ocr)?;
-    if opts.ocr || pages.iter().any(|p| !p.is_empty()) {
-        return Ok((pages, opts.ocr));
+    // With the `ocr` feature off there is no engine; `OCR_COMPILED &&`
+    // folds to `false` at compile time and also keeps `opts` referenced.
+    let ocr_requested = crate::OCR_COMPILED && opts.ocr;
+    let auto_ocr = crate::OCR_COMPILED && opts.auto_ocr;
+    let pages = extract_pages_with_ocr(data, ocr_requested)?;
+    if ocr_requested || pages.iter().any(|p| !p.is_empty()) {
+        return Ok((pages, ocr_requested));
     }
     // Every page is textless and OCR wasn't requested. Unless `auto_ocr` is
     // disabled (Vault), this is a scan: retry with OCR. A textless-but-empty
     // document (no images) costs only a re-parse here; `ocr_page` finds
     // nothing and reports it at the call site.
-    if !opts.auto_ocr {
+    if !auto_ocr {
         return Ok((pages, false));
     }
     let ocr_pages = extract_pages_with_ocr(data, true)?;
@@ -115,6 +128,7 @@ fn extract_pages_with_fallback(data: &[u8], opts: ExtractOptions) -> Result<(Vec
 /// order and lopdf's `get_pages()` numbers pages from the same tree in
 /// ascending order, so `page_ids[i]` corresponds to `pages[i]` produced by
 /// [`extract_pages`].
+#[cfg(feature = "ocr")]
 fn ocr_page(
     doc: &lopdf::Document,
     page_ids: &[lopdf::ObjectId],
@@ -218,10 +232,16 @@ fn render_pages(
     opts: ExtractOptions,
 ) -> Result<RenderedPages> {
     let mut emitted: Vec<(u32, String)> = Vec::new();
+    #[cfg(feature = "ocr")]
     let mut ocr_attempted = opts.ocr;
+    #[cfg(not(feature = "ocr"))]
+    let ocr_attempted = crate::OCR_COMPILED && opts.ocr; // false; keeps `opts` referenced
     let mut had_native_lines = false;
     for (page_num, page_id) in (1..=page_count).zip(page_ids) {
         let page = crate::pdf_text::extract_positioned_page(doc, page_num)?;
+        // `page_id` is only consumed by the OCR branch below.
+        #[cfg(not(feature = "ocr"))]
+        let _ = page_id;
         let garbled = page_looks_garbled(&page);
         let mut native = crate::pdf_layout::assemble(&page);
         if !native.is_empty() {
@@ -236,42 +256,50 @@ fn render_pages(
         }
         // OCR when asked, when the page assembled no non-empty lines
         // (auto-fallback, mirroring `extract_pages_with_fallback`), or when
-        // the native layer is garbage.
-        let need_ocr = opts.ocr
-            || (opts.auto_ocr && (garbled || native.iter().all(|l| l.text.trim().is_empty())));
-        let mut ocr_lines = Vec::new();
-        let mut unplaced_text = String::new();
-        if need_ocr {
-            ocr_attempted = true;
-            let placed = crate::pdf_geometry::placed_images(doc, *page_id);
-            if let Ok(images) = doc.get_page_images(*page_id) {
-                for img in crate::pdf_ocr::ocr_candidates(&images) {
-                    let Some(rgb) = crate::pdf_ocr::decode_pdf_image(img) else {
-                        continue;
-                    };
-                    let lines = crate::ocr::ocr_rgb_image_lines(&rgb)?;
-                    if lines.is_empty() {
-                        continue;
-                    }
-                    match placed.iter().find(|p| p.object_id == img.id) {
-                        Some(p) => ocr_lines.extend(crate::pdf_ocr::map_ocr_lines(
-                            p,
-                            rgb.width(),
-                            rgb.height(),
-                            &lines,
-                        )),
-                        None => {
-                            // Inline (BI/EI) or otherwise unplaceable image:
-                            // page-end append (today's fallback, spec §4.1).
-                            for l in &lines {
-                                unplaced_text.push_str(&l.text);
-                                unplaced_text.push('\n');
+        // the native layer is garbage. Compiled in only with the `ocr`
+        // feature; otherwise `ocr_lines` and `unplaced_text` stay empty.
+        #[cfg(feature = "ocr")]
+        let (ocr_lines, unplaced_text) = {
+            let need_ocr = opts.ocr
+                || (opts.auto_ocr && (garbled || native.iter().all(|l| l.text.trim().is_empty())));
+            let mut ocr_lines = Vec::new();
+            let mut unplaced_text = String::new();
+            if need_ocr {
+                ocr_attempted = true;
+                let placed = crate::pdf_geometry::placed_images(doc, *page_id);
+                if let Ok(images) = doc.get_page_images(*page_id) {
+                    for img in crate::pdf_ocr::ocr_candidates(&images) {
+                        let Some(rgb) = crate::pdf_ocr::decode_pdf_image(img) else {
+                            continue;
+                        };
+                        let lines = crate::ocr::ocr_rgb_image_lines(&rgb)?;
+                        if lines.is_empty() {
+                            continue;
+                        }
+                        match placed.iter().find(|p| p.object_id == img.id) {
+                            Some(p) => ocr_lines.extend(crate::pdf_ocr::map_ocr_lines(
+                                p,
+                                rgb.width(),
+                                rgb.height(),
+                                &lines,
+                            )),
+                            None => {
+                                // Inline (BI/EI) or otherwise unplaceable image:
+                                // page-end append (today's fallback, spec §4.1).
+                                for l in &lines {
+                                    unplaced_text.push_str(&l.text);
+                                    unplaced_text.push('\n');
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+            (ocr_lines, unplaced_text)
+        };
+        #[cfg(not(feature = "ocr"))]
+        let (ocr_lines, unplaced_text): (Vec<crate::pdf_layout::Line>, String) =
+            (Vec::new(), String::new());
         let merged = crate::pdf_ocr::merge(native, ocr_lines);
         // Tables are detected on the assembly-order stream (row fragments
         // are adjacent there), then regions join the xy-cut as opaque
@@ -473,6 +501,7 @@ mod tests {
         assert!(ocr_on.contains("OCR found nothing"));
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn extract_plain_textless_pdf_auto_ocrs_and_reports() {
         // A structurally valid PDF with no page tree (so text extraction succeeds
@@ -533,6 +562,18 @@ startxref\n\
         assert!(!err.contains("OCR"), "got: {err}");
     }
 
+    #[cfg(not(feature = "ocr"))]
+    #[test]
+    fn textless_pdf_without_ocr_feature_reports_scan() {
+        // auto_ocr is default-true, but with no engine it is forced off.
+        let err = extract_plain(textless_pdf(), crate::ExtractOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may be scanned/image-only"), "got: {err}");
+        assert!(!err.contains("OCR found nothing"), "got: {err}");
+    }
+
+    #[cfg(feature = "ocr")]
     #[test]
     fn extract_plain_ocr_true_auto_ocr_false_still_ocrs() {
         let err = extract_plain(
