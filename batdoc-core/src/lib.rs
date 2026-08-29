@@ -4,6 +4,10 @@
 //! plain text or Markdown. Format detection is by magic bytes, not
 //! file extension. Images (and optionally embedded images and textless
 //! PDF pages) are read via OCR.
+//!
+//! Image OCR, embedded-image OCR, and the textless-PDF OCR fallback are
+//! compiled in with the `ocr` feature (on by default); disabling it
+//! (`--no-default-features`) drops `ocrs`/`rten`/`image` for lean builds.
 
 #![allow(clippy::redundant_pub_crate)]
 
@@ -16,6 +20,7 @@ mod docx;
 mod error;
 mod heuristic;
 mod markup;
+#[cfg(feature = "ocr")]
 mod ocr;
 mod pdf;
 mod pdf_geometry;
@@ -34,11 +39,29 @@ mod xml_util;
 
 pub use csv::{escape_field, to_csv_row, CsvSink};
 pub use error::{BatdocError, Result};
+#[cfg(feature = "ocr")]
 pub use ocr::models_present;
 pub use sheets::{BudgetSheetSink, Sheet, SheetSink};
 pub use sink::{BudgetSink, ExtractSink, IoSink};
 
 use std::io::Cursor;
+
+/// Whether OCR inference is compiled in (the `ocr` feature). When `false`,
+/// [`ExtractOptions::ocr`] and [`ExtractOptions::auto_ocr`] are treated as
+/// `false` (there is no engine), and `Format::Image` input fails.
+#[cfg(feature = "ocr")]
+pub(crate) const OCR_COMPILED: bool = true;
+#[cfg(not(feature = "ocr"))]
+pub(crate) const OCR_COMPILED: bool = false;
+
+/// Whether OCR model files are present in the cache.
+///
+/// With the `ocr` feature disabled there is no OCR engine, so this is
+/// always `false`.
+#[cfg(not(feature = "ocr"))]
+pub fn models_present() -> bool {
+    false
+}
 
 /// Supported document formats.
 ///
@@ -59,7 +82,8 @@ pub enum Format {
     Pptx,
     /// PDF document.
     Pdf,
-    /// Raster image (PNG/JPEG/GIF/WebP/BMP) — always OCR'd.
+    /// Raster image (PNG/JPEG/GIF/WebP/BMP) — always OCR'd (when the
+    /// `ocr` feature is enabled).
     Image,
 }
 
@@ -162,12 +186,14 @@ pub struct ExtractOptions {
     /// Include embedded images as base64 markdown (markdown mode only).
     pub images: bool,
     /// OCR embedded images (DOCX/PPTX). Has no effect on `Format::Image` —
-    /// image input is always OCR'd.
+    /// image input is always OCR'd. No effect when built without the
+    /// `ocr` feature.
     pub ocr: bool,
     /// Textless or garbled PDF pages fall back to OCR when `true` (the
     /// default), even if `ocr` is `false`. Set `false` to disable that
     /// fallback (Worker-safe / Vault). Ignored when `ocr` is `true`; no
-    /// models are downloaded or required when `false`.
+    /// models are downloaded or required when `false`. Forced off when built
+    /// without the `ocr` feature.
     pub auto_ocr: bool,
     /// Stop writing after this many output bytes. `None` means unlimited.
     pub max_output_bytes: Option<u64>,
@@ -182,6 +208,33 @@ impl Default for ExtractOptions {
             max_output_bytes: None,
         }
     }
+}
+
+/// Extract text from a raster image. Requires the `ocr` feature; without it
+/// this always returns [`BatdocError::Document`].
+#[cfg(feature = "ocr")]
+fn extract_image(data: &[u8]) -> Result<String> {
+    ocr::extract_image_plain(data)
+}
+
+#[cfg(not(feature = "ocr"))]
+fn extract_image(_data: &[u8]) -> Result<String> {
+    Err(BatdocError::Document(
+        "image input requires the `ocr` feature (not compiled in)".into(),
+    ))
+}
+
+/// OCR a raw image byte buffer to text. With the `ocr` feature disabled this
+/// is a no-op returning `Ok(None)`, so DOCX/PPTX embedded-image OCR is
+/// silently skipped rather than erroring.
+#[cfg(feature = "ocr")]
+pub(crate) fn ocr_image_bytes(data: &[u8]) -> Result<Option<String>> {
+    ocr::ocr_image_bytes(data)
+}
+
+#[cfg(not(feature = "ocr"))]
+pub(crate) fn ocr_image_bytes(_data: &[u8]) -> Result<Option<String>> {
+    Ok(None)
 }
 
 /// Extract plain text from a document.
@@ -214,7 +267,7 @@ pub fn extract_plain_with(data: &[u8], format: Format, opts: ExtractOptions) -> 
         Format::Xlsx => xlsx::extract_plain(data),
         Format::Pptx => pptx::extract_plain(data, opts),
         Format::Pdf => pdf::extract_plain(data, opts),
-        Format::Image => ocr::extract_image_plain(data),
+        Format::Image => extract_image(data),
     }
 }
 
@@ -260,7 +313,7 @@ pub fn extract_markdown_with(data: &[u8], format: Format, opts: ExtractOptions) 
         Format::Xlsx => xlsx::extract_markdown(data, opts.images),
         Format::Pptx => pptx::extract_markdown(data, opts),
         Format::Pdf => pdf::extract_markdown(data, opts),
-        Format::Image => ocr::extract_image_plain(data),
+        Format::Image => extract_image(data),
     }
 }
 
@@ -489,6 +542,7 @@ mod tests {
         assert!(detect_format(b"GIFzzz....").is_err());
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn extract_image_plain_path_errors_without_text() {
         // Real OCR needs models; the garbage path must not.
@@ -498,6 +552,7 @@ mod tests {
         assert!(err.contains("no text found in image"));
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn extract_plain_to_equals_extract_plain_on_image_garbage() {
         let data = b"garbage";
@@ -512,6 +567,15 @@ mod tests {
             .to_string();
         assert_eq!(a, b);
         assert!(out.is_empty());
+    }
+
+    #[cfg(not(feature = "ocr"))]
+    #[test]
+    fn extract_image_without_ocr_feature_errors() {
+        let err = extract_plain_with(b"\x89PNG\r\n", Format::Image, ExtractOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`ocr` feature"), "got: {err}");
     }
 
     #[test]
