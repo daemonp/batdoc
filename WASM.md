@@ -10,10 +10,12 @@ Rust API (`detect_format`, `extract_*_to`). Native builds are unchanged.
 
 `batdoc-core` is a pure-Rust document-to-text/OCR library (docx/xlsx/pptx/doc/xls/
 pdf → plain text or markdown). The entire *document* pipeline (via `lopdf`,
-`pdf-extract`, `zip`, `cfb`, `image`) is wasm-clean. Only the OCR model
-**download** path and the terminal-oriented **CLI binary** are host-only. That
-means a wasm build of the library — e.g. an in-browser doc viewer/extractor — is
-very achievable with modest, well-scoped changes.
+`pdf-extract`, `zip`, `cfb`) is wasm-clean. The OCR model **download**
+(`net`, `ureq`) and OCR **inference** (`ocr`, `ocrs`/`rten`/`image`) are
+feature-gated and dropped by `--no-default-features`; the terminal-oriented
+**CLI binary** is host-only. That means a lean wasm build of the library —
+document/text pipeline with no OCR — is achievable with modest, well-scoped
+changes.
 
 ## Findings (empirically verified)
 
@@ -28,7 +30,8 @@ reading dependency READMEs.
    `--no-default-features` drops `ureq`/`rustls`/`ring`, and the download
    branch of `ocr.rs::ensure_file` is compiled out — it only checks for
    pre-seeded model files and returns a descriptive error otherwise. Model
-   loading/inference (`ocrs`/`rten`) are untouched.
+   loading/inference (`ocrs`/`rten`/`image`) are now also feature-gated behind
+   `ocr` (default-on) and dropped by `--no-default-features`.
 2. **Done — `getrandom` wasm backend configured.** `.cargo/config.toml` sets
    `getrandom_backend="wasm_js"` for `wasm32-unknown-unknown`, and the
    `batdoc-core` manifest enables `getrandom/0.3`'s `wasm_js` feature on the
@@ -187,11 +190,13 @@ batdoc-core = { git = "https://github.com/daemonp/batdoc", default-features = fa
 ```
 
 Do not enable the `wasm-bindgen` feature. Vault is the consumer.
-`ocrs` and `rten` remain in the graph — `--no-default-features` only drops
-`ureq`. CI fails the build if `batdoc_core.wasm` exceeds 10 MB or if
-`wasm-bindgen` is a *direct* dependency of `batdoc-core` (it stays
-present transitively via `getrandom`). An optional `ocr` feature to strip
-`ocrs`/`rten` is out of scope unless the size gate fails later.
+`--no-default-features` now drops `ureq` (`net`) **and**
+`ocrs`/`rten`/`image` (`ocr`), so image OCR and the textless/garbled-PDF OCR
+fallback are absent from the Worker build (`auto_ocr: false` is no longer
+required to keep OCR out — it is forced off). CI fails the build if
+`batdoc_core.wasm` exceeds 10 MB, if `wasm-bindgen` is a *direct* dependency
+of `batdoc-core`, or if `ocrs`/`rten` are still reachable in the
+`--no-default-features` graph.
 
 Known streaming behavior changes (vs. the buffered path, both non-OCR only):
 
@@ -230,10 +235,10 @@ Notes:
   the `BatdocError` message.
 - `to_sheets_stream` invokes its callbacks synchronously — Promises returned
   by the callbacks are not awaited.
-- This build disables `net`, so OCR model files are **not** downloaded — they
-  must be seeded (e.g. preloaded into the cache dir the library resolves). The
-  document/text pipeline (DOCX/XLSX/PPTX/DOC/XLS/PDF-text) needs no models and
-  works out of the box.
+- This build disables `net` and `ocr`, so no OCR is available in the browser
+  demo (image files and textless PDFs are not OCR'd). The document/text
+  pipeline (DOCX/XLSX/PPTX/DOC/XLS/PDF-text) needs no models and works out of
+  the box.
 
 ## Related
 

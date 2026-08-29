@@ -59,6 +59,10 @@ Set `ExtractOptions.auto_ocr = false` to disable the automatic
 textless/garbled-PDF OCR fallback (no model download or requirement).
 `Format::Image` is always OCR'd.
 
+Image OCR, embedded-image OCR, and the PDF fallback are behind the
+default-on `ocr` feature; `default-features = false` removes them
+together with the `ocrs`/`rten`/`image` dependencies.
+
 ```rust
 // Raster images are always OCR'd — no options needed for `Format::Image`.
 let text = batdoc_core::extract_plain_with(&png, Format::Image, ExtractOptions::default()).unwrap();

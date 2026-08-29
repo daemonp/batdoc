@@ -1,9 +1,10 @@
 //! Browser-facing entry points for the `wasm32-unknown-unknown` build.
 //!
-//! Bytes in, text out — no file I/O, no terminal. The OCR *model download*
-//! path is feature-gated off (`--no-default-features`); OCR still works when
-//! model files have been seeded via `BATDOC_MODELS_DIR` (or embedded by the
-//! caller before invoking these functions).
+//! Bytes in, text out — no file I/O, no terminal. This module is only
+//! meaningful when built with `--no-default-features --features wasm-bindgen`,
+//! which also disables `net` (model download) and `ocr` (inference) — so no
+//! image OCR or textless-PDF fallback is available in the browser build. The
+//! `ocr` parameter of `to_markdown` is accepted but is a no-op here.
 //!
 //! This module is only compiled for `wasm32` targets with the `wasm-bindgen`
 //! cargo feature enabled; native builds never pull in `wasm-bindgen`.
