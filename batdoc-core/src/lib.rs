@@ -16,17 +16,25 @@ mod codepage;
 mod csv;
 mod dateconv;
 mod doc;
+// ExtractOptions is a small options bag passed by value through the parse
+// tree. It stopped being `Copy` when the PDF strip options (a `Vec`) were
+// added; threading a borrow through every recursive helper would be churn
+// for no gain, so the lint is allowed module-wide.
+#[allow(clippy::needless_pass_by_value)]
 mod docx;
 mod error;
 mod heuristic;
 mod markup;
 #[cfg(feature = "ocr")]
 mod ocr;
+#[allow(clippy::needless_pass_by_value)] // see the note on `mod docx`
 mod pdf;
 mod pdf_geometry;
 mod pdf_layout;
 mod pdf_ocr;
 mod pdf_text;
+mod pdf_watermark;
+#[allow(clippy::needless_pass_by_value)] // see the note on `mod docx`
 mod pptx;
 mod sheet;
 mod sheets;
@@ -184,7 +192,8 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
 }
 
 /// Extraction options.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent feature switches, not state
 pub struct ExtractOptions {
     /// Include embedded images as base64 markdown (markdown mode only).
     pub images: bool,
@@ -200,6 +209,17 @@ pub struct ExtractOptions {
     pub auto_ocr: bool,
     /// Stop writing after this many output bytes. `None` means unlimited.
     pub max_output_bytes: Option<u64>,
+    /// Needles to strip from PDF output: any *reconstructed text run*
+    /// containing one (case-insensitive, ignoring whitespace) is removed
+    /// before layout. This operates on glyphs along their true direction, so
+    /// it reaches diagonal watermarks that per-line output filters cannot
+    /// see. Empty means no stripping. PDF only.
+    pub strip_text: Vec<String>,
+    /// Remove skewed (non-orthogonal) text runs whose normalized signature
+    /// repeats across pages — watermark removal without naming the string.
+    /// Needs at least two pages to learn a signature; a single-page document
+    /// is left untouched (use `strip_text` there). No-op by default.
+    pub strip_watermarks: bool,
 }
 
 impl Default for ExtractOptions {
@@ -209,6 +229,8 @@ impl Default for ExtractOptions {
             ocr: false,
             auto_ocr: true,
             max_output_bytes: None,
+            strip_text: Vec::new(),
+            strip_watermarks: false,
         }
     }
 }
@@ -469,6 +491,7 @@ pub fn extract_sheets_with(
 ///
 /// `"tabular extraction is only supported for XLS and XLSX"` for other
 /// formats; budget / column / parse errors otherwise.
+#[allow(clippy::needless_pass_by_value)] // matches the extract_*_to family
 pub fn extract_sheets_to(
     data: &[u8],
     format: Format,
@@ -564,7 +587,7 @@ mod tests {
         let data = b"garbage";
         let format = Format::Image;
         let opts = ExtractOptions::default();
-        let a = extract_plain_with(data, format, opts)
+        let a = extract_plain_with(data, format, opts.clone())
             .unwrap_err()
             .to_string();
         let mut out = String::new();

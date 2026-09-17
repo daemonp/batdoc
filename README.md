@@ -151,6 +151,10 @@ cat FILE | batdoc [OPTIONS]
   -m, --markdown    force markdown (default on tty)
   -i, --images      embed images as inline base64 data URIs
       --ocr         OCR embedded images (docx/pptx); textless PDFs auto-OCR
+      --strip-text STR   remove rotated PDF text containing STR (repeatable,
+                         markdown output)
+      --strip-watermarks remove diagonal PDF text repeated across pages
+                         (markdown output)
   -h, --help        help
 ```
 
@@ -166,6 +170,31 @@ The resulting markdown is self-contained — no external image files
 needed. JPEG, PNG, GIF, WebP, and BMP images are supported; vector
 formats (EMF/WMF) are silently skipped. Ignored in plain text mode
 and for formats without OOXML image support (`.doc`, `.xls`, `.pdf`).
+
+`--strip-text` and `--strip-watermarks` clean up PDF watermark text.
+Watermarks are often drawn at an angle (e.g. 45°), and ordinary line
+filters never see them as contiguous text — the rotation shatters a
+single word into per-letter noise. Both flags work on text runs
+reconstructed along their true direction, so a wrongly-angled word is
+matched as a whole:
+
+```sh
+batdoc -m --strip-text draftcopy report.pdf > report.md
+batdoc -m --strip-watermarks report.pdf > report.md
+```
+
+`--strip-text` is a needle: any tilted run containing it is removed, case-
+and whitespace-insensitively (`draftcopy` matches a run decoded as
+`Draft Copy`). Repeat it to strip several strings.
+`--strip-watermarks` needs no needle — it removes tilted text whose
+written form repeats across pages. It needs at least two pages to learn a
+signature and does nothing on a single page (use `--strip-text` there).
+Horizontal repeated text is left alone, so headers and footers survive.
+
+Both flags apply to the **markdown** output of PDFs; other formats ignore
+them. Piped output is plain text by default, and these flags do not alter
+it — pass `-m` when redirecting to a file (as in the examples above), or
+batdoc prints a notice that the flags had no effect.
 
 ## Known limitations
 

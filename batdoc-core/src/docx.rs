@@ -418,7 +418,7 @@ fn extract_to_streaming(
             &mut footnotes_idx,
             &mut endnotes_idx,
             markdown,
-            opts,
+            opts.clone(),
             &mut images,
             &mut out,
         )?;
@@ -512,8 +512,17 @@ fn emit_body<R: BufRead, S: ExtractSink>(
         match kind {
             1 => {
                 emit_block_children(
-                    reader, buf, b"body", rels, image_rels, footnotes, endnotes, markdown, opts,
-                    images, out,
+                    reader,
+                    buf,
+                    b"body",
+                    rels,
+                    image_rels,
+                    footnotes,
+                    endnotes,
+                    markdown,
+                    opts.clone(),
+                    images,
+                    out,
                 )?;
             }
             2 => break,
@@ -557,7 +566,7 @@ fn emit_block_children<R: BufRead, S: ExtractSink>(
         }
         if start_p {
             let blocks = parse_paragraph(reader, buf, rels, image_rels, footnotes, endnotes);
-            emit_parsed_blocks(blocks, markdown, opts, images, out)?;
+            emit_parsed_blocks(blocks, markdown, opts.clone(), images, out)?;
         } else if start_tbl {
             emit_table(reader, buf, rels, footnotes, endnotes, markdown, out)?;
         }
@@ -578,7 +587,7 @@ fn emit_parsed_blocks<S: ExtractSink>(
                 emit_paragraph(&style, &runs, markdown, out)?;
             }
             Block::Image { path, .. } => {
-                emit_image(&path, opts, images, out)?;
+                emit_image(&path, opts.clone(), images, out)?;
             }
             Block::Table { .. } => {}
         }
@@ -3874,13 +3883,13 @@ mod tests {
             "word/document.xml",
             &document_xml("<w:p><w:r><w:t>Body only</w:t></w:r></w:p>"),
         )]);
-        let a = extract_markdown(&data, opts).unwrap();
+        let a = extract_markdown(&data, opts.clone()).unwrap();
         assert_eq!(a, "Body only\n\n");
         let mut b = String::new();
-        extract_markdown_to(&data, opts, &mut b).unwrap();
+        extract_markdown_to(&data, opts.clone(), &mut b).unwrap();
         assert_eq!(a, b);
 
-        let plain_a = extract_plain(&data, opts).unwrap();
+        let plain_a = extract_plain(&data, opts.clone()).unwrap();
         assert_eq!(plain_a, "Body only\n");
         let mut plain_b = String::new();
         extract_plain_to(&data, opts, &mut plain_b).unwrap();
@@ -3897,7 +3906,7 @@ mod tests {
             images: true,
             ..crate::ExtractOptions::default()
         };
-        let a = extract_markdown(&data, opts).unwrap();
+        let a = extract_markdown(&data, opts.clone()).unwrap();
         assert_eq!(
             a,
             "Pic\n\n![][image1]\n\n[image1]: <data:image/png;base64,iVBORw0KGgo=>\n"
@@ -3914,12 +3923,12 @@ mod tests {
             &document_xml(r#"<w:p><w:r><w:t>Hi</w:t><w:footnoteReference w:id="1"/></w:r></w:p>"#),
         )]);
         let opts = crate::ExtractOptions::default();
-        let a = extract_markdown(&data, opts).unwrap();
+        let a = extract_markdown(&data, opts.clone()).unwrap();
         assert_eq!(a, "Hi\n\n");
         let mut b = String::new();
-        extract_markdown_to(&data, opts, &mut b).unwrap();
+        extract_markdown_to(&data, opts.clone(), &mut b).unwrap();
         assert_eq!(a, b);
-        let plain_a = extract_plain(&data, opts).unwrap();
+        let plain_a = extract_plain(&data, opts.clone()).unwrap();
         assert_eq!(plain_a, "Hi\n");
         let mut plain_b = String::new();
         extract_plain_to(&data, opts, &mut plain_b).unwrap();

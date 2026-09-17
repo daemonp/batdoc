@@ -2442,9 +2442,9 @@ mod tests {
         let data = minimal_pptx_multi(&[slide1, slide2]);
         let opts = crate::ExtractOptions::default();
 
-        assert_eq!(buffered_markdown(&data, opts), {
+        assert_eq!(buffered_markdown(&data, opts.clone()), {
             let mut out = String::new();
-            extract_markdown_to(&data, opts, &mut out).unwrap();
+            extract_markdown_to(&data, opts.clone(), &mut out).unwrap();
             out
         });
 
@@ -2452,13 +2452,13 @@ mod tests {
             &data,
             crate::ExtractOptions {
                 images: false,
-                ..opts
+                ..opts.clone()
             },
         )
         .unwrap();
         let ref_plain = render_plain(&slides);
         let mut plain = String::new();
-        extract_plain_to(&data, opts, &mut plain).unwrap();
+        extract_plain_to(&data, opts.clone(), &mut plain).unwrap();
         assert_eq!(ref_plain, plain);
 
         let md = buffered_markdown(&data, opts);
@@ -2549,7 +2549,7 @@ mod tests {
             ..crate::ExtractOptions::default()
         };
 
-        let expected = buffered_markdown(&data, opts);
+        let expected = buffered_markdown(&data, opts.clone());
         let mut actual = String::new();
         extract_markdown_to(&data, opts, &mut actual).unwrap();
 

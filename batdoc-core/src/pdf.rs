@@ -229,7 +229,7 @@ fn render_pages(
     page_ids: &[lopdf::ObjectId],
     page_count: u32,
     signals: &crate::pdf_layout::DocSignals,
-    opts: ExtractOptions,
+    opts: &ExtractOptions,
 ) -> Result<RenderedPages> {
     let mut emitted: Vec<(u32, String)> = Vec::new();
     #[cfg(feature = "ocr")]
@@ -239,6 +239,7 @@ fn render_pages(
     let mut had_native_lines = false;
     for (page_num, page_id) in (1..=page_count).zip(page_ids) {
         let page = crate::pdf_text::extract_positioned_page(doc, page_num)?;
+        let page = crate::pdf_watermark::strip_runs(page, &opts.strip_text, &signals.watermarks);
         // `page_id` is only consumed by the OCR branch below.
         #[cfg(not(feature = "ocr"))]
         let _ = page_id;
@@ -378,7 +379,15 @@ pub(crate) fn extract_markdown_to(
     let mut sig_builder = crate::pdf_layout::DocSignalsBuilder::new();
     for page_num in 1..=page_count {
         let page = crate::pdf_text::extract_positioned_page(&doc, page_num)?;
+        let page = crate::pdf_watermark::strip_runs(
+            page,
+            &opts.strip_text,
+            &std::collections::HashSet::new(),
+        );
         sig_builder.add_lines(&crate::pdf_layout::assemble(&page));
+        if opts.strip_watermarks {
+            sig_builder.add_watermark_runs(&crate::pdf_watermark::skewed_runs(&page));
+        }
     }
     let signals = sig_builder.finish(page_ids.len());
 
@@ -386,7 +395,7 @@ pub(crate) fn extract_markdown_to(
     // markdown is buffered (bounded by output size, same memory profile as
     // today's Vec<String> of all page text; the single-page heading rule
     // requires not emitting page 1 before knowing whether page 2 exists).
-    let rendered = render_pages(&doc, &page_ids, page_count, &signals, opts)?;
+    let rendered = render_pages(&doc, &page_ids, page_count, &signals, &opts)?;
     let mut emitted = rendered.emitted;
 
     // Safety net: if furniture stripping dropped every native line, re-run
@@ -397,8 +406,12 @@ pub(crate) fn extract_markdown_to(
             body_size: signals.body_size,
             headers: std::collections::HashSet::new(),
             footers: std::collections::HashSet::new(),
+            // Mirrors the header/footer clearing: the safety net re-renders
+            // with no furniture suppression at all. (It cannot recover text
+            // removed by `strip_text` needles — those stay applied.)
+            watermarks: std::collections::HashSet::new(),
         };
-        let fallback = render_pages(&doc, &page_ids, page_count, &fallback_signals, opts)?;
+        let fallback = render_pages(&doc, &page_ids, page_count, &fallback_signals, &opts)?;
         if !fallback.emitted.is_empty() {
             emitted = fallback.emitted;
         }
@@ -554,6 +567,7 @@ startxref\n\
                 ocr: false,
                 auto_ocr: false,
                 max_output_bytes: None,
+                ..Default::default()
             },
         )
         .unwrap_err()
@@ -583,6 +597,7 @@ startxref\n\
                 ocr: true,
                 auto_ocr: false,
                 max_output_bytes: None,
+                ..Default::default()
             },
         )
         .unwrap_err()
@@ -602,6 +617,7 @@ startxref\n\
                 ocr: false,
                 auto_ocr: false,
                 max_output_bytes: None,
+                ..Default::default()
             },
         )
         .unwrap_err()
@@ -681,6 +697,7 @@ startxref\n\
                     font_size: 12.0,
                     advance: 6.0,
                     rotation: 0,
+                    angle_deg: 0.0,
                 })
                 .collect();
             PositionedPage {
@@ -733,6 +750,152 @@ startxref\n\
         );
         let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
         assert_eq!(md, "# Big\n\nsome body text goes here\n", "got: {md:?}");
+    }
+
+    /// One page carrying a 45° "XZQ" watermark (glyphs chosen so they
+    /// cannot be confused with the body text) plus a horizontal body line.
+    fn diagonal_watermark_contents(body: &str) -> String {
+        format!(
+            "BT /F1 27 Tf 0.70710678 0.70710678 -0.70710678 0.70710678 200 300 Tm (XZQ) Tj ET\n\
+             BT /F1 12 Tf 72 700 Td ({body}) Tj ET"
+        )
+    }
+
+    fn contains_watermark(md: &str) -> bool {
+        md.contains('X') || md.contains('Z') || md.contains('Q')
+    }
+
+    #[test]
+    fn strip_text_removes_diagonal_watermark_by_needle() {
+        let data = build_text_pdf_content(&diagonal_watermark_contents("alpha beta"));
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(
+            contains_watermark(&md),
+            "watermark should be present by default: {md:?}"
+        );
+
+        let opts = crate::ExtractOptions {
+            strip_text: vec!["xzq".into()],
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(!contains_watermark(&md), "watermark not stripped: {md:?}");
+        assert!(md.contains("alpha beta"), "body lost: {md:?}");
+    }
+
+    #[test]
+    fn strip_text_ignores_case_and_whitespace() {
+        let data = build_text_pdf_content(&diagonal_watermark_contents("alpha beta"));
+        let opts = crate::ExtractOptions {
+            strip_text: vec!["X Z Q".into()],
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(!contains_watermark(&md), "watermark not stripped: {md:?}");
+    }
+
+    #[test]
+    fn strip_watermarks_removes_repeated_diagonal_run() {
+        let data = build_text_pdf_pages(&[
+            &diagonal_watermark_contents("alpha"),
+            &diagonal_watermark_contents("beta"),
+            &diagonal_watermark_contents("gamma"),
+        ]);
+        let opts = crate::ExtractOptions {
+            strip_watermarks: true,
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(!contains_watermark(&md), "watermark not stripped: {md:?}");
+        assert!(
+            md.contains("alpha") && md.contains("beta"),
+            "body lost: {md:?}"
+        );
+    }
+
+    #[test]
+    fn strip_watermarks_is_noop_on_single_page() {
+        // No repetition to learn from: the diagonal run must survive.
+        let data = build_text_pdf_content(&diagonal_watermark_contents("alpha"));
+        let opts = crate::ExtractOptions {
+            strip_watermarks: true,
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(
+            contains_watermark(&md),
+            "single-page run was stripped: {md:?}"
+        );
+    }
+
+    #[test]
+    fn strip_watermarks_ignores_duplicate_runs_on_one_page() {
+        // The repetition that identifies a watermark is ACROSS pages. One
+        // page carrying the same run twice must not reach the threshold.
+        let content = "BT /F1 27 Tf 0.70710678 0.70710678 -0.70710678 0.70710678 200 300 Tm (XZQ) Tj ET\n\
+                       BT /F1 27 Tf 0.70710678 0.70710678 -0.70710678 0.70710678 200 500 Tm (XZQ) Tj ET\n\
+                       BT /F1 12 Tf 72 700 Td (alpha) Tj ET";
+        let data = build_text_pdf_content(content);
+        let opts = crate::ExtractOptions {
+            strip_watermarks: true,
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(
+            contains_watermark(&md),
+            "single page counted internally: {md:?}"
+        );
+    }
+
+    #[test]
+    fn strip_watermarks_keeps_one_off_diagonal_text() {
+        // XZQ appears on page 1 only; pages 2-3 carry it too little to reach
+        // the repetition threshold, so nothing is stripped.
+        let data = build_text_pdf_pages(&[
+            &diagonal_watermark_contents("alpha"),
+            "BT /F1 12 Tf 72 700 Td (beta) Tj ET",
+            "BT /F1 12 Tf 72 700 Td (gamma) Tj ET",
+        ]);
+        let opts = crate::ExtractOptions {
+            strip_watermarks: true,
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(
+            contains_watermark(&md),
+            "one-off diagonal text stripped: {md:?}"
+        );
+    }
+
+    #[test]
+    fn strip_watermarks_leaves_repeated_horizontal_text() {
+        // Repeated horizontal text is a header/footer, not a watermark; only
+        // skewed runs are candidates.
+        let page = "BT /F1 12 Tf 72 700 Td (HEADER) Tj ET";
+        let data = build_text_pdf_pages(&[page, page, page]);
+        let opts = crate::ExtractOptions {
+            strip_watermarks: true,
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(
+            md.contains("HEADER"),
+            "repeated horizontal text stripped: {md:?}"
+        );
+    }
+
+    #[test]
+    fn strip_text_leaves_non_matching_diagonal_text() {
+        let data = build_text_pdf_content(&diagonal_watermark_contents("alpha beta"));
+        let opts = crate::ExtractOptions {
+            strip_text: vec!["somethingelse".into()],
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(
+            contains_watermark(&md),
+            "unrelated needle stripped text: {md:?}"
+        );
     }
 
     #[test]

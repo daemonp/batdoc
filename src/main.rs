@@ -26,6 +26,12 @@ Options:
   -m, --markdown    Output as markdown (default when terminal detected)
   -i, --images      Embed images as inline base64 data URIs in markdown
       --ocr         OCR embedded images (docx/pptx); textless PDFs already auto-OCR
+      --strip-text STR
+                    Remove rotated PDF text containing STR from markdown
+                    output (repeatable, case- and whitespace-insensitive).
+      --strip-watermarks
+                    Remove diagonal PDF text repeated across pages from
+                    markdown output
   -h, --help        Show this help
 
 When stdout is a terminal, output is pretty-printed as syntax-highlighted
@@ -42,6 +48,22 @@ For .docx/.pptx, embedded images are OCR'd. PDFs need no flag: any page
 without a text layer is OCR'd automatically from its embedded images as a
 fallback (a textless PDF is a scan). Image files (.png/.jpg/.gif/
 .webp/.bmp) are always OCR'd, with or without --ocr.
+
+--strip-text matches against text runs reconstructed along their true
+rotation, so it removes watermarks drawn at an angle (which otherwise
+shatter into per-letter noise). Matching ignores case and whitespace:
+--strip-text draftcopy also matches \"Draft Copy\". Repeat
+the flag to strip several strings.
+
+--strip-watermarks needs no string: it removes diagonal text whose written
+form repeats across pages. It requires at least two pages to learn a
+signature and is a no-op on a single-page document (use --strip-text
+there). Horizontal repeated text is left alone, so headers and footers
+survive. Both options apply to PDF markdown output only. Piped output
+defaults to plain text, which they do not change, so pass -m when
+redirecting to a file:
+
+    batdoc -m --strip-watermarks report.pdf > report.md
 
 Multiple files can be specified and will be processed in order.
 Use - to read from stdin explicitly.
@@ -69,9 +91,13 @@ fn main() {
     let mut mode = Mode::Auto;
     let mut images = false;
     let mut ocr = false;
+    let mut strip_text: Vec<String> = Vec::new();
+    let mut strip_watermarks = false;
     let mut files: Vec<String> = Vec::new();
 
-    for arg in &args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -81,6 +107,19 @@ fn main() {
             "-m" | "--markdown" => mode = Mode::Markdown,
             "-i" | "--images" => images = true,
             "--ocr" => ocr = true,
+            "--strip-watermarks" => strip_watermarks = true,
+            "--strip-text" => {
+                i += 1;
+                if let Some(value) = args.get(i) {
+                    strip_text.push(value.clone());
+                } else {
+                    eprintln!("batdoc: --strip-text requires a value");
+                    process::exit(1);
+                }
+            }
+            s if s.starts_with("--strip-text=") => {
+                strip_text.push(s["--strip-text=".len()..].to_string());
+            }
             "-" => files.push("-".to_string()),
             s if s.starts_with('-') => {
                 eprintln!("batdoc: unknown option: {s}");
@@ -89,6 +128,7 @@ fn main() {
             }
             _ => files.push(arg.clone()),
         }
+        i += 1;
     }
 
     // No files specified → read from stdin
@@ -130,7 +170,16 @@ fn main() {
 
         let multiple = files.len() > 1;
 
-        if let Err(e) = run(&buf, &filename, mode, images, ocr, multiple && i > 0) {
+        if let Err(e) = run(
+            &buf,
+            &filename,
+            mode,
+            images,
+            ocr,
+            &strip_text,
+            strip_watermarks,
+            multiple && i > 0,
+        ) {
             eprintln!("batdoc: {filename}: {e}");
             exit_code = 1;
         }
@@ -141,18 +190,39 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // thin CLI shim; each is a distinct flag
 fn run(
     data: &[u8],
     filename: &str,
     mode: Mode,
     images: bool,
     ocr: bool,
+    strip_text: &[String],
+    strip_watermarks: bool,
     needs_separator: bool,
 ) -> batdoc_core::Result<()> {
     use batdoc_core::ExtractOptions;
 
     let format = batdoc_core::detect_format(data)?;
     let is_tty = io::stdout().is_terminal();
+
+    // The strip flags act on the positioned (glyph) pipeline, which only the
+    // markdown path uses. Piped output is plain by default, so say so rather
+    // than silently doing nothing.
+    let plain_output = match mode {
+        Mode::Plain => true,
+        Mode::Markdown => false,
+        Mode::Auto => !is_tty,
+    };
+    if format == Format::Pdf && plain_output && (!strip_text.is_empty() || strip_watermarks) {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!(
+                "batdoc: --strip-text/--strip-watermarks affect markdown output only; \
+                 plain output is unchanged. Use -m to force markdown."
+            );
+        });
+    }
 
     if needs_separator && !is_tty {
         io::stdout().write_all(b"\n")?;
@@ -161,6 +231,8 @@ fn run(
     let opts = ExtractOptions {
         images,
         ocr,
+        strip_text: strip_text.to_vec(),
+        strip_watermarks,
         ..Default::default()
     };
 

@@ -30,6 +30,13 @@ pub(crate) struct PositionedChar {
     /// Glyph rotation quantized to 0/90/180/270 degrees. `u16`, not `u8`:
     /// 270° > `u8::MAX` and would overflow.
     pub rotation: u16,
+    /// True text direction in degrees, normalized to [0, 360).
+    ///
+    /// `rotation` deliberately snaps to the four orthogonal directions,
+    /// which is all layout assembly needs; watermark detection needs the
+    /// real angle to recognize diagonal runs (a 45° watermark quantizes to
+    /// 90° and is otherwise indistinguishable from a vertical side-label).
+    pub angle_deg: f64,
 }
 
 /// All positioned characters of a single page. No all-pages `Vec` is ever
@@ -94,6 +101,7 @@ impl OutputDev for PositionedOutputDev {
         let sy = (trm.m12 + trm.m22) * font_size;
         let size = (sx * sy).abs().sqrt();
         let rotation = quantize_rotation(trm);
+        let angle_deg = text_angle_deg(trm);
         let char_count = ch.chars().count();
         for (idx, c) in ch.chars().enumerate() {
             self.chars.push(PositionedChar {
@@ -116,6 +124,7 @@ impl OutputDev for PositionedOutputDev {
                     0.0
                 },
                 rotation,
+                angle_deg,
             });
         }
         Ok(())
@@ -130,6 +139,15 @@ impl OutputDev for PositionedOutputDev {
     fn end_line(&mut self) -> std::result::Result<(), pdf_extract::OutputError> {
         Ok(())
     }
+}
+
+/// Text direction in degrees, normalized to [0, 360).
+///
+/// Unlike [`quantize_rotation`], this preserves non-orthogonal angles
+/// (e.g. a 45° watermark) that layout assembly does not need but
+/// watermark detection does.
+fn text_angle_deg(trm: &Transform) -> f64 {
+    trm.m12.atan2(trm.m11).to_degrees().rem_euclid(360.0)
 }
 
 /// Snap the text matrix's rotation to 0/90/180/270.
@@ -208,6 +226,26 @@ mod tests {
         // Tm with a 90° rotation: 0 1 -1 0 x y.
         let page = positioned("BT /F1 12 Tf 0 1 -1 0 100 700 Tm (R) Tj ET");
         assert_eq!(page.chars[0].rotation, 90);
+    }
+
+    #[test]
+    fn captures_true_angle_through_quantization() {
+        // A 45° text matrix (cos45 sin45 -sin45 cos45) quantizes to 90°
+        // (round(0.5) = 1 quarter), so `rotation` alone cannot tell a
+        // diagonal watermark from genuinely vertical text. `angle_deg`
+        // must keep the real direction.
+        let page = positioned(
+            "BT /F1 12 Tf 0.70710678 0.70710678 -0.70710678 0.70710678 100 700 Tm (W) Tj ET",
+        );
+        let c = page.chars[0];
+        assert!((c.angle_deg - 45.0).abs() < 0.01, "angle={}", c.angle_deg);
+        assert_eq!(c.rotation, 90);
+    }
+
+    #[test]
+    fn horizontal_text_has_zero_angle() {
+        let page = positioned("BT /F1 12 Tf 1 0 0 1 100 700 Tm (H) Tj ET");
+        assert!(page.chars[0].angle_deg.abs() < 0.01);
     }
 
     /// Build a one-page PDF whose font's ToUnicode maps char code 0x41

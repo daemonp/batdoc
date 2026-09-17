@@ -17,6 +17,7 @@
 
 use crate::pdf_geometry::PtRect;
 use crate::pdf_text::{PositionedChar, PositionedPage};
+use crate::pdf_watermark::GlyphRun;
 
 /// Where a line's text came from. `Ocr` lines are synthesized by the
 /// region-aware merge (later phase) rather than from native PDF glyphs.
@@ -601,6 +602,9 @@ pub(crate) struct DocSignals {
     pub headers: std::collections::HashSet<String>,
     /// Same for last lines (footers).
     pub footers: std::collections::HashSet<String>,
+    /// Normalized signatures of skewed (diagonal) runs repeated across pages
+    /// — watermark candidates. Empty unless `--strip-watermarks` is on.
+    pub watermarks: std::collections::HashSet<String>,
 }
 
 /// Pass-1 accumulator for [`DocSignals`].
@@ -612,6 +616,8 @@ pub(crate) struct DocSignalsBuilder {
     first_counts: std::collections::HashMap<String, usize>,
     /// Normalized last-line signature → pages seen on.
     last_counts: std::collections::HashMap<String, usize>,
+    /// Normalized skewed-run signature → pages seen on.
+    watermark_counts: std::collections::HashMap<String, usize>,
 }
 
 /// A classified block of body content.
@@ -674,6 +680,23 @@ impl DocSignalsBuilder {
         }
     }
 
+    /// Fold one page's skewed text runs (watermark candidates) into the
+    /// cross-page signature counts. Callers pass the page's
+    /// `pdf_watermark::skewed_runs`; a run counts once per page it appears on.
+    pub(crate) fn add_watermark_runs(&mut self, runs: &[GlyphRun]) {
+        // One count per distinct signature per page: a page that repeats the
+        // same run must not masquerade as multi-page repetition, or the
+        // single-page no-op contract breaks.
+        let signatures: std::collections::HashSet<String> = runs
+            .iter()
+            .map(|run| crate::pdf_watermark::normalize(&run.text))
+            .filter(|sig| !sig.is_empty())
+            .collect();
+        for sig in signatures {
+            *self.watermark_counts.entry(sig).or_insert(0) += 1;
+        }
+    }
+
     /// Emit the aggregates. `body_size` is the bucket with the most text
     /// (ties go to the larger size — the body is never smaller than its own
     /// footnotes); signatures under the repetition threshold are dropped.
@@ -695,6 +718,7 @@ impl DocSignalsBuilder {
             body_size,
             headers: collect(self.first_counts),
             footers: collect(self.last_counts),
+            watermarks: collect(self.watermark_counts),
         }
     }
 }
@@ -1463,6 +1487,7 @@ mod tests {
             font_size: size,
             advance: adv,
             rotation: 0,
+            angle_deg: 0.0,
         }
     }
 
@@ -1557,6 +1582,7 @@ mod tests {
                     font_size: size,
                     advance: 4.5,
                     rotation: 0,
+                    angle_deg: 0.0,
                 });
             }
         };
@@ -1588,6 +1614,7 @@ mod tests {
                 font_size: 12.0,
                 advance: 7.0,
                 rotation: 90,
+                angle_deg: 90.0,
             },
             PositionedChar {
                 ch: 'b',
@@ -1596,6 +1623,7 @@ mod tests {
                 font_size: 12.0,
                 advance: 7.0,
                 rotation: 90,
+                angle_deg: 90.0,
             },
             PositionedChar {
                 ch: 'c',
@@ -1604,6 +1632,7 @@ mod tests {
                 font_size: 12.0,
                 advance: 7.0,
                 rotation: 90,
+                angle_deg: 90.0,
             },
         ];
         let lines = assemble(&PositionedPage {
@@ -1766,6 +1795,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             Line {
@@ -1795,6 +1825,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("This is an exam-", 72.0, 100.0, 300.0),
@@ -1813,6 +1844,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("real text", 72.0, 100.0, 300.0),
@@ -1865,6 +1897,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         assert_eq!(blocks.len(), 1);
@@ -1892,6 +1925,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         assert!(blocks.iter().all(|b| matches!(b, Block::Paragraph(_))));
@@ -1908,6 +1942,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         assert!(blocks.iter().all(|b| matches!(b, Block::Paragraph(_))));
@@ -1934,6 +1969,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let items = find_tables(&lines, &sig);
         assert_eq!(items.len(), 3);
@@ -1994,6 +2030,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let items = find_tables(&lines, &sig);
         let ordered = reading_order_items(items);
@@ -2037,6 +2074,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         assert_eq!(blocks.len(), 1);
@@ -2058,6 +2096,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line(
@@ -2082,6 +2121,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("- a", 90.0, 100.0, 120.0),
@@ -2124,6 +2164,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         assert_eq!(blocks.len(), 1);
@@ -2149,6 +2190,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         match &blocks[0] {
@@ -2163,6 +2205,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let ocr = Line {
             source: LineSource::Ocr,
@@ -2183,6 +2226,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("\u{25a0} first item", 72.0, 100.0, 300.0),
@@ -2209,6 +2253,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let mut h1 = line(
             "Lenders value predictable businesses and data",
@@ -2238,6 +2283,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let mut b = line(
             "\u{25a0} Tightly coordinated to minimize",
@@ -2262,6 +2308,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("\u{2022} first item", 72.0, 100.0, 300.0),
@@ -2281,6 +2328,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("1. one", 72.0, 100.0, 300.0),
@@ -2296,6 +2344,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![
             line("a. first", 72.0, 100.0, 300.0),
@@ -2315,6 +2364,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let lines = vec![line("a well-known fact", 72.0, 100.0, 300.0)];
         let blocks = classify(lines, &sig);
@@ -2335,6 +2385,7 @@ mod tests {
             body_size: 12.0,
             headers: Default::default(),
             footers: Default::default(),
+            watermarks: Default::default(),
         };
         let blocks = detect_tables(lines, &sig);
         assert_eq!(blocks.len(), 1);
