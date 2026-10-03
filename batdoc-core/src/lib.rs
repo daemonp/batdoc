@@ -194,7 +194,7 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
 }
 
 /// Extraction options.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)] // independent feature switches, not state
 pub struct ExtractOptions {
     /// Include embedded images as base64 markdown (markdown mode only).
@@ -241,6 +241,40 @@ impl Default for ExtractOptions {
             strip_watermarks: false,
             password: None,
         }
+    }
+}
+
+/// Wrapper that renders an optional password without revealing it.
+///
+/// Used by the manual `Debug` impl below so that `ExtractOptions` can be
+/// printed (for example from a `#[derive(Debug)]` container) without ever
+/// putting a plaintext password into the output.
+struct RedactedPassword<'a>(&'a Option<String>);
+
+impl std::fmt::Debug for RedactedPassword<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_some() {
+            f.write_str("Some(\"<redacted>\")")
+        } else {
+            f.write_str("None")
+        }
+    }
+}
+
+// Manual impl: `#[derive(Debug)]` would print the plaintext password, which
+// must never reach `Debug`, logs, or stdout. Every field is listed explicitly
+// to satisfy `clippy::missing_fields_in_debug`.
+impl std::fmt::Debug for ExtractOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtractOptions")
+            .field("images", &self.images)
+            .field("ocr", &self.ocr)
+            .field("auto_ocr", &self.auto_ocr)
+            .field("max_output_bytes", &self.max_output_bytes)
+            .field("strip_text", &self.strip_text)
+            .field("strip_watermarks", &self.strip_watermarks)
+            .field("password", &RedactedPassword(&self.password))
+            .finish()
     }
 }
 
@@ -691,6 +725,21 @@ mod tests {
     #[test]
     fn extract_options_default_password_is_none() {
         assert!(ExtractOptions::default().password.is_none());
+    }
+
+    #[test]
+    fn extract_options_debug_redacts_password() {
+        let opts = ExtractOptions {
+            password: Some("hunter2".into()),
+            ..Default::default()
+        };
+        let debug = format!("{opts:?}");
+        assert!(!debug.contains("hunter2"), "password leaked: {debug}");
+        assert!(debug.contains("password: Some(\"<redacted>\")"), "{debug}");
+        assert!(
+            format!("{:?}", ExtractOptions::default()).contains("password: None"),
+            "unset password should render as None"
+        );
     }
 
     #[test]
