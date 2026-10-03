@@ -27,6 +27,7 @@ mod heuristic;
 mod markup;
 #[cfg(feature = "ocr")]
 mod ocr;
+mod office_crypto_bridge;
 #[allow(clippy::needless_pass_by_value)] // see the note on `mod docx`
 mod pdf;
 mod pdf_geometry;

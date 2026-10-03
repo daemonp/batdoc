@@ -42,6 +42,16 @@ ocr = ["dep:ocrs", "dep:rten", "dep:image", "dep:hayro"]
 # `to_sheets` / `to_sheets_stream`). Worker / rlib consumers leave this off.
 wasm-bindgen = ["dep:wasm-bindgen", "dep:js-sys"]
 
+# Password-protected OOXML decryption (MS-OFFCRYPTO). `crypto-ops` is the
+# decrypt/encrypt half; `classify` (detection) is always present. Pinned to
+# the RC line: the API may change before 0.1.0.
+#
+# Native only: the crate does not compile for wasm32-unknown-unknown (its
+# `cfb` 0.14 dependency hands `std::time::SystemTime` to a `web_time` API
+# there), so `office_crypto_bridge` carries wasm stubs instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+msoffice-crypto = { version = "=0.1.0-rc.5", default-features = false, features = ["crypto-ops"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # lopdf pulls getrandom 0.4 transitively (via rand); enable its wasm backend
 # (see .cargo/config.toml for the matching `getrandom_backend="wasm_js"` cfg).
