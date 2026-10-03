@@ -73,16 +73,26 @@ fn extract_encrypted_pages(
 /// A password only reaches the encrypted loader when the document is
 /// actually encrypted. Without one, pdf-extract's plain helper rejects an
 /// encrypted document with an incorrect-password error (mapped to
-/// [`BatdocError::PasswordRequired`]); a password supplied for an
-/// unencrypted PDF must leave the plain helper in charge, so that a readable
-/// document stays readable.
+/// [`BatdocError::PasswordRequired`]), so the encryption probe is only run
+/// when a password was supplied; a password supplied for an unencrypted PDF
+/// must leave the plain helper in charge, so that a readable document stays
+/// readable.
 ///
-/// Panics from the underlying library are caught and converted to errors.
+/// Panics from the underlying library — including from the probe — are
+/// caught and converted to errors.
 fn extract_pages(data: &[u8], password: Option<&str>) -> Result<Vec<String>> {
-    let encrypted = lopdf::Document::load_mem(data).is_ok_and(|d| d.is_encrypted());
-    let result = panic::catch_unwind(AssertUnwindSafe(|| match (password, encrypted) {
-        (Some(pw), true) => extract_encrypted_pages(data, pw),
-        _ => pdf_extract::extract_text_from_mem_by_pages(data),
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Probe only when a password was supplied: with none, the plain
+        // helper below already reports an encrypted document as
+        // `PasswordRequired`, and a plain document must not pay for an
+        // extra parse. The probe lives inside the panic guard so a
+        // malformed document that makes lopdf panic still becomes an error.
+        if let Some(pw) = password {
+            if lopdf::Document::load_mem(data).is_ok_and(|d| d.is_encrypted()) {
+                return extract_encrypted_pages(data, pw);
+            }
+        }
+        pdf_extract::extract_text_from_mem_by_pages(data)
     }));
     match result {
         Ok(Ok(pages)) => Ok(pages),
@@ -1212,6 +1222,20 @@ startxref\n\
         };
         let md = extract_markdown(&data, opts).unwrap();
         assert!(md.contains("SecretText"), "got {md:?}");
+    }
+
+    /// Regression: with a password supplied the encryption probe runs, and a
+    /// document it cannot parse must still surface as a `Document` error (the
+    /// probe sits inside the panic guard, so a malformed document can never
+    /// abort the process).
+    #[test]
+    fn malformed_pdf_with_password_returns_document_error() {
+        let opts = crate::ExtractOptions {
+            password: Some("anything".into()),
+            ..Default::default()
+        };
+        let err = extract_plain(b"not a pdf at all", opts).unwrap_err();
+        assert!(matches!(err, BatdocError::Document(_)), "got {err:?}");
     }
 
     /// Regression: a password supplied for a *plain* PDF must not route
