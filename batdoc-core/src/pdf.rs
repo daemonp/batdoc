@@ -10,17 +10,83 @@ use crate::ExtractOptions;
 use crate::ExtractSink;
 use std::panic::{self, AssertUnwindSafe};
 
+/// Load a PDF, decrypting it with `password` when it is encrypted.
+///
+/// lopdf's reader only parses an encrypted document's object graph when the
+/// password is handed to the loader — `Document::load_mem` followed by
+/// `Document::decrypt` leaves the document empty. An empty password still
+/// opens owner-only locks (restrictions without an open password), and lopdf
+/// ignores the password for an unencrypted document.
+fn load_document(
+    data: &[u8],
+    password: &str,
+) -> std::result::Result<lopdf::Document, lopdf::Error> {
+    lopdf::Document::load_mem_with_options(data, lopdf::LoadOptions::with_password(password))
+}
+
+/// Map a `lopdf` load/decrypt failure, distinguishing a bad password from a
+/// malformed document.
+fn map_lopdf_error(e: lopdf::Error, had_password: bool) -> BatdocError {
+    if matches!(
+        e,
+        lopdf::Error::InvalidPassword
+            | lopdf::Error::Decryption(lopdf::encryption::DecryptionError::IncorrectPassword)
+    ) {
+        return if had_password {
+            BatdocError::IncorrectPassword
+        } else {
+            BatdocError::PasswordRequired
+        };
+    }
+    BatdocError::Document(format!("PDF extraction failed: {e}"))
+}
+
+/// Map a `pdf-extract` failure, distinguishing a bad password from a
+/// malformed document.
+fn map_pdf_error(e: pdf_extract::OutputError, had_password: bool) -> BatdocError {
+    match e {
+        pdf_extract::OutputError::PdfError(e) => map_lopdf_error(e, had_password),
+        other => BatdocError::Document(format!("PDF extraction failed: {other}")),
+    }
+}
+
+/// Extract the pages of an encrypted PDF: load it with `password` and run
+/// pdf-extract's per-page text extractor over the decrypted document.
+fn extract_encrypted_pages(
+    data: &[u8],
+    password: &str,
+) -> std::result::Result<Vec<String>, pdf_extract::OutputError> {
+    let doc = load_document(data, password)?;
+    let mut pages = Vec::new();
+    for (page_num, _) in doc.get_pages() {
+        let mut text = String::new();
+        let mut output = pdf_extract::PlainTextOutput::new(&mut text);
+        pdf_extract::output_doc_page(&doc, &mut output, page_num)?;
+        pages.push(text);
+    }
+    Ok(pages)
+}
+
 /// Extract pages of text from a PDF byte slice, returning one `String` per
 /// page.
 ///
+/// A password only reaches the encrypted loader when the document is
+/// actually encrypted. Without one, pdf-extract's plain helper rejects an
+/// encrypted document with an incorrect-password error (mapped to
+/// [`BatdocError::PasswordRequired`]); a password supplied for an
+/// unencrypted PDF must leave the plain helper in charge, so that a readable
+/// document stays readable.
+///
 /// Panics from the underlying library are caught and converted to errors.
-fn extract_pages(data: &[u8]) -> Result<Vec<String>> {
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        pdf_extract::extract_text_from_mem_by_pages(data)
+fn extract_pages(data: &[u8], password: Option<&str>) -> Result<Vec<String>> {
+    let encrypted = lopdf::Document::load_mem(data).is_ok_and(|d| d.is_encrypted());
+    let result = panic::catch_unwind(AssertUnwindSafe(|| match (password, encrypted) {
+        (Some(pw), true) => extract_encrypted_pages(data, pw),
+        _ => pdf_extract::extract_text_from_mem_by_pages(data),
     }));
     match result {
         Ok(Ok(pages)) => Ok(pages),
-        Ok(Err(e)) => Err(BatdocError::Document(format!("PDF extraction failed: {e}"))),
+        Ok(Err(e)) => Err(map_pdf_error(e, password.is_some())),
         Err(_) => Err(BatdocError::Document(
             "PDF extraction panicked (malformed document)".into(),
         )),
@@ -60,8 +126,8 @@ fn clean_page(raw: &str) -> String {
 }
 
 /// Produce the per-page text, OCR'ing empty pages when `ocr` is set.
-fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
-    let pages = extract_pages(data)?;
+fn extract_pages_with_ocr(data: &[u8], ocr: bool, password: Option<&str>) -> Result<Vec<String>> {
+    let pages = extract_pages(data, password)?;
     if !ocr {
         return Ok(pages.iter().map(|p| clean_page(p)).collect());
     }
@@ -69,7 +135,9 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
     {
         // Parse the document with lopdf ONCE for image extraction; if that
         // fails, empty pages fall through as "no text" (same as non-OCR).
-        let doc_pages = lopdf::Document::load_mem(data)
+        // The password-aware loader keeps an encrypted document's page tree
+        // and image streams readable.
+        let doc_pages = load_document(data, password.unwrap_or(""))
             .ok()
             .map(|doc| (doc.get_pages().into_values().collect::<Vec<_>>(), doc));
         let mut out = Vec::with_capacity(pages.len());
@@ -120,7 +188,7 @@ fn extract_pages_with_fallback(data: &[u8], opts: ExtractOptions) -> Result<(Vec
     // folds to `false` at compile time and also keeps `opts` referenced.
     let ocr_requested = crate::OCR_COMPILED && opts.ocr;
     let auto_ocr = crate::OCR_COMPILED && opts.auto_ocr;
-    let pages = extract_pages_with_ocr(data, ocr_requested)?;
+    let pages = extract_pages_with_ocr(data, ocr_requested, opts.password.as_deref())?;
     if ocr_requested || pages.iter().any(|p| !p.is_empty()) {
         return Ok((pages, ocr_requested));
     }
@@ -131,7 +199,7 @@ fn extract_pages_with_fallback(data: &[u8], opts: ExtractOptions) -> Result<(Vec
     if !auto_ocr {
         return Ok((pages, false));
     }
-    let ocr_pages = extract_pages_with_ocr(data, true)?;
+    let ocr_pages = extract_pages_with_ocr(data, true, opts.password.as_deref())?;
     Ok((ocr_pages, true))
 }
 
@@ -426,29 +494,11 @@ pub(crate) fn extract_markdown_to(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
-    let mut doc = match lopdf::Document::load_mem(data) {
-        Ok(d) => d,
-        Err(e) => {
-            return Err(BatdocError::Document(format!("PDF extraction failed: {e}")));
-        }
-    };
-    if doc.is_encrypted() {
-        // Mirror pdf-extract's `maybe_decrypt`: empty-password attempt,
-        // and the same error string the plain path produces on failure.
-        if let Err(e) = doc.decrypt("") {
-            use lopdf::encryption::DecryptionError;
-            if matches!(
-                e,
-                lopdf::Error::Decryption(DecryptionError::IncorrectPassword)
-            ) {
-                return Err(BatdocError::Document(format!(
-                    "PDF extraction failed: {}",
-                    pdf_extract::OutputError::PdfError(e)
-                )));
-            }
-            // Other decrypt failures: log-and-continue, per the plan ruling.
-        }
-    }
+    // The loader decrypts when `opts.password` opens the document (or when
+    // the empty user password does, for owner-only locks); an unusable
+    // password becomes `PasswordRequired`/`IncorrectPassword`.
+    let doc = load_document(data, opts.password.as_deref().unwrap_or(""))
+        .map_err(|e| map_lopdf_error(e, opts.password.is_some()))?;
     let page_ids: Vec<lopdf::ObjectId> = doc.get_pages().into_values().collect();
     // Absurd-page-count guard: > u32::MAX pages cannot be numbered anyway.
     let page_count = u32::try_from(page_ids.len()).unwrap_or(u32::MAX);
@@ -1093,6 +1143,91 @@ startxref\n\
         let mut buf = Vec::new();
         doc.save_to(&mut buf).unwrap();
         buf
+    }
+
+    /// Encrypt a text PDF with AES-128 (lopdf `EncryptionVersion::V4`).
+    fn encrypt_text_pdf(page_texts: &[&str], user: &str, owner: &str) -> Vec<u8> {
+        use lopdf::encryption::crypt_filters::{Aes128CryptFilter, CryptFilter};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut doc = lopdf::Document::load_mem(&build_text_pdf(page_texts)).unwrap();
+        // lopdf derives the file encryption key from the first /ID element,
+        // and `build_text_pdf` writes no trailer /ID.
+        let file_id = lopdf::Object::string_literal("batdoc-test-file-id");
+        doc.trailer.set("ID", vec![file_id.clone(), file_id]);
+        let filter: Arc<dyn CryptFilter> = Arc::new(Aes128CryptFilter);
+        let version = lopdf::EncryptionVersion::V4 {
+            document: &doc,
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), filter)]),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password: owner,
+            user_password: user,
+            permissions: lopdf::Permissions::all(),
+        };
+        let state = lopdf::EncryptionState::try_from(version).unwrap();
+        doc.encrypt(&state).unwrap();
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn encrypted_pdf_without_password_requires_one() {
+        let data = encrypt_text_pdf(&["SecretText"], "user", "owner");
+        let err = extract_plain(&data, crate::ExtractOptions::default()).unwrap_err();
+        assert!(matches!(err, BatdocError::PasswordRequired), "got {err:?}");
+    }
+
+    #[test]
+    fn encrypted_pdf_with_password_extracts() {
+        let data = encrypt_text_pdf(&["SecretText"], "user", "owner");
+        let opts = crate::ExtractOptions {
+            password: Some("user".into()),
+            ..Default::default()
+        };
+        let text = extract_plain(&data, opts).unwrap();
+        assert!(text.contains("SecretText"), "got {text:?}");
+    }
+
+    #[test]
+    fn encrypted_pdf_wrong_password_is_incorrect() {
+        let data = encrypt_text_pdf(&["SecretText"], "user", "owner");
+        let opts = crate::ExtractOptions {
+            password: Some("nope".into()),
+            ..Default::default()
+        };
+        let err = extract_plain(&data, opts).unwrap_err();
+        assert!(matches!(err, BatdocError::IncorrectPassword), "got {err:?}");
+    }
+
+    #[test]
+    fn encrypted_pdf_markdown_with_password_extracts() {
+        let data = encrypt_text_pdf(&["SecretText"], "user", "owner");
+        let opts = crate::ExtractOptions {
+            password: Some("user".into()),
+            ..Default::default()
+        };
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(md.contains("SecretText"), "got {md:?}");
+    }
+
+    /// Regression: a password supplied for a *plain* PDF must not route
+    /// extraction through pdf-extract's encrypted helper (which fails with
+    /// `NotEncrypted`), on either the plain or the markdown path.
+    #[test]
+    fn unencrypted_pdf_with_password_still_extracts() {
+        let data = build_text_pdf(&["PlainText"]);
+        let opts = crate::ExtractOptions {
+            password: Some("anything".into()),
+            ..Default::default()
+        };
+        let text = extract_plain(&data, opts.clone()).unwrap();
+        assert!(text.contains("PlainText"), "got {text:?}");
+        let md = extract_markdown(&data, opts).unwrap();
+        assert!(md.contains("PlainText"), "got {md:?}");
     }
 
     #[test]

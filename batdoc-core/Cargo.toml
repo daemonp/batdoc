@@ -21,7 +21,7 @@ encoding_rs = "0.8"
 # does not embed them; `embed-cmaps` is left off (OCR is Latin-only).
 hayro = { version = "0.7", default-features = false, features = ["embed-fonts"], optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"], optional = true }
-lopdf = { version = "0.38", default-features = false }
+lopdf = { version = "0.42", default-features = false }
 ocrs = { version = "0.12", default-features = false, optional = true }
 pdf-extract = "0.10"
 quick-xml = "0.37"
@@ -43,16 +43,16 @@ ocr = ["dep:ocrs", "dep:rten", "dep:image", "dep:hayro"]
 wasm-bindgen = ["dep:wasm-bindgen", "dep:js-sys"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# lopdf pulls getrandom 0.3 transitively (via rand); enable its wasm backend
+# lopdf pulls getrandom 0.4 transitively (via rand); enable its wasm backend
 # (see .cargo/config.toml for the matching `getrandom_backend="wasm_js"` cfg).
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 # Only needed when the `wasm-bindgen` feature is on (browser demo).
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-lopdf = { version = "0.38", default-features = false }
+lopdf = { version = "0.42", default-features = false }
 # zip 2.x has no `write` feature (ZipWriter is unconditional); the `deflate`
 # feature union matches the main dependency.
 zip = { version = "2", default-features = false, features = ["deflate"] }
