@@ -222,6 +222,12 @@ pub struct ExtractOptions {
     /// Needs at least two pages to learn a signature; a single-page document
     /// is left untouched (use `strip_text` there). No-op by default.
     pub strip_watermarks: bool,
+    /// Password for an encrypted PDF or Office document.
+    ///
+    /// `None` means "not supplied": PDF still tries the empty user password
+    /// (owner-only locks); an encrypted Office package returns
+    /// [`BatdocError::PasswordRequired`] without guessing.
+    pub password: Option<String>,
 }
 
 impl Default for ExtractOptions {
@@ -233,6 +239,7 @@ impl Default for ExtractOptions {
             max_output_bytes: None,
             strip_text: Vec::new(),
             strip_watermarks: false,
+            password: None,
         }
     }
 }
@@ -679,6 +686,11 @@ mod tests {
         assert_eq!(err, "output exceeded 3 bytes");
         assert_eq!(out.len(), 1);
         assert!(out[0].rows.is_empty());
+    }
+
+    #[test]
+    fn extract_options_default_password_is_none() {
+        assert!(ExtractOptions::default().password.is_none());
     }
 
     #[test]
