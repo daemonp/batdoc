@@ -16,6 +16,10 @@ crate-type = ["rlib", "cdylib"]
 base64 = "0.22"
 cfb = "0.13"
 encoding_rs = "0.8"
+# Pure-Rust PDF rasterizer for the textless/imageless (vector-outline) OCR
+# fallback. `embed-fonts` supplies the 14 standard PDF fonts when a document
+# does not embed them; `embed-cmaps` is left off (OCR is Latin-only).
+hayro = { version = "0.7", default-features = false, features = ["embed-fonts"], optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"], optional = true }
 lopdf = { version = "0.38", default-features = false }
 ocrs = { version = "0.12", default-features = false, optional = true }
@@ -33,7 +37,7 @@ default = ["net", "ocr"]
 net = ["dep:ureq"]
 # OCR inference (ocrs + rten engine + `image` decode). Disable for lean
 # wasm/embedded builds that do not OCR images or textless PDFs.
-ocr = ["dep:ocrs", "dep:rten", "dep:image"]
+ocr = ["dep:ocrs", "dep:rten", "dep:image", "dep:hayro"]
 # Browser JS glue + `src/wasm.rs` exports (`detect` / `to_plain` / `to_markdown` /
 # `to_sheets` / `to_sheets_stream`). Worker / rlib consumers leave this off.
 wasm-bindgen = ["dep:wasm-bindgen", "dep:js-sys"]

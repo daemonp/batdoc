@@ -45,9 +45,9 @@ Ignored in plain text mode and for formats without image support (.doc, .xls, .p
 --ocr uses the ocrs engine (models downloaded on first use to
 $BATDOC_MODELS_DIR, $XDG_CACHE_HOME/batdoc/models, or ~/.cache/batdoc/models).
 For .docx/.pptx, embedded images are OCR'd. PDFs need no flag: any page
-without a text layer is OCR'd automatically from its embedded images as a
-fallback (a textless PDF is a scan). Image files (.png/.jpg/.gif/
-.webp/.bmp) are always OCR'd, with or without --ocr.
+without a text layer is OCR'd automatically — from its embedded images, or
+(if it has none) from a rendered bitmap of the page. Image files (.png/.jpg/
+.gif/.webp/.bmp) are always OCR'd, with or without --ocr.
 
 --strip-text matches against text runs reconstructed along their true
 rotation, so it removes watermarks drawn at an angle (which otherwise

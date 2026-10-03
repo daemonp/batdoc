@@ -73,16 +73,30 @@ fn extract_pages_with_ocr(data: &[u8], ocr: bool) -> Result<Vec<String>> {
             .ok()
             .map(|doc| (doc.get_pages().into_values().collect::<Vec<_>>(), doc));
         let mut out = Vec::with_capacity(pages.len());
+        // Lazily built once per document, only if a textless page has no
+        // embedded image to OCR (see the vector-outline fallback below).
+        let mut rasterizer: Option<crate::pdf_raster::PageRasterizer> = None;
         for (i, page) in pages.iter().enumerate() {
             let cleaned = clean_page(page);
             if !cleaned.is_empty() {
                 out.push(cleaned);
                 continue;
             }
-            let ocr_text = match &doc_pages {
+            let mut ocr_text = match &doc_pages {
                 Some((page_ids, doc)) => ocr_page(doc, page_ids, i)?,
                 None => None,
             };
+            // Vector-outline fallback: the page yielded no embedded-image
+            // text (usually because it has no images at all — the glyphs
+            // were drawn as paths), so render the page and OCR the bitmap.
+            if ocr_text.is_none() {
+                if rasterizer.is_none() {
+                    rasterizer = crate::pdf_raster::PageRasterizer::new(data);
+                }
+                if let Some(raster) = &rasterizer {
+                    ocr_text = crate::pdf_ocr::rasterized_ocr_text(raster, i)?;
+                }
+            }
             out.push(ocr_text.map_or_else(String::new, |t| clean_page(&t)));
         }
         Ok(out)
@@ -156,9 +170,48 @@ fn ocr_page(
     }
 }
 
+/// Full-page rectangle in top-down points for a rasterized render, derived
+/// from the page's `MediaBox` (the coordinate space the layout pipeline
+/// uses). A renderer covers the page's crop box; for the common case where
+/// crop box == media box this is exact.
+#[cfg(feature = "ocr")]
+fn page_pt_rect(page: &crate::pdf_text::PositionedPage) -> crate::pdf_geometry::PtRect {
+    let (llx, lly, urx, ury) = page.media_box;
+    crate::pdf_geometry::PtRect {
+        x0: llx,
+        y0: 0.0,
+        x1: urx,
+        y1: ury - lly,
+    }
+}
+
+/// Vector-outline OCR fallback: render a textless, imageless page and OCR
+/// the bitmap, returning layout lines mapped into page points.
+///
+/// `rasterizer` is built on first use and reused across pages; when the
+/// renderer cannot parse the document it stays `None` and this is a no-op.
+#[cfg(feature = "ocr")]
+fn rasterized_page_lines(
+    rasterizer: &mut Option<crate::pdf_raster::PageRasterizer>,
+    data: &[u8],
+    page_index: usize,
+    page: &crate::pdf_text::PositionedPage,
+) -> Result<Vec<crate::pdf_layout::Line>> {
+    if rasterizer.is_none() {
+        *rasterizer = crate::pdf_raster::PageRasterizer::new(data);
+    }
+    match rasterizer {
+        Some(raster) => {
+            crate::pdf_ocr::rasterized_ocr_lines(raster, page_index, page_pt_rect(page))
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
 fn no_text_error(ocr: bool) -> BatdocError {
     let message = if ocr {
-        "PDF contains no extractable text (no text layer; OCR found nothing)"
+        "PDF contains no extractable text (no text layer; OCR found nothing in \
+         page images or rendered pages)"
     } else {
         "PDF contains no extractable text (may be scanned/image-only)"
     };
@@ -226,6 +279,7 @@ struct RenderedPages {
 /// page had non-empty native assembled lines (the safety-net trigger).
 fn render_pages(
     doc: &lopdf::Document,
+    data: &[u8],
     page_ids: &[lopdf::ObjectId],
     page_count: u32,
     signals: &crate::pdf_layout::DocSignals,
@@ -236,6 +290,13 @@ fn render_pages(
     let mut ocr_attempted = opts.ocr;
     #[cfg(not(feature = "ocr"))]
     let ocr_attempted = crate::OCR_COMPILED && opts.ocr; // false; keeps `opts` referenced
+    #[cfg(not(feature = "ocr"))]
+    let _ = data; // only the OCR fallback renders pages
+
+    // Lazily built once per document, only if a textless page has no
+    // embedded image to OCR (see the vector-outline fallback below).
+    #[cfg(feature = "ocr")]
+    let mut rasterizer: Option<crate::pdf_raster::PageRasterizer> = None;
     let mut had_native_lines = false;
     for (page_num, page_id) in (1..=page_count).zip(page_ids) {
         let page = crate::pdf_text::extract_positioned_page(doc, page_num)?;
@@ -294,6 +355,23 @@ fn render_pages(
                             }
                         }
                     }
+                }
+                // Vector-outline fallback: embedded-image OCR produced
+                // nothing (usually because the page has no images at all —
+                // the producer drew glyphs as filled paths), so render the
+                // page and OCR the bitmap. Restricted to pages that also
+                // assembled no native text, so an `--ocr` request on a
+                // normal text PDF never pays for rendering.
+                let got_embedded_lines = !ocr_lines.is_empty() || !unplaced_text.trim().is_empty();
+                let textless = garbled || native.iter().all(|l| l.text.trim().is_empty());
+                if !got_embedded_lines && textless {
+                    let page_index = usize::try_from(page_num - 1).unwrap_or(0);
+                    ocr_lines.extend(rasterized_page_lines(
+                        &mut rasterizer,
+                        data,
+                        page_index,
+                        &page,
+                    )?);
                 }
             }
             (ocr_lines, unplaced_text)
@@ -395,7 +473,7 @@ pub(crate) fn extract_markdown_to(
     // markdown is buffered (bounded by output size, same memory profile as
     // today's Vec<String> of all page text; the single-page heading rule
     // requires not emitting page 1 before knowing whether page 2 exists).
-    let rendered = render_pages(&doc, &page_ids, page_count, &signals, &opts)?;
+    let rendered = render_pages(&doc, data, &page_ids, page_count, &signals, &opts)?;
     let mut emitted = rendered.emitted;
 
     // Safety net: if furniture stripping dropped every native line, re-run
@@ -411,7 +489,7 @@ pub(crate) fn extract_markdown_to(
             // removed by `strip_text` needles — those stay applied.)
             watermarks: std::collections::HashSet::new(),
         };
-        let fallback = render_pages(&doc, &page_ids, page_count, &fallback_signals, &opts)?;
+        let fallback = render_pages(&doc, data, &page_ids, page_count, &fallback_signals, &opts)?;
         if !fallback.emitted.is_empty() {
             emitted = fallback.emitted;
         }
@@ -624,6 +702,28 @@ startxref\n\
         .to_string();
         assert!(err.contains("no extractable text"), "got: {err}");
         assert!(!err.contains("OCR found nothing"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_markdown_vector_outline_auto_ocr_off_reports_scan() {
+        // Paths only: no text layer and no embedded image. With OCR disabled
+        // the page must report the scanned/image-only error (no regression)
+        // and must not attempt rasterization.
+        let data = build_text_pdf_content("0 0 0 rg 100 100 m 300 100 l 300 200 l 100 200 l h f");
+        let err = extract_markdown(
+            &data,
+            crate::ExtractOptions {
+                images: false,
+                ocr: false,
+                auto_ocr: false,
+                max_output_bytes: None,
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no extractable text"), "got: {err}");
+        assert!(!err.contains("OCR"), "got: {err}");
     }
 
     #[test]

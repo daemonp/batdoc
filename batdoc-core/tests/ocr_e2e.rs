@@ -298,6 +298,87 @@ fn ocr_pdf_embedded_image_page() {
     assert!(text.contains("123"), "OCR text missing: {text:?}");
 }
 
+/// Build a one-page PDF that draws the bitmap fixture as **filled vector
+/// rectangles** — no text operators, no fonts, and no image XObjects.
+///
+/// This reproduces the "Microsoft: Print To PDF" failure mode: a page with
+/// neither a text layer nor an embedded image to OCR. Each black pixel of
+/// [`render_test_image`] becomes a 1pt square, so the recognized glyph layout
+/// is exactly the one the image fixture already reads reliably — the only new
+/// thing under test is that the page is rasterized before OCR.
+#[allow(clippy::cast_precision_loss)] // image dimensions are far below f32 precision
+fn build_pdf_with_vector_glyphs() -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+    use std::fmt::Write as _;
+
+    const MARGIN: i64 = 12;
+    let img = render_test_image();
+    let (w, h) = img.dimensions();
+
+    let mut content = String::from("0 0 0 rg\n");
+    for (x, y, px) in img.enumerate_pixels() {
+        if px.0 == [0, 0, 0] {
+            let x_pt = MARGIN + i64::from(x);
+            // Image rows are top-down; PDF user space is bottom-up.
+            let y_pt = MARGIN + i64::from(h - 1 - y);
+            let _ = writeln!(content, "{x_pt} {y_pt} 1 1 re");
+        }
+    }
+    content.push_str("f\n");
+
+    let mut doc = Document::with_version("1.5");
+    let pages_obj = doc.new_object_id();
+    let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_obj,
+        "Contents" => content_id,
+        "MediaBox" => vec![
+            0.into(),
+            0.into(),
+            (i64::from(w) + 2 * MARGIN).into(),
+            (i64::from(h) + 2 * MARGIN).into(),
+        ],
+    });
+    doc.objects.insert(
+        pages_obj,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_obj,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+    buf
+}
+
+#[test]
+#[ignore = "requires OCR models (downloaded on first use)"]
+fn ocr_pdf_vector_outline_page() {
+    // The page has no text layer and no embedded image (the glyphs are
+    // filled paths), so OCR can only succeed by rasterizing the page first.
+    //
+    // Exact-word assertions are deliberately avoided: this synthetic block
+    // font is legible to a human but sits at the edge of what the OCR models
+    // read after their fixed-size resize, whereas real typographic fonts (the
+    // shipped spec PDFs) read cleanly. The point of this test is that the
+    // fallback renders the page and yields recognized text instead of the
+    // no-text error.
+    let pdf = build_pdf_with_vector_glyphs();
+    let md = batdoc_core::extract_markdown_with(&pdf, Format::Pdf, ExtractOptions::default())
+        .expect("vector-outline page must not fail with a no-text error");
+    assert!(
+        md.chars().any(|c| c.is_ascii_alphanumeric()),
+        "vector-outline fallback produced no recognizable text: {md:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires OCR models (downloaded on first use)"]
 fn ocr_pdf_markdown_mode_region_merge() {

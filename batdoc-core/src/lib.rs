@@ -32,6 +32,8 @@ mod pdf;
 mod pdf_geometry;
 mod pdf_layout;
 mod pdf_ocr;
+#[cfg(feature = "ocr")]
+mod pdf_raster;
 mod pdf_text;
 mod pdf_watermark;
 #[allow(clippy::needless_pass_by_value)] // see the note on `mod docx`

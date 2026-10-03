@@ -5,10 +5,14 @@
 //! native PDF text lines while dropping overlaps.
 
 #[cfg(feature = "ocr")]
+use crate::error::Result;
+#[cfg(feature = "ocr")]
 use crate::ocr::MAX_OCR_IMAGE_DIM;
 #[cfg(feature = "ocr")]
 use crate::pdf_geometry::{PlacedImage, PtRect};
 use crate::pdf_layout::{Line, LineSource};
+#[cfg(feature = "ocr")]
+use crate::pdf_raster::PageRasterizer;
 #[cfg(feature = "ocr")]
 use lopdf::xobject::PdfImage;
 #[cfg(feature = "ocr")]
@@ -155,6 +159,46 @@ pub(crate) fn map_ocr_lines(
             }
         })
         .collect()
+}
+
+/// OCR a rasterized page render and map the recognized lines into page
+/// points spanning `page_rect` (top-down points).
+///
+/// This is the vector-outline fallback: the page has no text layer and no
+/// embedded image to OCR, so the whole page is rendered and read as a
+/// bitmap. Empty when the page cannot be rendered or OCR finds no text.
+#[cfg(feature = "ocr")]
+pub(crate) fn rasterized_ocr_lines(
+    rasterizer: &PageRasterizer,
+    page_index: usize,
+    page_rect: PtRect,
+) -> Result<Vec<Line>> {
+    let Some(rgb) = rasterizer.rasterize(page_index) else {
+        return Ok(Vec::new());
+    };
+    let lines = crate::ocr::ocr_rgb_image_lines(&rgb)?;
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A full-page render has no XObject identity; `map_ocr_lines` never
+    // reads `object_id`.
+    let placed = PlacedImage {
+        object_id: (0, 0),
+        rect: page_rect,
+    };
+    Ok(map_ocr_lines(&placed, rgb.width(), rgb.height(), &lines))
+}
+
+/// OCR a rasterized page render to plain text (the plain-output fallback).
+#[cfg(feature = "ocr")]
+pub(crate) fn rasterized_ocr_text(
+    rasterizer: &PageRasterizer,
+    page_index: usize,
+) -> Result<Option<String>> {
+    let Some(rgb) = rasterizer.rasterize(page_index) else {
+        return Ok(None);
+    };
+    crate::ocr::ocr_rgb_image(&rgb)
 }
 
 /// Drop OCR lines that overlap native text (2.0 pt tolerance, spec §6) and

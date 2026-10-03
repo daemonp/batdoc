@@ -34,10 +34,12 @@ fn main() {
                 .help(
                     "OCR text from images using the ocrs engine. For .docx/.pptx, \
                      embedded images are OCR'd; for .pdf, pages without a text \
-                     layer are OCR'd from their embedded images. Image files \
-                     (.png/.jpg/.gif/.webp/.bmp) are always OCR'd. Models are \
-                     downloaded on first use to $BATDOC_MODELS_DIR, \
-                     $XDG_CACHE_HOME/batdoc/models, or ~/.cache/batdoc/models.",
+                     layer are OCR'd from their embedded images, or from a \
+                     rendered bitmap when the page has no images (vector-outline \
+                     PDFs). Image files (.png/.jpg/.gif/.webp/.bmp) are always \
+                     OCR'd. Models are downloaded on first use to \
+                     $BATDOC_MODELS_DIR, $XDG_CACHE_HOME/batdoc/models, or \
+                     ~/.cache/batdoc/models.",
                 ),
         )
         .flag(

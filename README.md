@@ -126,10 +126,13 @@ notes are appended after the deck under `## Notes` when present.
 
 `.pdf` extracts text from text-based PDFs using `pdf-extract`. Multi-page
 documents get `## Page N` headings in markdown mode. When a PDF has no text
-layer at all (a scan), batdoc automatically falls back to OCR'ing its embedded
-page images — no `--ocr` flag needed. A scanned PDF whose OCR also finds
-nothing gets a clean error message. Malformed PDFs that would crash the
-underlying library are caught and reported as errors rather than panics.
+layer, batdoc automatically falls back to OCR — no `--ocr` flag needed. It
+first OCRs any embedded page images (a scan); if there are none, it renders
+the page with a built-in pure-Rust rasterizer and OCRs that bitmap, which
+recovers PDFs whose glyphs were converted to vector outlines (for example by
+"Microsoft: Print To PDF"). A PDF whose OCR also finds nothing gets a clean
+error message. Malformed PDFs that would crash the underlying library are
+caught and reported as errors rather than panics.
 
 ### PDF extraction notes
 
