@@ -44,6 +44,16 @@ fn main() {
         )
         .flag(
             Flag::new()
+                .long("--password")
+                .help(
+                    "Password for an encrypted PDF or Office document. If omitted \
+                     and standard input is a terminal, batdoc prompts without echo. \
+                     A password on the command line may be visible to other users \
+                     via ps(1).",
+                ),
+        )
+        .flag(
+            Flag::new()
                 .short("-h")
                 .long("--help")
                 .help("Show help information."),

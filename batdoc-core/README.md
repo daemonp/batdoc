@@ -33,7 +33,14 @@ let text = batdoc_core::extract_plain(&data, format).unwrap();
 
 ```rust
 pub enum Format { Doc, Xls, Docx, Xlsx, Pptx, Pdf, Image }
-pub enum BatdocError { Io, Zip, Document, Render }
+
+// #[non_exhaustive]: match with a wildcard arm.
+pub enum BatdocError {
+    Io, Zip, Document, Render,
+    PasswordRequired,               // encrypted, no usable password supplied
+    IncorrectPassword,              // supplied password did not authenticate
+    UnsupportedEncryption(String),  // encryption this build does not handle
+}
 pub type Result<T> = std::result::Result<T, BatdocError>;
 
 pub struct ExtractOptions {
@@ -41,15 +48,23 @@ pub struct ExtractOptions {
     pub ocr: bool,               // OCR embedded images (DOCX/PPTX)
     pub auto_ocr: bool,          // textless/garbled PDF fallback (default true)
     pub max_output_bytes: Option<u64>,
+    pub password: Option<String>, // password for an encrypted PDF/Office document
 }
 
 pub fn detect_format(data: &[u8]) -> Result<Format>;
+pub fn detect_format_with(data: &[u8], password: Option<&str>) -> Result<Format>;
+pub fn needs_password(data: &[u8]) -> Result<bool>;
 pub fn extract_plain(data: &[u8], format: Format) -> Result<String>;
 pub fn extract_plain_with(data: &[u8], format: Format, opts: ExtractOptions) -> Result<String>;
 pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<String>;
 pub fn extract_markdown_with(data: &[u8], format: Format, opts: ExtractOptions) -> Result<String>;
 pub fn to_plain(data: &[u8]) -> Result<String>;
+pub fn to_plain_with(data: &[u8], opts: ExtractOptions) -> Result<String>;
 pub fn to_markdown(data: &[u8], images: bool) -> Result<String>;
+pub fn to_markdown_with(data: &[u8], opts: ExtractOptions) -> Result<String>;
+pub fn to_sheets_with(data: &[u8], opts: ExtractOptions) -> Result<Vec<Sheet>>;
+
+pub struct Sheet { pub name: String, pub rows: Vec<Vec<String>> }
 ```
 
 `extract_markdown` with `images: true` embeds images from DOCX/XLSX/PPTX as
@@ -67,6 +82,39 @@ together with the `ocrs`/`rten`/`image` dependencies.
 // Raster images are always OCR'd — no options needed for `Format::Image`.
 let text = batdoc_core::extract_plain_with(&png, Format::Image, ExtractOptions::default()).unwrap();
 ```
+
+## Password-protected documents
+
+Encrypted PDFs and Office documents (`.docx`/`.xlsx`/`.pptx`) are decrypted
+when `ExtractOptions::password` is set:
+
+```rust
+let mut opts = batdoc_core::ExtractOptions::default();
+opts.password = Some(std::env::var("BATDOC_PASSWORD")?);
+let markdown = batdoc_core::to_markdown_with(&data, opts)?;
+```
+
+`to_plain_with`, `to_markdown_with`, and `to_sheets_with` decrypt encrypted
+Office input before extracting; the `extract_*_with` functions do the same, so
+the `format` argument may describe the decrypted package even though `data` is
+still the ciphertext. `password: None` means "not supplied": an encrypted
+Office package reports `BatdocError::PasswordRequired` without guessing, while
+a PDF still tries the empty user password (owner-only locks). A wrong password
+reports `BatdocError::IncorrectPassword`.
+
+`detect_format` cannot name the format of an encrypted Office package and
+returns `BatdocError::PasswordRequired`; use
+`detect_format_with(data, Some(pw))` to detect through the encryption, or
+`needs_password(data)` to probe for encryption without a password. Probing a
+PDF parses its encryption dictionary, so it is not free.
+
+Encrypted legacy `.doc`/`.xls` files are detected but not decrypted — they
+report `BatdocError::UnsupportedEncryption`. `BatdocError` is
+`#[non_exhaustive]`, so matches need a wildcard arm. Passwords never appear in
+error messages or `Debug` output (`ExtractOptions`'s `Debug` renders the
+password as `<redacted>`). On `wasm32`, Office decryption is unavailable (the
+crypto dependency does not build there) — only PDF passwords are supported;
+see [WASM.md](../WASM.md).
 
 ## Supported formats
 

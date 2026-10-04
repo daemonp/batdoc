@@ -144,6 +144,22 @@ crates.io instead and gets upstream behavior: still safe (panics are caught), bu
 garbled documents stay garbled. Publishing the fork to close this gap is a
 deferred follow-up.
 
+### Password-protected documents
+
+Encrypted PDFs and Office documents (`.docx`/`.xlsx`/`.pptx`, and legacy
+`.doc`/`.xls`) are opened with a password:
+
+    batdoc --password secret locked.pdf
+    batdoc locked.docx          # prompts when stdin is a terminal
+
+When no `--password` is given and stdin is a terminal, batdoc prompts without
+echo and retries once. Without a terminal it fails with a clear message.
+Passwords are never written to output or logs. Note that a password passed on
+the command line may be visible to other users via `ps(1)`.
+
+Encrypted legacy `.doc`/`.xls` files are detected and reported as unsupported
+rather than decrypted.
+
 ## Options
 
 ```
@@ -154,6 +170,8 @@ cat FILE | batdoc [OPTIONS]
   -m, --markdown    force markdown (default on tty)
   -i, --images      embed images as inline base64 data URIs
       --ocr         OCR embedded images (docx/pptx); textless PDFs auto-OCR
+      --password SECRET  password for encrypted PDF/Office documents; prompts
+                         without echo when omitted and stdin is a tty
       --strip-text STR   remove rotated PDF text containing STR (repeatable,
                          markdown output)
       --strip-watermarks remove diagonal PDF text repeated across pages
