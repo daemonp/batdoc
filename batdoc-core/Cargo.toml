@@ -53,8 +53,9 @@ wasm-bindgen = ["dep:wasm-bindgen", "dep:js-sys"]
 msoffice-crypto = { version = "=0.1.0-rc.5", default-features = false, features = ["crypto-ops"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# lopdf pulls getrandom 0.4 transitively (via rand); enable its wasm backend
-# (see .cargo/config.toml for the matching `getrandom_backend="wasm_js"` cfg).
+# lopdf pulls getrandom 0.4 transitively (via rand); enable its wasm backend.
+# The `wasm_js` feature alone selects that backend — no `getrandom_backend`
+# rustflag is needed (see .cargo/config.toml).
 getrandom = { version = "0.4", features = ["wasm_js"] }
 # Only needed when the `wasm-bindgen` feature is on (browser demo).
 wasm-bindgen = { version = "0.2", optional = true }

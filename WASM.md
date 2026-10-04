@@ -289,12 +289,18 @@ returns `UnsupportedEncryption`. Consequences in the browser build:
   package that cannot be recognised here — it fails as
   `tabular extraction is only supported for XLS and XLSX` (or an
   unreadable-container error from `detect_format_with`).
-- An encrypted **Office** package (`.docx`/`.xlsx`/`.pptx`, or legacy
-  `.doc`/`.xls`) is **not** detected as encrypted and cannot be opened: it
-  falls through to the unrecognised-container error (`OLE2 file is not a .doc
-  or .xls document` / `ZIP archive is not a .docx, .xlsx, or .pptx file`). No
-  `password-required:` is reported for it, because nothing there can tell it is
-  encrypted.
+- An encrypted **Office** package is **not** detected as encrypted and cannot
+  be opened, and no `password-required:` is reported for it, because nothing
+  in this build can tell it is encrypted. The failure differs by container:
+  - A legacy binary `.doc`/`.xls` is an OLE2 CFB that still carries its
+    `/WordDocument` (or `/Workbook`) stream, so `detect_format` recognises it
+    as `DOC`/`XLS`; extraction then reports
+    `unsupported-encryption: encrypted legacy .doc is not supported` (or
+    `.xls`).
+  - An encrypted OOXML package (`.docx`/`.xlsx`/`.pptx`) is an OLE2 CFB with
+    no `/WordDocument`, so no document type is recognised and `detect_format`
+    fails with the unrecognised-container error (`OLE2 file is not a .doc or
+    .xls document`).
 - `detect(data)` therefore never returns `password-required:` on wasm, while
   the native CLI/library does for an encrypted Office package. Native builds
   (and the `msoffice-crypto` path generally) are unaffected.

@@ -234,13 +234,25 @@ pub fn detect_format_with(data: &[u8], password: Option<&str>) -> Result<Format>
 /// cannot be parsed.
 pub fn needs_password(data: &[u8]) -> Result<bool> {
     if data.len() >= 5 && &data[..5] == b"%PDF-" {
-        let mut doc = lopdf::Document::load_mem(data)
-            .map_err(|e| BatdocError::Document(format!("PDF parse failed: {e}")))?;
-        if !doc.is_encrypted() {
-            return Ok(false);
-        }
-        // Owner-only locks decrypt with the empty user password.
-        return Ok(doc.decrypt("").is_err());
+        // lopdf parses attacker-controlled dictionaries and can panic on
+        // malformed input; contain that as a `Document` error rather than
+        // letting it abort the caller.
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let doc = lopdf::Document::load_mem(data)
+                .map_err(|e| BatdocError::Document(format!("PDF parse failed: {e}")))?;
+            if !doc.is_encrypted() {
+                return Ok(false);
+            }
+            // Owner-only locks authenticate with the empty user password.
+            // Probe authentication rather than full decryption: an
+            // undecryptable object must not make an empty password look
+            // wrong when the document itself accepts it.
+            Ok(doc.authenticate_password("").is_err())
+        }));
+        return match probed {
+            Ok(result) => result,
+            Err(_) => Err(BatdocError::Document("PDF parse panicked".into())),
+        };
     }
     Ok(office_crypto_bridge::is_encrypted(data))
 }

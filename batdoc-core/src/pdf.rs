@@ -1224,6 +1224,26 @@ startxref\n\
         assert!(md.contains("SecretText"), "got {md:?}");
     }
 
+    /// Spec §10.2 #1: an owner-only lock (empty user password) opens with no
+    /// password supplied, on both the plain and markdown paths, and
+    /// `needs_password` reports it as password-free — unlike a user-password
+    /// PDF, which does need one. This is the guarantee the change must not
+    /// regress.
+    #[test]
+    fn owner_only_pdf_opens_without_password() {
+        let data = encrypt_text_pdf(&["SecretText"], "", "owner");
+
+        let text = extract_plain(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(text.contains("SecretText"), "got {text:?}");
+
+        let md = extract_markdown(&data, crate::ExtractOptions::default()).unwrap();
+        assert!(md.contains("SecretText"), "got {md:?}");
+
+        assert!(!crate::needs_password(&data).unwrap());
+        let user_locked = encrypt_text_pdf(&["SecretText"], "user", "owner");
+        assert!(crate::needs_password(&user_locked).unwrap());
+    }
+
     /// Regression: with a password supplied the encryption probe runs, and a
     /// document it cannot parse must still surface as a `Document` error (the
     /// probe sits inside the panic guard, so a malformed document can never
