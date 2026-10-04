@@ -360,6 +360,19 @@ pub(crate) fn ocr_image_bytes(_data: &[u8]) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// If `data` is an encrypted Office package, decrypt it. `None` when it is
+/// not encrypted Office (the caller uses `data` as-is).
+fn decrypt_office(data: &[u8], opts: &ExtractOptions) -> Result<Option<Vec<u8>>> {
+    if !office_crypto_bridge::is_encrypted_office(data) {
+        return Ok(None);
+    }
+    let password = opts
+        .password
+        .as_deref()
+        .ok_or(BatdocError::PasswordRequired)?;
+    Ok(Some(office_crypto_bridge::decrypt(data, password)?))
+}
+
 /// Extract plain text from a document.
 ///
 /// # Errors
@@ -378,11 +391,20 @@ pub fn extract_plain(data: &[u8], format: Format) -> Result<String> {
 /// `Format::Image` input is always OCR'd regardless of options and returns
 /// plain OCR text.
 ///
+/// An encrypted Office package is decrypted first when `opts.password` is
+/// set, so `format` may describe the decrypted package even though `data` is
+/// still the ciphertext.
+///
 /// # Errors
 ///
 /// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
-/// document is malformed, encrypted, or cannot be parsed.
+/// document is malformed, encrypted, or cannot be parsed; for encrypted
+/// Office input, [`BatdocError::PasswordRequired`] /
+/// [`BatdocError::IncorrectPassword`] / [`BatdocError::UnsupportedEncryption`].
 pub fn extract_plain_with(data: &[u8], format: Format, opts: ExtractOptions) -> Result<String> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_plain_with(&plain, detect_format(&plain)?, opts);
+    }
     match format {
         Format::Doc => doc::extract_plain(data),
         Format::Xls => xls::extract_plain(data),
@@ -424,11 +446,20 @@ pub fn extract_markdown(data: &[u8], format: Format, images: bool) -> Result<Str
 /// enabled (the default). `Format::Image` input is always OCR'd regardless
 /// of options and returns plain OCR text (no markdown).
 ///
+/// An encrypted Office package is decrypted first when `opts.password` is
+/// set, so `format` may describe the decrypted package even though `data` is
+/// still the ciphertext.
+///
 /// # Errors
 ///
 /// Returns [`BatdocError::Io`] or [`BatdocError::Document`] if the
-/// document is malformed, encrypted, or cannot be parsed.
+/// document is malformed, encrypted, or cannot be parsed; for encrypted
+/// Office input, [`BatdocError::PasswordRequired`] /
+/// [`BatdocError::IncorrectPassword`] / [`BatdocError::UnsupportedEncryption`].
 pub fn extract_markdown_with(data: &[u8], format: Format, opts: ExtractOptions) -> Result<String> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_markdown_with(&plain, detect_format(&plain)?, opts);
+    }
     match format {
         Format::Doc => doc::extract_markdown(data),
         Format::Xls => xls::extract_markdown(data),
@@ -455,6 +486,9 @@ pub fn extract_plain_to(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_plain_to(&plain, detect_format(&plain)?, opts, sink);
+    }
     match opts.max_output_bytes {
         Some(max) => {
             let mut limited = BudgetSink::new(sink, max);
@@ -499,6 +533,9 @@ pub fn extract_markdown_to(
     opts: ExtractOptions,
     sink: &mut impl ExtractSink,
 ) -> Result<()> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_markdown_to(&plain, detect_format(&plain)?, opts, sink);
+    }
     match opts.max_output_bytes {
         Some(max) => {
             let mut limited = BudgetSink::new(sink, max);
@@ -537,6 +574,19 @@ pub fn to_plain(data: &[u8]) -> Result<String> {
     extract_plain(data, format)
 }
 
+/// Convenience: detect (decrypting encrypted Office) and extract plain text.
+///
+/// # Errors
+///
+/// See [`extract_plain_with`]; adds [`BatdocError::PasswordRequired`] /
+/// [`BatdocError::IncorrectPassword`] / [`BatdocError::UnsupportedEncryption`].
+pub fn to_plain_with(data: &[u8], opts: ExtractOptions) -> Result<String> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_plain_with(&plain, detect_format(&plain)?, opts);
+    }
+    extract_plain_with(data, detect_format(data)?, opts)
+}
+
 /// Convenience: detect format and extract Markdown in one call.
 ///
 /// # Errors
@@ -545,6 +595,18 @@ pub fn to_plain(data: &[u8]) -> Result<String> {
 pub fn to_markdown(data: &[u8], images: bool) -> Result<String> {
     let format = detect_format(data)?;
     extract_markdown(data, format, images)
+}
+
+/// Convenience: detect (decrypting encrypted Office) and extract Markdown.
+///
+/// # Errors
+///
+/// See [`extract_markdown_with`]; adds the same encryption errors.
+pub fn to_markdown_with(data: &[u8], opts: ExtractOptions) -> Result<String> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_markdown_with(&plain, detect_format(&plain)?, opts);
+    }
+    extract_markdown_with(data, detect_format(data)?, opts)
 }
 
 /// Extract all sheets into a `Vec<Sheet>` (collecting — O(cells) memory).
@@ -593,6 +655,9 @@ pub fn extract_sheets_to(
     opts: ExtractOptions,
     sink: &mut impl SheetSink,
 ) -> Result<()> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_sheets_to(&plain, detect_format(&plain)?, opts, sink);
+    }
     match opts.max_output_bytes {
         Some(max) => {
             let mut limited = BudgetSheetSink::new(sink, max);
@@ -620,6 +685,18 @@ fn write_sheets(data: &[u8], format: Format, sink: &mut impl SheetSink) -> Resul
 pub fn to_sheets(data: &[u8]) -> Result<Vec<Sheet>> {
     let format = detect_format(data)?;
     extract_sheets(data, format)
+}
+
+/// Convenience: detect (decrypting encrypted Office) and extract sheets.
+///
+/// # Errors
+///
+/// See [`extract_sheets_with`]; adds the same encryption errors.
+pub fn to_sheets_with(data: &[u8], opts: ExtractOptions) -> Result<Vec<Sheet>> {
+    if let Some(plain) = decrypt_office(data, &opts)? {
+        return extract_sheets_with(&plain, detect_format(&plain)?, opts);
+    }
+    extract_sheets_with(data, detect_format(data)?, opts)
 }
 
 #[cfg(test)]
@@ -872,5 +949,58 @@ mod tests {
     fn needs_password_errors_on_unparseable_pdf() {
         let err = needs_password(b"%PDF-1.4\n%%EOF\n").unwrap_err();
         assert!(matches!(err, BatdocError::Document(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn encrypted_docx_extracts_with_password() {
+        let docx = {
+            use std::io::Write;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut z = zip::ZipWriter::new(&mut buf);
+            z.start_file(
+                "word/document.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            z.write_all(b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>SecretOfficeText</w:t></w:r></w:p></w:body></w:document>")
+                .unwrap();
+            z.finish().unwrap();
+            buf.into_inner()
+        };
+        let enc = msoffice_crypto::encrypt_ooxml(&docx, "pw").unwrap();
+
+        let err = to_plain(&enc).unwrap_err();
+        assert!(matches!(err, BatdocError::PasswordRequired), "got {err:?}");
+
+        let opts = ExtractOptions {
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        let text = to_plain_with(&enc, opts).unwrap();
+        assert!(text.contains("SecretOfficeText"), "got {text:?}");
+    }
+
+    #[test]
+    fn encrypted_docx_wrong_password_is_incorrect() {
+        let enc = msoffice_crypto::encrypt_ooxml(&plain_docx(), "pw").unwrap();
+        let opts = ExtractOptions {
+            password: Some("nope".into()),
+            ..Default::default()
+        };
+        let err = to_plain_with(&enc, opts).unwrap_err();
+        assert!(matches!(err, BatdocError::IncorrectPassword), "got {err:?}");
+    }
+
+    #[test]
+    fn explicit_format_entry_decrypts_encrypted_office() {
+        let enc = msoffice_crypto::encrypt_ooxml(&plain_docx(), "pw").unwrap();
+        // A caller who pre-detected with the password can still pass the
+        // original encrypted bytes to the explicit entry point.
+        let format = detect_format_with(&enc, Some("pw")).unwrap();
+        let opts = ExtractOptions {
+            password: Some("pw".into()),
+            ..Default::default()
+        };
+        assert!(extract_plain_with(&enc, format, opts).is_ok());
     }
 }
