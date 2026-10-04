@@ -28,7 +28,10 @@ Options:
       --ocr         OCR embedded images (docx/pptx); textless PDFs already auto-OCR
       --password SECRET
                     Password for encrypted PDF/Office documents. If omitted
-                    and stdin is a terminal, you are prompted.
+                    and stdin is a terminal, you are prompted without echo.
+                    A password on the command line may be visible to other
+                    users via ps(1). Encrypted legacy .doc/.xls files are
+                    reported as unsupported; no password is requested.
       --strip-text STR
                     Remove rotated PDF text containing STR from markdown
                     output (repeatable, case- and whitespace-insensitive).

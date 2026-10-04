@@ -34,7 +34,7 @@ reading dependency READMEs.
    `ocr` (default-on) and dropped by `--no-default-features`.
 2. **Done — `getrandom` wasm backend configured.** `.cargo/config.toml` sets
    `getrandom_backend="wasm_js"` for `wasm32-unknown-unknown`, and the
-   `batdoc-core` manifest enables `getrandom/0.3`'s `wasm_js` feature on the
+   `batdoc-core` manifest enables `getrandom/0.4`'s `wasm_js` feature on the
    wasm target only. `getrandom 0.2` disappears with `ring` (state 1).
 3. **Done — wasm-facing entry points + browser demo.** `batdoc-core` is now a
    `rlib`+`cdylib`; `src/wasm.rs` (compiled only on `wasm32` with the
@@ -64,7 +64,7 @@ reading dependency READMEs.
 
 2. **`getrandom` (two versions) needs the wasm backend config — RESOLVED.**
    - `getrandom 0.2` — pulled via `ring → rustls → ureq` (gone with `net` off).
-   - `getrandom 0.3` — pulled via `rand → lopdf`.
+   - `getrandom 0.4` — pulled via `rand → lopdf`.
    Both reject wasm unless you pass a config flag *and* enable a feature:
 
    ```toml
@@ -115,9 +115,9 @@ Ordered so each step is independently shippable and keeps the native CLI intact.
      (`ocrs`/`rten`) remain wasm-safe.
 
 2. **Fix `getrandom` for wasm — DONE.** Added `.cargo/config.toml` with the
-   `getrandom_backend="wasm_js"` rustflag and enabled `getrandom/0.3`'s
+   `getrandom_backend="wasm_js"` rustflag and enabled `getrandom/0.4`'s
    `wasm_js` feature on the wasm target only. The 0.2 instance disappeared with
-   `ring`; only the 0.3 one (via `lopdf`) remains.
+   `ring`; only the 0.4 one (via `lopdf`) remains.
 
 3. **Expose a library entry point — DONE.** `batdoc-core` is now
    `crate-type = ["rlib", "cdylib"]`, and `src/wasm.rs` (compiled only on

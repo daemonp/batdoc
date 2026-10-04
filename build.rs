@@ -49,7 +49,8 @@ fn main() {
                     "Password for an encrypted PDF or Office document. If omitted \
                      and standard input is a terminal, batdoc prompts without echo. \
                      A password on the command line may be visible to other users \
-                     via ps(1).",
+                     via ps(1). Encrypted legacy .doc/.xls files are reported as \
+                     unsupported; no password is requested.",
                 ),
         )
         .flag(

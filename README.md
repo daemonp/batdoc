@@ -146,8 +146,8 @@ deferred follow-up.
 
 ### Password-protected documents
 
-Encrypted PDFs and Office documents (`.docx`/`.xlsx`/`.pptx`, and legacy
-`.doc`/`.xls`) are opened with a password:
+Encrypted PDFs and Office documents (`.docx`/`.xlsx`/`.pptx`) are opened with
+a password:
 
     batdoc --password secret locked.pdf
     batdoc locked.docx          # prompts when stdin is a terminal
@@ -158,7 +158,7 @@ Passwords are never written to output or logs. Note that a password passed on
 the command line may be visible to other users via `ps(1)`.
 
 Encrypted legacy `.doc`/`.xls` files are detected and reported as unsupported
-rather than decrypted.
+rather than decrypted, and no password is requested.
 
 ## Options
 
@@ -263,9 +263,10 @@ The CLI binary depends on `batdoc-core` (document extraction library),
 
 The `batdoc-core` library depends on `cfb`, `encoding_rs`, `quick-xml`,
 `zip`, `pdf-extract`, `lopdf`, `base64`, and `thiserror`, plus `ocrs`,
-`image`, and `ureq` for OCR and `rten` for model inference. No C, no
-system libs. `ocrs`, `rten`, `image`, and `ureq` are behind the default-on
-`ocr`/`net` features; `default-features = false` removes both.
+`image`, and `ureq` for OCR and `rten` for model inference. `msoffice-crypto`
+(encrypted Office documents) is a native-only dependency, absent from wasm
+builds. No C, no system libs. `ocrs`, `rten`, `image`, and `ureq` are behind
+the default-on `ocr`/`net` features; `default-features = false` removes both.
 
 ## Library
 
