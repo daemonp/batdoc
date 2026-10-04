@@ -26,6 +26,9 @@ Options:
   -m, --markdown    Output as markdown (default when terminal detected)
   -i, --images      Embed images as inline base64 data URIs in markdown
       --ocr         OCR embedded images (docx/pptx); textless PDFs already auto-OCR
+      --password SECRET
+                    Password for encrypted PDF/Office documents. If omitted
+                    and stdin is a terminal, you are prompted.
       --strip-text STR
                     Remove rotated PDF text containing STR from markdown
                     output (repeatable, case- and whitespace-insensitive).
@@ -86,6 +89,17 @@ enum Mode {
     Markdown,
 }
 
+/// Consume the value that follows a `--flag` argument. Exits with `code`
+/// (usage error) when the flag was given without one.
+fn flag_value(args: &[String], i: &mut usize, flag: &str, code: i32) -> String {
+    *i += 1;
+    args.get(*i).cloned().unwrap_or_else(|| {
+        eprintln!("batdoc: {flag} requires a value");
+        eprintln!("{USAGE}");
+        process::exit(code);
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut mode = Mode::Auto;
@@ -93,6 +107,7 @@ fn main() {
     let mut ocr = false;
     let mut strip_text: Vec<String> = Vec::new();
     let mut strip_watermarks = false;
+    let mut password: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -108,6 +123,10 @@ fn main() {
             "-i" | "--images" => images = true,
             "--ocr" => ocr = true,
             "--strip-watermarks" => strip_watermarks = true,
+            "--password" => password = Some(flag_value(&args, &mut i, "--password", 2)),
+            s if s.starts_with("--password=") => {
+                password = Some(s["--password=".len()..].to_string());
+            }
             "--strip-text" => {
                 i += 1;
                 if let Some(value) = args.get(i) {
@@ -135,6 +154,10 @@ fn main() {
     if files.is_empty() {
         files.push("-".to_string());
     }
+
+    // Only prompt when the user did not supply --password and stdin is a
+    // terminal; with a supplied password a failure is reported immediately.
+    let allow_prompt = password.is_none() && io::stdin().is_terminal();
 
     let mut exit_code = 0;
     for (i, path) in files.iter().enumerate() {
@@ -168,8 +191,6 @@ fn main() {
             continue;
         }
 
-        let multiple = files.len() > 1;
-
         if let Err(e) = run(
             &buf,
             &filename,
@@ -178,7 +199,9 @@ fn main() {
             ocr,
             &strip_text,
             strip_watermarks,
-            multiple && i > 0,
+            files.len() > 1 && i > 0,
+            password.clone(),
+            allow_prompt,
         ) {
             eprintln!("batdoc: {filename}: {e}");
             exit_code = 1;
@@ -200,10 +223,51 @@ fn run(
     strip_text: &[String],
     strip_watermarks: bool,
     needs_separator: bool,
+    password: Option<String>,
+    allow_prompt: bool,
 ) -> batdoc_core::Result<()> {
     use batdoc_core::ExtractOptions;
 
-    let format = batdoc_core::detect_format(data)?;
+    let mut opts = ExtractOptions {
+        images,
+        ocr,
+        strip_text: strip_text.to_vec(),
+        strip_watermarks,
+        password,
+        ..Default::default()
+    };
+
+    // An encrypted document rejects the first attempt with a typed error.
+    // Prompt and retry — twice, so a typo is recoverable — but only when
+    // interactive; a supplied `--password` that fails is reported as-is.
+    let mut prompts = 0u32;
+    loop {
+        match run_once(data, filename, mode, &opts, needs_separator) {
+            Err(BatdocError::PasswordRequired | BatdocError::IncorrectPassword)
+                if allow_prompt && prompts < 2 =>
+            {
+                prompts += 1;
+                opts.password = Some(prompt_password()?);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Prompt for a password without echo. Returns [`BatdocError::Io`] if the
+/// terminal cannot be read.
+fn prompt_password() -> batdoc_core::Result<String> {
+    rpassword::prompt_password("Password: ").map_err(BatdocError::Io)
+}
+
+fn run_once(
+    data: &[u8],
+    filename: &str,
+    mode: Mode,
+    opts: &batdoc_core::ExtractOptions,
+    needs_separator: bool,
+) -> batdoc_core::Result<()> {
+    let format = batdoc_core::detect_format_with(data, opts.password.as_deref())?;
     let is_tty = io::stdout().is_terminal();
 
     // The strip flags act on the positioned (glyph) pipeline, which only the
@@ -214,7 +278,10 @@ fn run(
         Mode::Markdown => false,
         Mode::Auto => !is_tty,
     };
-    if format == Format::Pdf && plain_output && (!strip_text.is_empty() || strip_watermarks) {
+    if format == Format::Pdf
+        && plain_output
+        && (!opts.strip_text.is_empty() || opts.strip_watermarks)
+    {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| {
             eprintln!(
@@ -228,17 +295,9 @@ fn run(
         io::stdout().write_all(b"\n")?;
     }
 
-    let opts = ExtractOptions {
-        images,
-        ocr,
-        strip_text: strip_text.to_vec(),
-        strip_watermarks,
-        ..Default::default()
-    };
-
     // OCR input (flagged, or image input which is always OCR'd) downloads
     // models on first use; say so once per process, before it happens.
-    if (ocr || format == Format::Image) && !batdoc_core::models_present() {
+    if (opts.ocr || format == Format::Image) && !batdoc_core::models_present() {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| {
             eprintln!(
@@ -251,24 +310,24 @@ fn run(
     match mode {
         Mode::Plain => {
             let mut sink = batdoc_core::IoSink(io::stdout());
-            batdoc_core::extract_plain_to(data, format, opts, &mut sink)?;
+            batdoc_core::extract_plain_to(data, format, opts.clone(), &mut sink)?;
         }
         Mode::Markdown => {
             if is_tty && format != Format::Image {
-                let md = batdoc_core::extract_markdown_with(data, format, opts)?;
+                let md = batdoc_core::extract_markdown_with(data, format, opts.clone())?;
                 pretty_print(&md, filename)?;
             } else {
                 let mut sink = batdoc_core::IoSink(io::stdout());
-                batdoc_core::extract_markdown_to(data, format, opts, &mut sink)?;
+                batdoc_core::extract_markdown_to(data, format, opts.clone(), &mut sink)?;
             }
         }
         Mode::Auto => {
             if is_tty && format != Format::Image {
-                let md = batdoc_core::extract_markdown_with(data, format, opts)?;
+                let md = batdoc_core::extract_markdown_with(data, format, opts.clone())?;
                 pretty_print(&md, filename)?;
             } else {
                 let mut sink = batdoc_core::IoSink(io::stdout());
-                batdoc_core::extract_plain_to(data, format, opts, &mut sink)?;
+                batdoc_core::extract_plain_to(data, format, opts.clone(), &mut sink)?;
             }
         }
     }

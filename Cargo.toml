@@ -27,6 +27,10 @@ path = "src/main.rs"
 batdoc-core = { path = "batdoc-core" }
 bat = { version = "0.26.1", default-features = false, features = ["regex-fancy", "paging"] }
 is-terminal = "0.4"
+rpassword = "7"
+
+[dev-dependencies]
+lopdf = { version = "0.42", default-features = false }
 
 [build-dependencies]
 man = "0.3"
