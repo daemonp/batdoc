@@ -295,7 +295,9 @@ fn parse_globals(
 
         match rec.rec_type {
             REC_FILEPASS => {
-                return Err(BatdocError::Document("document is encrypted".into()));
+                return Err(BatdocError::UnsupportedEncryption(
+                    "encrypted legacy .xls is not supported".into(),
+                ));
             }
             REC_CODEPAGE
                 if rec.data.len() >= 2 => {
@@ -1604,6 +1606,23 @@ mod tests {
         assert_eq!(
             sheets[0].rows,
             vec![vec!["First".into(), String::new(), "Third".into()]]
+        );
+    }
+
+    // ── encryption ───────────────────────────────────────────────
+
+    #[test]
+    fn filepass_record_reports_unsupported_encryption() {
+        // A single BIFF8 FILEPASS record (type 0x002F, length 0).
+        let records = parse_records(&[0x2F, 0x00, 0x00, 0x00]);
+        // Not `unwrap_err`: the Ok tuple contains a `StringArena`, which is
+        // deliberately not `Debug`.
+        let Err(err) = parse_globals(&records) else {
+            panic!("FILEPASS record must be rejected");
+        };
+        assert!(
+            matches!(err, BatdocError::UnsupportedEncryption(_)),
+            "got {err:?}"
         );
     }
 }

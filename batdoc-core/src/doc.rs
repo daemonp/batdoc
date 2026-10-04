@@ -71,7 +71,9 @@ pub(crate) fn extract_plain_to(
     let flags = u16::from_le_bytes([buf[10], buf[11]]);
 
     if flags & F_ENCRYPTED != 0 {
-        return Err(BatdocError::Document("document is encrypted".into()));
+        return Err(BatdocError::UnsupportedEncryption(
+            "encrypted legacy .doc is not supported".into(),
+        ));
     }
 
     // FIB `lid` (install language) at offset 6-7, used to infer codepage
@@ -752,5 +754,30 @@ mod tests {
         let mut out = String::new();
         extract_plain_to(&data, &mut out).unwrap();
         assert_eq!(out, expected);
+    }
+
+    // ── encryption ───────────────────────────────────────────────
+
+    #[test]
+    fn encrypted_doc_reports_unsupported_encryption() {
+        use std::io::Write;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut cf = cfb::CompoundFile::create(cursor).unwrap();
+        {
+            let mut stream = cf.create_stream("/WordDocument").unwrap();
+            let mut fib = vec![0u8; 32];
+            // FIB flags live at offset 10 (LE u16); F_ENCRYPTED = 0x0100.
+            fib[10] = 0x00;
+            fib[11] = 0x01;
+            stream.write_all(&fib).unwrap();
+        }
+        cf.flush().unwrap();
+        let data = cf.into_inner().into_inner();
+
+        let err = extract_plain(&data).unwrap_err();
+        assert!(
+            matches!(err, BatdocError::UnsupportedEncryption(_)),
+            "got {err:?}"
+        );
     }
 }
