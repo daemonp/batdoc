@@ -228,17 +228,78 @@ cd web && python3 -m http.server 8000    # then open http://localhost:8000/
 Notes:
 
 - `web/pkg/` and `web/samples/` are generated and git-ignored.
-- The exported functions are `detect(data)`, `to_plain(data)`,
-  `to_markdown(data, images, ocr)`, `to_sheets(data, max_output_bytes)`, and
-  `to_sheets_stream(data, max_output_bytes, on_begin_sheet, on_row,
-  on_end_sheet)` — `data` is a `Uint8Array`; errors throw a JS `Error` with
-  the `BatdocError` message.
+- The exported functions are `detect(data)`, `to_plain(data, password)`,
+  `to_markdown(data, images, ocr, password)`,
+  `to_sheets(data, max_output_bytes, password)`, and
+  `to_sheets_stream(data, max_output_bytes, password, on_begin_sheet, on_row,
+  on_end_sheet)` — `data` is a `Uint8Array`. Errors are thrown as a plain JS
+  **string** (the `BatdocError` text), not an `Error` object: `catch (e)`
+  receives the message itself, so use `String(e)`, not `e.message`. Encryption
+  errors are prefixed (see [Passwords](#passwords)).
 - `to_sheets_stream` invokes its callbacks synchronously — Promises returned
   by the callbacks are not awaited.
 - This build disables `net` and `ocr`, so no OCR is available in the browser
   demo (image files and textless PDFs are not OCR'd). The document/text
   pipeline (DOCX/XLSX/PPTX/DOC/XLS/PDF-text) needs no models and works out of
   the box.
+
+## Passwords
+
+`to_plain`, `to_markdown`, `to_sheets` and `to_sheets_stream` take an optional
+`password` argument. In JS it is the last argument on the first three, and
+comes directly after `max_output_bytes` (before the callbacks) on
+`to_sheets_stream`. Omit it or pass `undefined`/`null` for no password —
+existing calls that never passed it keep working (`Option<String>` maps both
+`undefined` and `null` to `None`).
+
+```js
+const bytes = new Uint8Array(await file.arrayBuffer());
+try {
+  const text = to_plain(bytes, prompt('Password?') ?? undefined);
+} catch (e) {
+  if (String(e).startsWith('password-required:')) { /* ask the user */ }
+}
+```
+
+On `to_sheets_stream` the argument sits between `max_output_bytes` and the
+callbacks, so a call written for the older signature
+(`to_sheets_stream(data, max, onBegin, onRow, onEnd)`) must be updated — the
+third argument is now the password.
+
+Encryption errors carry a stable prefix so JS can branch without parsing Rust
+`Display` text. The rest of the message is the core error text.
+
+| prefix | when |
+| --- | --- |
+| `password-required: document is password-protected` | encrypted document, no password supplied |
+| `incorrect-password: incorrect password` | password supplied but rejected |
+| `unsupported-encryption: {detail}` | encryption this build cannot handle |
+
+**Limitation — wasm supports encrypted PDFs only.** `msoffice-crypto` does not
+compile for `wasm32-unknown-unknown`, so the wasm build links stubs:
+`is_encrypted_office` and `is_encrypted` always return `false`, and `decrypt`
+returns `UnsupportedEncryption`. Consequences in the browser build:
+
+- `password` decrypts an encrypted **PDF** (via `lopdf`) in `to_plain` and
+  `to_markdown`, including the owner-only-lock case where no user password is
+  needed. A password supplied for an unencrypted PDF is ignored, as on native.
+- `password` on `to_sheets` / `to_sheets_stream` is accepted for interface
+  parity with the native API but has **no effect** in this build: tabular
+  extraction only accepts XLS/XLSX, and an encrypted XLS/XLSX is an Office
+  package that cannot be recognised here — it fails as
+  `tabular extraction is only supported for XLS and XLSX` (or an
+  unreadable-container error from `detect_format_with`).
+- An encrypted **Office** package (`.docx`/`.xlsx`/`.pptx`, or legacy
+  `.doc`/`.xls`) is **not** detected as encrypted and cannot be opened: it
+  falls through to the unrecognised-container error (`OLE2 file is not a .doc
+  or .xls document` / `ZIP archive is not a .docx, .xlsx, or .pptx file`). No
+  `password-required:` is reported for it, because nothing there can tell it is
+  encrypted.
+- `detect(data)` therefore never returns `password-required:` on wasm, while
+  the native CLI/library does for an encrypted Office package. Native builds
+  (and the `msoffice-crypto` path generally) are unaffected.
+
+Passwords are never echoed in errors, `Debug` output, or logs.
 
 ## Related
 

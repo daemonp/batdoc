@@ -6,75 +6,118 @@
 //! image OCR or textless-PDF fallback is available in the browser build. The
 //! `ocr` parameter of `to_markdown` is accepted but is a no-op here.
 //!
+//! Password support here covers encrypted **PDFs** (`to_plain` /
+//! `to_markdown`): `msoffice-crypto` does not compile for wasm, so an
+//! encrypted Office package is neither detected nor opened in this build, and
+//! the sheets exports take `password` only for interface parity (see
+//! `WASM.md`).
+//!
 //! This module is only compiled for `wasm32` targets with the `wasm-bindgen`
 //! cargo feature enabled; native builds never pull in `wasm-bindgen`.
 
 #![cfg(target_arch = "wasm32")]
 
 use crate::{
-    detect_format, extract_markdown_with, extract_plain_with, extract_sheets_to, ExtractOptions,
-    Sheet, SheetSink,
+    detect_format, detect_format_with, extract_sheets_to, to_markdown_with, to_plain_with,
+    to_sheets_with, BatdocError, ExtractOptions, Sheet, SheetSink,
 };
 use js_sys::{Array, Function, Object, Reflect};
 use wasm_bindgen::prelude::*;
 
+/// Map a core error to the stable string the WASM contract exposes.
+///
+/// The prefixes `password-required:`, `incorrect-password:` and
+/// `unsupported-encryption:` are part of the JS API so callers can branch
+/// without parsing Rust `Display` text.
+fn wasm_error(e: BatdocError) -> String {
+    use BatdocError as E;
+    match e {
+        E::PasswordRequired => "password-required: document is password-protected".into(),
+        E::IncorrectPassword => "incorrect-password: incorrect password".into(),
+        E::UnsupportedEncryption(m) => format!("unsupported-encryption: {m}"),
+        other => other.to_string(),
+    }
+}
+
 /// Detect the document format from magic bytes and return its name
 /// (`DOC`, `XLS`, `DOCX`, `XLSX`, `PPTX`, `PDF`, `IMAGE`) or an error string.
+///
+/// An encrypted Office package has no nameable format, so this returns the
+/// `password-required:` message instead. On wasm that cannot happen: the
+/// crypto dependency is absent, so an encrypted package is not recognised as
+/// encrypted (it fails as an unreadable container instead).
 #[wasm_bindgen]
 pub fn detect(data: &[u8]) -> String {
-    detect_format(data)
-        .map(|f| f.to_string())
-        .unwrap_or_else(|e| e.to_string())
+    detect_format(data).map_or_else(wasm_error, |f| f.to_string())
 }
 
 /// Detect + extract plain text. `data` is the raw file bytes (a `Uint8Array`
-/// from JS). Returns the extracted text, or throws with a descriptive message.
+/// from JS). `password` opens an encrypted PDF; pass `undefined` (or omit it)
+/// when there is none. Returns the extracted text, or throws with a
+/// descriptive message.
 #[wasm_bindgen]
-pub fn to_plain(data: &[u8]) -> Result<String, String> {
-    let format = detect_format(data).map_err(|e| e.to_string())?;
-    extract_plain_with(data, format, ExtractOptions::default()).map_err(|e| e.to_string())
+pub fn to_plain(data: &[u8], password: Option<String>) -> Result<String, String> {
+    to_plain_with(
+        data,
+        ExtractOptions {
+            password,
+            ..Default::default()
+        },
+    )
+    .map_err(wasm_error)
 }
 
 /// Detect + extract Markdown. `images` embeds DOCX/XLSX/PPTX images as
 /// base64 data URIs; `ocr` is accepted for API compatibility but is a no-op
-/// in this build (the `ocr` feature is off). Returns the Markdown, or
-/// throws with a descriptive message.
+/// in this build (the `ocr` feature is off); `password` opens an encrypted
+/// PDF (omit it when there is none). Returns the Markdown, or throws with a
+/// descriptive message.
 #[wasm_bindgen]
-pub fn to_markdown(data: &[u8], images: bool, ocr: bool) -> Result<String, String> {
-    let format = detect_format(data).map_err(|e| e.to_string())?;
-    extract_markdown_with(
+pub fn to_markdown(
+    data: &[u8],
+    images: bool,
+    ocr: bool,
+    password: Option<String>,
+) -> Result<String, String> {
+    to_markdown_with(
         data,
-        format,
         ExtractOptions {
             images,
             ocr,
+            password,
             ..Default::default()
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(wasm_error)
 }
 
 /// Detect + extract tabular data (XLS / XLSX) as an array of sheet objects,
 /// each `{ name, rows: [[cell, …], …] }`. `max_output_bytes` bounds the
 /// payload estimate (sheet name bytes + per-cell `len+1`); pass `null` from
-/// JS for unlimited.
+/// JS for unlimited. `password` is accepted for interface parity with the
+/// native API and has no effect in this build — tabular extraction takes only
+/// XLS/XLSX, and an encrypted Office package cannot be recognised as
+/// encrypted here (see the module docs).
 ///
 /// This collecting path is O(total cells) in both the Rust and JS heaps and
 /// is intended for small files only — prefer [`to_sheets_stream`] (or the
 /// Rust rlib [`crate::SheetSink`] in a Worker) for large workbooks. Returns
 /// the sheet array, or throws with a descriptive message.
 #[wasm_bindgen]
-pub fn to_sheets(data: &[u8], max_output_bytes: Option<u64>) -> Result<Array, String> {
-    let format = detect_format(data).map_err(|e| e.to_string())?;
-    let sheets = crate::extract_sheets_with(
+pub fn to_sheets(
+    data: &[u8],
+    max_output_bytes: Option<u64>,
+    password: Option<String>,
+) -> Result<Array, String> {
+    let sheets = to_sheets_with(
         data,
-        format,
         ExtractOptions {
             max_output_bytes,
+            password,
             ..Default::default()
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(wasm_error)?;
     Ok(sheets_to_js_array(&sheets))
 }
 
@@ -138,30 +181,29 @@ impl SheetSink for JsSheetSink<'_> {
 /// invoked synchronously on the CPU; Promises returned by the callbacks are
 /// NOT awaited. Prefer the Rust rlib [`crate::SheetSink`] in a Worker for
 /// large, long-running workbooks. `max_output_bytes` bounds the payload
-/// estimate (see [`to_sheets`]); pass `null` from JS for unlimited. Returns
-/// `undefined`, or throws with a descriptive message.
+/// estimate (see [`to_sheets`]); pass `null` from JS for unlimited.
+/// `password` is accepted for interface parity with the native API and has no
+/// effect in this build (see [`to_sheets`]). Returns `undefined`, or throws
+/// with a descriptive message.
 #[wasm_bindgen]
 pub fn to_sheets_stream(
     data: &[u8],
     max_output_bytes: Option<u64>,
+    password: Option<String>,
     on_begin_sheet: &Function,
     on_row: &Function,
     on_end_sheet: &Function,
 ) -> Result<(), String> {
-    let format = detect_format(data).map_err(|e| e.to_string())?;
+    let opts = ExtractOptions {
+        max_output_bytes,
+        password,
+        ..Default::default()
+    };
+    let format = detect_format_with(data, opts.password.as_deref()).map_err(wasm_error)?;
     let mut sink = JsSheetSink {
         on_begin: on_begin_sheet,
         on_row,
         on_end: on_end_sheet,
     };
-    extract_sheets_to(
-        data,
-        format,
-        ExtractOptions {
-            max_output_bytes,
-            ..Default::default()
-        },
-        &mut sink,
-    )
-    .map_err(|e| e.to_string())
+    extract_sheets_to(data, format, opts, &mut sink).map_err(wasm_error)
 }
