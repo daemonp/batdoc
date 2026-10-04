@@ -123,6 +123,11 @@ impl std::fmt::Display for Format {
 ///
 /// # Errors
 ///
+/// Returns [`BatdocError::PasswordRequired`] for an encrypted Office package:
+/// the plaintext is not reachable without a password, so no format can be
+/// named. Use [`detect_format_with`] to supply one, or [`needs_password`] to
+/// probe first.
+///
 /// Returns [`BatdocError::Document`] if the magic bytes don't match any
 /// supported format, or if the file matches a container format (OLE2/ZIP)
 /// but doesn't contain a recognised document type.
@@ -132,6 +137,9 @@ impl std::fmt::Display for Format {
 pub fn detect_format(data: &[u8]) -> Result<Format> {
     // OLE2 compound file: 0xD0CF11E0A1B11AE1
     if data.len() >= 8 && data[..8] == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+        if office_crypto_bridge::is_encrypted_office(data) {
+            return Err(BatdocError::PasswordRequired);
+        }
         let cursor = Cursor::new(data);
         let cfb = cfb::CompoundFile::open(cursor)?;
         if cfb.exists("/WordDocument") {
@@ -192,6 +200,49 @@ pub fn detect_format(data: &[u8]) -> Result<Format> {
     Err(BatdocError::Document(
         "not a supported document (unrecognized format)".into(),
     ))
+}
+
+/// Detect the format, decrypting an encrypted Office package when a password
+/// is supplied.
+///
+/// Without a password an encrypted Office package yields
+/// [`BatdocError::PasswordRequired`]. PDF and unencrypted formats behave
+/// exactly like [`detect_format`].
+///
+/// # Errors
+///
+/// See [`detect_format`], plus [`BatdocError::PasswordRequired`] /
+/// [`BatdocError::IncorrectPassword`] / [`BatdocError::UnsupportedEncryption`].
+pub fn detect_format_with(data: &[u8], password: Option<&str>) -> Result<Format> {
+    if office_crypto_bridge::is_encrypted_office(data) {
+        let password = password.ok_or(BatdocError::PasswordRequired)?;
+        let plain = office_crypto_bridge::decrypt(data, password)?;
+        return detect_format(&plain);
+    }
+    detect_format(data)
+}
+
+/// Whether `data` is encrypted and will need a password to open.
+///
+/// Never requires a password. Covers the PDF encryption dictionary, encrypted
+/// Office packages, and legacy `.doc`/`.xls`/`.ppt` encryption markers. This
+/// parses a PDF's encryption dictionary, so it is not free.
+///
+/// # Errors
+///
+/// [`BatdocError::Document`] if a PDF header is present but the document
+/// cannot be parsed.
+pub fn needs_password(data: &[u8]) -> Result<bool> {
+    if data.len() >= 5 && &data[..5] == b"%PDF-" {
+        let mut doc = lopdf::Document::load_mem(data)
+            .map_err(|e| BatdocError::Document(format!("PDF parse failed: {e}")))?;
+        if !doc.is_encrypted() {
+            return Ok(false);
+        }
+        // Owner-only locks decrypt with the empty user password.
+        return Ok(doc.decrypt("").is_err());
+    }
+    Ok(office_crypto_bridge::is_encrypted(data))
 }
 
 /// Extraction options.
@@ -749,5 +800,77 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "not a supported document (unrecognized format)");
+    }
+
+    /// A minimal docx ZIP carrying `word/document.xml`, for detection tests.
+    fn plain_docx() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut z = zip::ZipWriter::new(&mut buf);
+        z.start_file(
+            "word/document.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        z.write_all(b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body/></w:document>")
+            .unwrap();
+        z.finish().unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn encrypted_office_detect_requires_password() {
+        let enc = msoffice_crypto::encrypt_ooxml(&plain_docx(), "pw").unwrap();
+        let err = detect_format(&enc).unwrap_err();
+        assert!(matches!(err, BatdocError::PasswordRequired), "got {err:?}");
+    }
+
+    #[test]
+    fn detect_format_with_password_resolves_inner_format() {
+        let enc = msoffice_crypto::encrypt_ooxml(&plain_docx(), "pw").unwrap();
+        assert_eq!(detect_format_with(&enc, Some("pw")).unwrap(), Format::Docx);
+        let err = detect_format_with(&enc, None).unwrap_err();
+        assert!(matches!(err, BatdocError::PasswordRequired));
+    }
+
+    /// A minimal valid PDF (empty page tree), for `needs_password` tests.
+    ///
+    /// A header-only stub will not do: the probe parses the trailer, and lopdf
+    /// rejects a file with no cross-reference table.
+    fn plain_pdf() -> Vec<u8> {
+        use lopdf::dictionary;
+
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let catalog_id = doc.add_object(lopdf::dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Pages",
+                "Kids" => lopdf::Object::Array(Vec::new()),
+                "Count" => 0,
+            }),
+        );
+        doc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn needs_password_matrix() {
+        let enc = msoffice_crypto::encrypt_ooxml(&plain_docx(), "pw").unwrap();
+        assert!(needs_password(&enc).unwrap());
+        assert!(!needs_password(&plain_docx()).unwrap());
+        assert!(!needs_password(&plain_pdf()).unwrap());
+    }
+
+    #[test]
+    fn needs_password_errors_on_unparseable_pdf() {
+        let err = needs_password(b"%PDF-1.4\n%%EOF\n").unwrap_err();
+        assert!(matches!(err, BatdocError::Document(_)), "got {err:?}");
     }
 }
