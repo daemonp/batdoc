@@ -249,10 +249,7 @@ pub fn needs_password(data: &[u8]) -> Result<bool> {
             // wrong when the document itself accepts it.
             Ok(doc.authenticate_password("").is_err())
         }));
-        return match probed {
-            Ok(result) => result,
-            Err(_) => Err(BatdocError::Document("PDF parse panicked".into())),
-        };
+        return probed.unwrap_or_else(|_| Err(BatdocError::Document("PDF parse panicked".into())));
     }
     Ok(office_crypto_bridge::is_encrypted(data))
 }

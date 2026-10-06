@@ -278,12 +278,10 @@ fn rasterized_page_lines(
     if rasterizer.is_none() {
         *rasterizer = crate::pdf_raster::PageRasterizer::new(data);
     }
-    match rasterizer {
-        Some(raster) => {
-            crate::pdf_ocr::rasterized_ocr_lines(raster, page_index, page_pt_rect(page))
-        }
-        None => Ok(Vec::new()),
-    }
+    rasterizer.as_mut().map_or_else(
+        || Ok(Vec::new()),
+        |raster| crate::pdf_ocr::rasterized_ocr_lines(raster, page_index, page_pt_rect(page)),
+    )
 }
 
 fn no_text_error(ocr: bool) -> BatdocError {
