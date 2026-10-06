@@ -1,0 +1,164 @@
+msoffice-crypto
+Copyright (c) 2026 Slurp9187
+
+This product includes software derived from https://github.com/herumi/msoffice,
+which is licensed under the BSD 3-Clause License. As of 2026-09-05 the
+derivation covers, in src/:
+
+  agile.rs          the ECMA-376 agile key derivation -- the iterated spin hash,
+                    the block-key derivation and the three password-encryptor
+                    block-key constants -- and the verifier comparison
+  hash.rs           the per-segment and dataIntegrity IV derivation
+  integrity.rs      the two dataIntegrity block-key constants and the HMAC
+                    verification order
+  agile_encrypt.rs  the encrypt-side key schedule (encode.hpp's encode_in),
+                    with one deliberate departure recorded in that file's
+                    header: the session key is drawn at its full length rather
+                    than padded
+  standard_encrypt.rs
+                    the ECMA-376 standard (Office 2007) EncryptionHeader and
+                    EncryptionVerifier layout and the AES-128-ECB verifier
+                    construction, read from standard_encryption.hpp -- which
+                    is a decoder -- and inverted into a writer; the header
+                    constants themselves are [MS-OFFCRYPTO]'s
+
+src/dataspaces.rs and src/encryption_info.rs are NOT derivations. The
+\x06DataSpaces stream contents are generated from their [MS-OFFCRYPTO] field
+definitions and the EncryptionInfo document is written from the bytes real
+Office produces; both cite herumi for behaviour only and reproduce none of its
+expression. They are listed so that a reader does not infer a derivation from
+the citations.
+
+excelize (https://github.com/qax-os/excelize, BSD 3-Clause, the excelize
+contributors) was consulted for src/standard_encrypt.rs as a second reading of
+the standard EncryptionInfo layout -- its crypt.go was fetched read-only and
+cited for behaviour; no code is derived from it and nothing here reproduces
+its expression.
+
+The same upstream reaches this ecosystem a second way: msoffcrypto-tool (MIT)
+carries its own NOTICE.txt recording that its encryption support is a port of
+herumi/msoffice. Where this crate consults msoffcrypto-tool as a reference, the
+obligation below is the same one; msoffcrypto-tool's own notice follows further
+down.
+
+  Copyright (c) 2007-2015 Cybozu Labs, Inc.
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+  Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+  Neither the name of the Cybozu Labs, Inc. nor the names of its contributors may
+  be used to endorse or promote products derived from this software without
+  specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+  THE POSSIBILITY OF SUCH DAMAGE.
+
+---
+
+msoffcrypto-tool, https://github.com/nolze/msoffcrypto-tool, licensed under
+the MIT License, is this crate's differential oracle, and since 2026-09-05
+(plan slice S3) a source of ported behaviour as well. In src/:
+
+  excel97.rs         the Excel 97 walk: which records stay in the clear, the
+                     XOR array index per record, the FILEPASS record left in
+                     place with its type zeroed (format/xls97.py)
+  powerpoint97.rs    the PowerPoint 97 walk: the persist directory, the
+                     per-object block number, the UserEditAtom rewrite
+                     (format/ppt97.py), with one deliberate departure
+                     recorded in that file's header
+  xor_obfuscation.rs the XOR array known answers; the tables and procedures
+                     themselves are [MS-OFFCRYPTO] 2.3.7's own
+                     (method/xor_obfuscation.py)
+  rc4_cryptoapi.rs   the RC4 CryptoAPI header parse and key generation
+                     (method/rc4_cryptoapi.py, format/common.py)
+  word97.rs          the Word 97 walk (format/doc97.py)
+
+Besides that: the agile fixtures under tests/fixtures/ that are not
+Office-written were produced by running it (tools/gen_agile_fixtures.py), as
+was excel97_xor.xls (tools/gen_xor_fixture.py, over its DocumentXOR); the
+SHA-256 digests in tests/real_office_fixtures.rs and
+tests/legacy_binary_fixtures.rs are its output; and the known-answer values in
+the standard-encryption and legacy tests were computed with it. Program output
+carries no licence; a notice for the program that produced it costs nothing.
+
+  MIT License
+
+  Copyright (c) 2015 nolze
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+---
+
+office-crypto, https://github.com/Udbhav-Muthakana/office-crypto, licensed
+under the MIT License, is a dev-dependency used as a second differential
+oracle, and since 2026-09-05 (plan slice S3) the source of ported
+behaviour in src/:
+
+  rc4.rs            the per-block RC4 loop and the verifier check
+                    (src/method/rc4.rs)
+  rc4_cryptoapi.rs  the RC4 CryptoAPI key generation, including the 40-bit
+                    zero padding (src/method/rc4.rs, makekey_rc4_cryptoapi)
+  rc4_office97.rs   the Office 97/2000 MD5 key generation
+                    (src/method/rc4.rs, makekey_rc4)
+  word97.rs         the Word 97 walk: which streams, the FIB rewrite
+                    (src/format/doc97.rs -- its ole.rs is NOT ported; the
+                    container layer is the cfb crate, plan D2)
+
+  Copyright 2023 Udbhav Muthakana
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+---
+
+LibreOffice (MPL-2.0) is used as a behavioural reference only -- observed
+behaviour and cited file:line locations, never copied expression -- and
+therefore imposes no obligation recorded here. It is credited in README.md
+regardless. CoreOffice/CryptoOffice (Apache-2.0) has not been opened and
+nothing here derives from it.

@@ -264,8 +264,8 @@ The CLI binary depends on `batdoc-core` (document extraction library),
 The `batdoc-core` library depends on `cfb`, `encoding_rs`, `quick-xml`,
 `zip`, `pdf-extract`, `lopdf`, `base64`, and `thiserror`, plus `ocrs`,
 `image`, and `ureq` for OCR and `rten` for model inference. `msoffice-crypto`
-(encrypted Office documents) is a native-only dependency, absent from wasm
-builds. No C, no system libs. `ocrs`, `rten`, `image`, and `ureq` are behind
+(encrypted Office documents) is the vendored fork under `crates/msoffice-crypto`,
+so the same decrypt path links on wasm. No C, no system libs. `ocrs`, `rten`, `image`, and `ureq` are behind
 the default-on `ocr`/`net` features; `default-features = false` removes both.
 
 ## Library

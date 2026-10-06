@@ -106,3 +106,75 @@ fn password_without_value_is_usage_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+fn secret_docx() -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut z = zip::ZipWriter::new(&mut buf);
+    z.start_file(
+        "word/document.xml",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    z.write_all(b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>SecretOfficeCli</w:t></w:r></w:p></w:body></w:document>")
+        .unwrap();
+    z.finish().unwrap();
+    buf.into_inner()
+}
+
+fn office_fixture(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("batdoc-cli-{tag}-{}.docx", std::process::id()));
+    let enc = msoffice_crypto::encrypt_ooxml(&secret_docx(), "pw").unwrap();
+    std::fs::write(&path, enc).unwrap();
+    path
+}
+
+#[test]
+fn office_password_flag_extracts() {
+    let path = office_fixture("office-ok");
+    let out = Command::new(env!("CARGO_BIN_EXE_batdoc"))
+        .args(["--plain", "--password", "pw"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("SecretOfficeCli"));
+}
+
+#[test]
+fn office_missing_password_non_tty_fails() {
+    let path = office_fixture("office-nopw");
+    let out = Command::new(env!("CARGO_BIN_EXE_batdoc"))
+        .args(["--plain"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("password-protected"), "stderr: {stderr}");
+}
+
+#[test]
+fn office_wrong_password_exits_without_prompting() {
+    let path = office_fixture("office-bad");
+    let out = Command::new(env!("CARGO_BIN_EXE_batdoc"))
+        .args(["--plain", "--password", "nope"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("incorrect password"), "stderr: {stderr}");
+    assert!(!stderr.contains("Password:"), "stderr: {stderr}");
+    assert!(!stderr.contains("nope") && !stderr.contains("pw"));
+}

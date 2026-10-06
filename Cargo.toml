@@ -6,10 +6,13 @@ members = [".", "batdoc-core", "crates/pdf-extract"]
 # upstream pdf-extract 0.10 (a documented, safe degradation).
 [patch.crates-io]
 pdf-extract = { path = "crates/pdf-extract" }
+# Fork of 0.1.0-rc.5: `cfb` 0.14 timestamps take `web_time::SystemTime`, which is
+# a different type on wasm32-unknown-unknown. See crates/msoffice-crypto/BATDOC-FORK.md.
+msoffice-crypto = { path = "crates/msoffice-crypto" }
 
 [package]
 name = "batdoc"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "cat(1) for doc, docx, xls, xlsx, pptx, pdf, and image files (OCR) -- renders to markdown with bat"
 license = "MIT"
@@ -31,6 +34,8 @@ rpassword = "7"
 
 [dev-dependencies]
 lopdf = { version = "0.42", default-features = false }
+msoffice-crypto = { version = "=0.1.0-rc.5", default-features = false, features = ["crypto-ops"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 man = "0.3"

@@ -1,6 +1,6 @@
 [package]
 name = "batdoc-core"
-version = "1.7.0"
+version = "1.7.1"
 edition = "2021"
 description = "Document text extraction library — DOCX, XLSX, PPTX, DOC, XLS, PDF, and image OCR to plain text or Markdown"
 license = "MIT"
@@ -29,6 +29,12 @@ rten = { version = "0.24", default-features = false, optional = true }
 thiserror = "2"
 ureq = { version = "2", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Password-protected OOXML decryption (MS-OFFCRYPTO). `crypto-ops` is the
+# decrypt/encrypt half; `classify` (detection) is always present. Pinned to
+# the RC line: the API may change before 0.1.0. Resolved to the vendored fork
+# in the workspace (`crates/msoffice-crypto`) so the same code links on
+# wasm32-unknown-unknown. Not gated on `ocr` / `net`.
+msoffice-crypto = { version = "=0.1.0-rc.5", default-features = false, features = ["crypto-ops"] }
 
 [features]
 default = ["net", "ocr"]
@@ -41,16 +47,6 @@ ocr = ["dep:ocrs", "dep:rten", "dep:image", "dep:hayro"]
 # Browser JS glue + `src/wasm.rs` exports (`detect` / `to_plain` / `to_markdown` /
 # `to_sheets` / `to_sheets_stream`). Worker / rlib consumers leave this off.
 wasm-bindgen = ["dep:wasm-bindgen", "dep:js-sys"]
-
-# Password-protected OOXML decryption (MS-OFFCRYPTO). `crypto-ops` is the
-# decrypt/encrypt half; `classify` (detection) is always present. Pinned to
-# the RC line: the API may change before 0.1.0.
-#
-# Native only: the crate does not compile for wasm32-unknown-unknown (its
-# `cfb` 0.14 dependency hands `std::time::SystemTime` to a `web_time` API
-# there), so `office_crypto_bridge` carries wasm stubs instead.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-msoffice-crypto = { version = "=0.1.0-rc.5", default-features = false, features = ["crypto-ops"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # lopdf pulls getrandom 0.4 transitively (via rand); enable its wasm backend.

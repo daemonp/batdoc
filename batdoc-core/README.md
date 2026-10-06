@@ -112,9 +112,9 @@ Encrypted legacy `.doc`/`.xls` files are detected but not decrypted — they
 report `BatdocError::UnsupportedEncryption`. `BatdocError` is
 `#[non_exhaustive]`, so matches need a wildcard arm. Passwords never appear in
 error messages or `Debug` output (`ExtractOptions`'s `Debug` renders the
-password as `<redacted>`). On `wasm32`, Office decryption is unavailable (the
-crypto dependency does not build there) — only PDF passwords are supported;
-see [WASM.md](../WASM.md).
+password as `<redacted>`). The same Office path links on `wasm32`; this repo
+vendors `msoffice-crypto` for that (see `crates/msoffice-crypto/BATDOC-FORK.md`
+and [WASM.md](../WASM.md)).
 
 ## Supported formats
 

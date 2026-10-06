@@ -6,11 +6,10 @@
 //! image OCR or textless-PDF fallback is available in the browser build. The
 //! `ocr` parameter of `to_markdown` is accepted but is a no-op here.
 //!
-//! Password support here covers encrypted **PDFs** (`to_plain` /
-//! `to_markdown`): `msoffice-crypto` does not compile for wasm, so an
-//! encrypted Office package is neither detected nor opened in this build, and
-//! the sheets exports take `password` only for interface parity (see
-//! `WASM.md`).
+//! Password support covers encrypted PDFs and Office packages
+//! (`.docx` / `.xlsx` / `.pptx`). The workspace vendors `msoffice-crypto` so
+//! that path links here; see `crates/msoffice-crypto/BATDOC-FORK.md`. Encrypted
+//! legacy `.doc` / `.xls` are still reported as unsupported.
 //!
 //! This module is only compiled for `wasm32` targets with the `wasm-bindgen`
 //! cargo feature enabled; native builds never pull in `wasm-bindgen`.
@@ -43,17 +42,15 @@ fn wasm_error(e: BatdocError) -> String {
 /// (`DOC`, `XLS`, `DOCX`, `XLSX`, `PPTX`, `PDF`, `IMAGE`) or an error string.
 ///
 /// An encrypted Office package has no nameable format, so this returns the
-/// `password-required:` message instead. On wasm that cannot happen: the
-/// crypto dependency is absent, so an encrypted package is not recognised as
-/// encrypted (it fails as an unreadable container instead).
+/// `password-required:` message instead.
 #[wasm_bindgen]
 pub fn detect(data: &[u8]) -> String {
     detect_format(data).map_or_else(wasm_error, |f| f.to_string())
 }
 
 /// Detect + extract plain text. `data` is the raw file bytes (a `Uint8Array`
-/// from JS). `password` opens an encrypted PDF; pass `undefined` (or omit it)
-/// when there is none. Returns the extracted text, or throws with a
+/// from JS). `password` opens an encrypted PDF or Office document; pass
+/// `undefined` (or omit it) when there is none. Returns the extracted text, or throws with a
 /// descriptive message.
 #[wasm_bindgen]
 pub fn to_plain(data: &[u8], password: Option<String>) -> Result<String, String> {
@@ -70,7 +67,7 @@ pub fn to_plain(data: &[u8], password: Option<String>) -> Result<String, String>
 /// Detect + extract Markdown. `images` embeds DOCX/XLSX/PPTX images as
 /// base64 data URIs; `ocr` is accepted for API compatibility but is a no-op
 /// in this build (the `ocr` feature is off); `password` opens an encrypted
-/// PDF (omit it when there is none). Returns the Markdown, or throws with a
+/// PDF or Office document (omit it when there is none). Returns the Markdown, or throws with a
 /// descriptive message.
 #[wasm_bindgen]
 pub fn to_markdown(
@@ -94,10 +91,8 @@ pub fn to_markdown(
 /// Detect + extract tabular data (XLS / XLSX) as an array of sheet objects,
 /// each `{ name, rows: [[cell, …], …] }`. `max_output_bytes` bounds the
 /// payload estimate (sheet name bytes + per-cell `len+1`); pass `null` from
-/// JS for unlimited. `password` is accepted for interface parity with the
-/// native API and has no effect in this build — tabular extraction takes only
-/// XLS/XLSX, and an encrypted Office package cannot be recognised as
-/// encrypted here (see the module docs).
+/// JS for unlimited. `password` opens an encrypted `.xlsx`. An encrypted
+/// legacy `.xls` is detected and reported as unsupported encryption.
 ///
 /// This collecting path is O(total cells) in both the Rust and JS heaps and
 /// is intended for small files only — prefer [`to_sheets_stream`] (or the
@@ -182,9 +177,8 @@ impl SheetSink for JsSheetSink<'_> {
 /// NOT awaited. Prefer the Rust rlib [`crate::SheetSink`] in a Worker for
 /// large, long-running workbooks. `max_output_bytes` bounds the payload
 /// estimate (see [`to_sheets`]); pass `null` from JS for unlimited.
-/// `password` is accepted for interface parity with the native API and has no
-/// effect in this build (see [`to_sheets`]). Returns `undefined`, or throws
-/// with a descriptive message.
+/// `password` opens an encrypted `.xlsx` (see [`to_sheets`]). Returns
+/// `undefined`, or throws with a descriptive message.
 #[wasm_bindgen]
 pub fn to_sheets_stream(
     data: &[u8],

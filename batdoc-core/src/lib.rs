@@ -1012,4 +1012,127 @@ mod tests {
         };
         assert!(extract_plain_with(&enc, format, opts).is_ok());
     }
+
+    fn zip_parts(parts: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut z = zip::ZipWriter::new(&mut buf);
+        for (name, body) in parts {
+            z.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+        buf.into_inner()
+    }
+
+    fn secret_docx() -> Vec<u8> {
+        zip_parts(&[(
+            "word/document.xml",
+            "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>SecretOfficeText</w:t></w:r></w:p></w:body></w:document>",
+        )])
+    }
+
+    fn with_password(password: &str) -> ExtractOptions {
+        ExtractOptions {
+            password: Some(password.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn encrypted_standard_docx_extracts_with_password() {
+        let enc = msoffice_crypto::encrypt_ooxml_standard(&secret_docx(), "pw").unwrap();
+
+        let err = to_plain(&enc).unwrap_err();
+        assert!(matches!(err, BatdocError::PasswordRequired), "got {err:?}");
+
+        let text = to_plain_with(&enc, with_password("pw")).unwrap();
+        assert!(text.contains("SecretOfficeText"), "got {text:?}");
+
+        let err = to_plain_with(&enc, with_password("nope")).unwrap_err();
+        assert!(matches!(err, BatdocError::IncorrectPassword), "got {err:?}");
+        assert!(!err.to_string().contains("pw") && !err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn encrypted_xlsx_extracts_sheets_with_password() {
+        let xlsx = zip_parts(&[
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<?xml version="1.0"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <si><t>SecretCell</t></si>
+</sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>
+</worksheet>"#,
+            ),
+        ]);
+        let enc = msoffice_crypto::encrypt_ooxml(&xlsx, "pw").unwrap();
+        assert_eq!(detect_format_with(&enc, Some("pw")).unwrap(), Format::Xlsx);
+
+        let text = to_plain_with(&enc, with_password("pw")).unwrap();
+        assert!(text.contains("SecretCell"), "got {text:?}");
+
+        let sheets = to_sheets_with(&enc, with_password("pw")).unwrap();
+        assert_eq!(sheets.len(), 1);
+        assert_eq!(sheets[0].rows, vec![vec!["SecretCell".to_string()]]);
+    }
+
+    #[test]
+    fn encrypted_pptx_extracts_with_password() {
+        let pptx = zip_parts(&[
+            (
+                "ppt/presentation.xml",
+                r#"<?xml version="1.0"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>
+</p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                r#"<?xml version="1.0"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree>
+    <p:sp><p:txBody><a:p><a:r><a:t>SecretSlideText</a:t></a:r></a:p></p:txBody></p:sp>
+  </p:spTree></p:cSld>
+</p:sld>"#,
+            ),
+        ]);
+        let enc = msoffice_crypto::encrypt_ooxml(&pptx, "pw").unwrap();
+        assert_eq!(detect_format_with(&enc, Some("pw")).unwrap(), Format::Pptx);
+        let text = to_plain_with(&enc, with_password("pw")).unwrap();
+        assert!(text.contains("SecretSlideText"), "got {text:?}");
+        let md = to_markdown_with(&enc, with_password("pw")).unwrap();
+        assert!(md.contains("SecretSlideText"), "got {md:?}");
+    }
 }

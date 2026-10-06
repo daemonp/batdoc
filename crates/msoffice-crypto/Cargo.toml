@@ -1,0 +1,418 @@
+[package]
+name = "msoffice-crypto"
+version = "0.1.0-rc.5"
+edition = "2021"
+description = "Microsoft Office document encryption per MS-OFFCRYPTO: detect, decrypt and encrypt (agile and Office 2007 standard), with key material that zeroizes on drop and a detection build that links no cryptography. Not affiliated with Microsoft. batdoc fork: cfb timestamps go through web_time::SystemTime so this links on wasm32-unknown-unknown."
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Slurp9187/msoffice-crypto"
+# Without this, the crates.io listing offers a Repository chip and no Documentation one,
+# which is what rc.2 and rc.3 shipped with. docs.rs itself was never the problem -- it
+# built and rendered both, and `[package.metadata.docs.rs]` below is why -- but the
+# manifest never declared the link, so a reader on crates.io had no route to the docs the
+# crate had gone to some trouble to produce. Metadata is baked in at publish, so this
+# first appears on the next release; the two published listings keep their one chip.
+documentation = "https://docs.rs/msoffice-crypto"
+readme = "README.md"
+keywords = ["office", "ooxml", "ecma376", "encryption", "msoffcrypto"]
+categories = ["cryptography", "parser-implementations"]
+
+# Every `src/bin/*.rs` is otherwise auto-discovered as its own binary target, which would
+# turn the CLI's `#[path]`-included test module into a second binary with no `main`.
+autobins = false
+
+# Allowlist -- everything not named here stays out of the crates.io tarball. It does NOT
+# affect git: the tests, the fixtures and docs/ all remain in the repository.
+#
+# This is the minimum at which the *published* crate is self-consistent, and no more:
+#
+#   - src/**/*.rs is the crate.
+#   - LICENSE-* are not auto-included (that happens only for `license-file`, and this crate
+#     uses an SPDX `license` expression). Both licences require the text to travel with the
+#     copy: MIT's notice clause, Apache-2.0 section 4(a).
+#   - NOTICE carries the BSD-3 attribution herumi/msoffice requires for the ported encrypt
+#     path, and the MIT chains for office-crypto and msoffcrypto-tool.
+#   - build.rs decides whether the corpus-dependent tests are `#[ignore]`d. Without it the
+#     published crate's `cargo test` reports 30 failures -- the fixtures-are-not-optional
+#     rule firing against a tarball that deliberately ships 2 of the 19 fixtures. Shipping
+#     the script and not the corpus is the point: it is what turns those 30 into an honest
+#     "ignored, needs the fixture corpus" instead of red.
+#   - SECURITY.md is where a reader who has only the tarball finds out how to report a
+#     flaw, and -- more usefully -- what this crate counts as one. A panic on a crafted
+#     file is a vulnerability here and an ordinary bug almost anywhere else, which is not
+#     something a reporter can infer from the source. 5 KB against a 310 KB tarball; the
+#     size argument that cut the fixtures does not reach it.
+#   - The two fixtures are the ones `classify`'s doc examples pull in with `include_bytes!`
+#     (src/classify.rs:340, :362). Without them `cargo test --doc` does not *compile* on an
+#     unpacked tarball -- a compile error, not a skipped test. Both are python-docx output
+#     rather than Office's, so unlike the other seventeen they carry no document metadata
+#     from whoever generated them.
+#
+# README.md is included automatically by `readme = "README.md"`.
+#
+# What this deliberately drops: tests/*.rs, examples/*.rs and the other seventeen fixtures,
+# which were ~666 KB raw and two thirds of the .crate. A consumer therefore cannot re-run
+# the fixture suite from the tarball alone; the repository is where the evidence is checked,
+# and CHANGELOG.md is where the external readers' verdicts are recorded. That is a
+# reversal of the earlier posture -- see docs/design/development-record.md section 2.4.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "tests/fixtures/plain.docx",
+    "tests/fixtures/agile_encrypted.docx",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "NOTICE",
+    "SECURITY.md",
+]
+
+# docs.rs builds with default features unless told otherwise, and the default here is
+# detection-only -- without this the rendered docs would omit `decrypt_ooxml`,
+# `IntegrityPolicy` and `IntegrityOutcome` entirely.
+[package.metadata.docs.rs]
+all-features = true
+# Same `docsrs` cfg the `docsrs` CI job passes, so a `doc_cfg` marker added later is
+# visible on docs.rs and in that job alike. Inert on stable; the MSRV job is unaffected.
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Detection only (S1). `classify` needs a CFB reader and an XML parser and no cipher at
+# all. Nobody pays for a cipher stack to ask whether a file is encrypted.
+#
+# The property, not a count -- the count differs by platform and is not what a consumer
+# is promised. CI's `no-cipher-in-detection` job asserts it on every push; reproduce with:
+#   cargo tree --locked -e normal --prefix none --no-default-features \
+#     | grep -E '^(aes|cbc|ecb|sha1|sha2|hmac|subtle|rand|rand_core|getrandom|chacha20|secure-gate|zeroize|base64) '
+# which must print nothing.
+default = []
+
+# Everything past detection: `decrypt_ooxml`, `decrypt_ooxml_with_policy`, and the
+# `IntegrityPolicy` / `IntegrityOutcome` enums that only mean something to a decrypt.
+#
+# One feature, not one per format. `agile` and `standard` share `aes`, `secure-gate` and
+# the CFB reader, so splitting them would save a consumer nothing measurable while adding
+# a third build configuration in which a bound or a helper can be dead in neither of the
+# others -- the failure mode `odf-crypto` hit when it collapsed its own `decrypt`/`encrypt`
+# split back into one feature.
+#
+# Named for what it gates, which is not only ciphers: sha1/sha2 are hashes, hmac is a MAC,
+# and base64 is the agile XML's blob decoder -- `classify` reports attribute *names* and
+# *numbers*, so it never decodes one.
+crypto-ops = [
+    "dep:aes",
+    "dep:base64",
+    "dep:cbc",
+    "dep:ecb",
+    "dep:hmac",
+    "dep:rand",
+    "dep:sha1",
+    "dep:secure-gate",
+    "dep:sha2",
+    "secure-gate/ct-eq",
+    "secure-gate/rand",
+]
+
+# Word 97-2003, Excel 97-2003 and PowerPoint 97-2003 decryption (plan slice S3):
+# `decrypt_binary_office`, over RC4 CryptoAPI ([MS-OFFCRYPTO] 2.3.5), Office 97/2000 RC4
+# (2.3.6) and XOR obfuscation (2.3.7). A superset of `crypto-ops` -- it needs the same
+# SHA-1, the same secure-gate wrappers and the same CFB reader -- plus the two primitives
+# nothing modern uses, the RC4 stream cipher and MD5. Default off, so the default build
+# stays modern-Office and neither `rc4` nor `md-5` reaches a consumer who never opens a
+# `.doc`. CI's `no-cipher-in-detection` job asserts both are absent from the detection
+# graph AND from the `crypto-ops` graph; reproduce with:
+#   cargo tree --locked -e normal --prefix none --no-default-features --features crypto-ops \
+#     | grep -E '^(rc4|md-5) '
+# which must print nothing.
+legacy-binary = ["crypto-ops", "dep:rc4", "dep:md-5"]
+
+# The `msoffice-crypto` binary (plan docs/plans/msoffice-crypto-cli-2026-09-11.md).
+cli = ["crypto-ops", "dep:clap", "dep:rpassword", "dep:serde_json"]
+
+[[bin]]
+name = "msoffice-crypto"
+path = "src/bin/msoffice-crypto.rs"
+required-features = ["cli"]
+
+[dependencies]
+clap = { version = "4", optional = true, default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+rpassword = { version = "7", optional = true }
+serde_json = { version = "1", optional = true }
+# CFB (Compound Binary File) container. 0.14 over the 0.7 this crate started on:
+# 0.14 adds create_with_version (CFB v3 512B vs v4 4096B sectors -- Office cares),
+# create_new_stream, an internal validate pass, and a fuzz target covering the
+# writer. The writer half is unused today and load-bearing for the encrypt path,
+# so the bump is taken now rather than mid-feature.
+#
+# Unconditional: `classify` opens the container to read /EncryptionInfo, and the
+# reader's bounds-checking is what makes that safe on an untrusted file.
+cfb = "0.14"
+# `cfb` 0.14's `set_created_time` / `set_modified_time` take `web_time::SystemTime`.
+# Off wasm that is a re-export of `std::time::SystemTime`; on
+# `wasm32-unknown-unknown` it is a different type. Naming it here is what lets
+# `cfb_zero_time` compile for both. See BATDOC-FORK.md.
+web-time = "1"
+
+# Unconditional: `classify` parses the agile EncryptionInfo XML to report the algorithm
+# tuple and whether a <dataIntegrity> element is declared.
+# 0.42 over the 0.38 this crate ran on until 2026-09-05, and the bump is a security fix
+# rather than currency. Two RUSTSEC advisories land on 0.38 and both are remediated in
+# 0.41.0:
+#
+#   RUSTSEC-2026-0194  `BytesStart::attributes()` with the default duplicate-name check is
+#                      O(N^2) in the attribute count of a single start tag. Reachable here:
+#                      seven call sites in `classify.rs` and `agile.rs` iterate attributes
+#                      of XML that came out of a file an attacker chose, with checks left
+#                      on. The advisory measures ~6 s for 80,000 attributes and ~10 min for
+#                      800,000 on one tag -- pure computation, so a caller's I/O timeout
+#                      cannot interrupt it. That is precisely CLAUDE.md's "unbounded work
+#                      is a vulnerability", and it was in the DEFAULT build, the one whose
+#                      whole pitch is that it is cheap and safe to run on anything.
+#   RUSTSEC-2026-0195  unbounded namespace-declaration allocation in `NsReader`. Not
+#                      reachable here -- both parsers use the plain `Reader` and neither
+#                      resolves namespaces -- but it rides the same fix.
+#
+# 0.41.0 is the floor that fixes both, and it is what is taken. It builds against this
+# crate's source with **zero changes** -- verified, not assumed. 0.42 is deliberately NOT
+# taken: it moves element and attribute names from `&[u8]` to `&str`, so every
+# `match attr.key.as_ref() { b"cipherAlgorithm" => ... }` in `classify.rs` and `agile.rs`
+# stops compiling. That migration may well be worth doing, but it is a refactor of both
+# parsers and it must not ride along inside a security fix, where the whole value is that
+# the diff is small enough to be read in full.
+#
+# `cargo deny check advisories` is what found this, on the day the job was added -- the
+# first thing it did. Before that the crate would have gone to crates.io carrying a
+# reachable DoS in its default build.
+quick-xml = "0.41"
+thiserror = "2.0"
+
+sha2 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+
+# HMAC for the ECMA-376 agile `dataIntegrity` tag (S2). Keyed with the value
+# recovered from `encryptedHmacKey` and evaluated over the whole EncryptedPackage
+# stream. The hash comes from the file's own `keyData/@hashAlgorithm`, so all four
+# of SHA-1/256/384/512 are wired even though every fixture in the corpus is SHA-512.
+hmac = { version = "0.12", optional = true }
+
+# `zeroize` on both, for the reason it is on `rc4` below: the AES key schedule is the
+# round keys expanded from the session key, and the CBC state carries a block of
+# key-dependent material. Neither is reachable from this crate -- they live inside the
+# cipher objects -- so a wrapper here cannot cover them and only the upstream feature can.
+# `aes` declares `zeroize` as an optional dependency rather than in `[features]`, so the
+# feature is implicit; it implements `ZeroizeOnDrop` on the round keys in all three
+# backends (`soft.rs`, `ni.rs`, `armv8.rs`), which is what makes it worth turning on
+# wherever this actually runs. `ecb` has no such feature to enable -- checked, not assumed.
+#
+# This adds no crate to any graph: `zeroize` is already a `crypto-ops` node through
+# secure-gate, so both lines switch on code in crates that are already there.
+#
+# It was missing here while `rc4` had it since the legacy work, which is the more
+# interesting half: the hazard was identified, given a CI packaging invariant, and applied
+# to the cipher in `legacy-binary` while the cipher in the default `crypto-ops` build went
+# without. Found by auditing what crosses a `with_secret` boundary, not by reading this file.
+aes = { version = "0.8", optional = true, features = ["zeroize"] }
+cbc = { version = "0.1", optional = true, features = ["block-padding", "zeroize"] }
+ecb = { version = "0.1", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# The two primitives only the 97-2003 binary formats use (feature `legacy-binary`).
+# RustCrypto, MIT/Apache-2.0, on the same `cipher` 0.4 / `digest` 0.10 lines as `aes`
+# and `sha1`, so they add exactly two crates and no second copy of a trait crate --
+# both were already in the dev graph through `office-crypto`.
+#
+# `rc4`'s `zeroize` feature wipes the 256-byte key schedule on drop; the schedule is
+# a function of the block key, so leaving it behind would leave the key behind.
+# `zeroize` itself is already in the graph through secure-gate.
+rc4 = { version = "0.1", optional = true, features = ["zeroize"] }
+md-5 = { version = "0.10", optional = true }
+
+# Randomness for the encrypt path (plan slice S5, step 4): salts, the verifier input and the
+# session key. Two things come from here and nothing else does -- `SysRng` for the
+# production entry point, and the `TryRng` + `TryCryptoRng` bounds that let every
+# generator take an *injected* RNG so a test can seed it (plan D3). Both are re-exports
+# of `rand_core`'s, so naming `rand` rather than `rand_core` costs nothing.
+#
+# Zero added crates: `secure-gate/rand` (enabled just above, for `Dynamic::from_rng`)
+# already resolves rand 0.10 with `sys_rng`, so this names a dependency the graph has
+# rather than adding one.
+#
+# `default-features = false` keeps the distribution machinery, `thread_rng` and the SIMD
+# backends out; `sys_rng` is the one feature the production path needs.
+rand = { version = "0.10", optional = true, default-features = false, features = [
+    "sys_rng",
+] }
+
+# Key material -- the spin hash, the derived block keys and the session
+# encryption key -- is wrapped so it zeroizes on drop. This is the property no
+# other implementation of these formats has (office-crypto, ms-offcrypto-writer,
+# msoffcrypto-tool and herumi/msoffice all hold key bytes in bare containers),
+# and it is the reason this crate exists rather than a dependency on one of them.
+#
+# "rand" IS enabled, through `crypto-ops` below. It arrived with the encrypt path, where
+# `Dynamic::from_rng(len, &mut rng)` draws the session key (agile_encrypt.rs), the standard
+# verifier (standard_encrypt.rs) and the dataIntegrity HMAC key (integrity.rs) straight into
+# the wrapper's own storage, so the secret never exists outside it. Passing the RNG in rather
+# than reaching for a global is what makes the same code deterministic under a seeded
+# generator, and that is what allows byte-exact golden output rather than round-trip-only
+# tests.
+#
+# Salts and IVs are NOT drawn this way and are NOT wrapped: they are written into
+# EncryptionInfo in the clear, so wrapping them would be theatre. (An earlier version of this
+# comment claimed `Fixed::from_random()` supplied them. It never did -- every `from_rng` call
+# in this crate is on `Dynamic`, and `Fixed` is used at exactly one site, the XOR obfuscation
+# array.) Version tracks odf-crypto rather than the consumer's =0.8.0-rc.10 pin; see the
+# README's compatibility note.
+#
+# Pinned with `=`, not a caret, and that is load-bearing on this dependency. A caret
+# requirement carrying a pre-release tag matches later pre-releases of the same version, so
+# the previous `"0.9.0-rc.7"` already resolved to rc.10 -- and rc.10 deleted the four
+# `*_alias!` macros `src/sensitive.rs` was built on. A bare `cargo update` would have broken
+# the build with no warning; only `--locked` discipline was holding it. Upstream's README
+# recommends the pin for exactly this reason.
+#
+# The pin proved itself within minutes of being added: with `=0.9.0-rc.10` written here,
+# `cargo update --precise 0.9.0-rc.11` refused -- "candidate versions found which didn't
+# match: 0.9.0-rc.11" -- so moving the line is a deliberate edit, which is the whole point.
+# rc.12 is what is pinned now, and it is the one release in this span that changed something
+# this crate calls. `Dynamic::new_with` went from handing the closure an empty growable `Vec`
+# to handing it a pre-zeroed `&mut [u8]` of exactly `len`, which makes the heap-residue defect
+# fixed two commits earlier in this branch impossible to express rather than merely fixed --
+# see `src/rc4_cryptoapi.rs`. The all-zero slot is a documented guarantee, not an
+# implementation detail, and this crate's 40-bit RC4 key is the case it was made a guarantee
+# for: those eleven trailing zeros are key-schedule input, so a slot that merely happened to
+# be zeroed would produce a different cipher the day it was not.
+#
+# `Fixed::new_with` is unchanged at one argument -- checked against the published source
+# rather than assumed, because `src/xor_obfuscation.rs` is its only caller here and
+# `legacy-binary` is the only configuration that compiles it.
+#
+# When it goes on, the seeded RNG is a `chacha20` dev-dependency and NOT
+# `rand_chacha`. from_rng's `TryRng + TryCryptoRng` bounds come from rand_core
+# 0.10, which secure-gate 0.9 resolves; rand_chacha 0.9 is pinned to rand_core
+# 0.9 and does not satisfy them. rand's own StdRng is the trap next door -- it
+# is ChaCha12 and it takes a seed, so it compiles, but rand documents it as
+# non-portable "even with a fixed seed", which would silently invalidate a
+# committed golden on the next rand release. chacha20 0.10 with features =
+# ["rng"] is what rand's docs point at, and it adds zero crates: rand 0.10
+# already depends on it.
+#
+# "alloc" for Dynamic<Vec<u8>>; still no "encoding" -- this crate neither displays
+# nor copies key material.
+#
+# "ct-eq" IS on, switched on deliberately at S2 and recorded in the crate's
+# secure-gate skill. The dataIntegrity check compares a MAC this crate computes
+# against a value the *file* supplies, which is the textbook MAC-forgery oracle
+# shape: a short-circuiting `==` there leaks how many leading bytes of a forged tag
+# were right. (verify_password's comparison moved to ct_eq in the same change --
+# its channel is far weaker, both operands being password-derived, but leaving two
+# comparisons that look identical and were reasoned about differently is how the
+# wrong one gets copied next.)
+#
+# The cost is exactly one crate, `subtle` 2.6, which is a leaf with no transitive
+# dependencies -- and which `hmac` above pulls in regardless via digest's `mac`
+# feature. So enabling ct-eq alongside hmac adds nothing to the graph at all.
+#
+# Optional, on `crypto-ops`, for one reason: no module compiled into the detection build
+# references it. Every use -- `sensitive.rs`, `agile.rs`, `standard.rs`, `integrity.rs`,
+# `agile_encrypt.rs` -- is behind the feature, because the detection build holds no key
+# material and so has nothing to zeroize. This used to be unconditional on the strength
+# of a plan item ("the remaining third of S1 moves the public API onto secure-gate
+# types") that was withdrawn as a design error: the boundary stays plain types, and
+# nothing in `classify` will ever wrap a secret.
+#
+# This is not a dependency-count argument. In the build that has key material, secure-gate
+# and its `zeroize` come along regardless -- that is what they are for.
+secure-gate = { version = "=0.9.0-rc.12", optional = true, default-features = false, features = [
+    "alloc",
+] }
+
+[dev-dependencies]
+# Already a normal dependency, optional under "cli" (dep:serde_json). Repeated here for the
+# same reason as `cfb` below: tests/cli.rs's own need for a real JSON parser must not depend
+# on the "cli" feature continuing to spell dep:serde_json exactly this way. (Not actually
+# required by Cargo -- features resolve once per invocation for the whole package, so
+# `#![cfg(feature = "cli")]` in tests/cli.rs already activates `dep:serde_json` for every
+# target -- this entry is house style, on the `cfb` precedent below, not a workaround.)
+serde_json = "1"
+
+# Already a normal dependency; repeated here so the integration tests can build the
+# containers they feed to the public API. tests/legacy_allocation.rs needs a real .xls
+# and will not borrow the crate's internal test helpers to get one.
+cfb = "0.14"
+
+# Reads the decrypted OOXML payloads in tests/fixture_identity.rs. `docProps/core.xml` is
+# deflated inside the package, so a raw byte scan cannot see the author fields at all --
+# that is exactly how a scan over tests/fixtures/ reports the three Office-written agile
+# fixtures as clean when they are not.
+# `default-features = false`: the default set pulls `time`, which requires rustc 1.88
+# and breaks the MSRV 1.85 job -- and this only ever inflates one deflated entry.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# Differential oracle: an independent MIT implementation of the same formats,
+# used to check this crate's output against someone else's reading of the spec.
+# ms-offcrypto-writer uses office-crypto the same way to verify its own writer.
+office-crypto = "0.3"
+
+# The seeded RNG that makes encrypt output byte-exact under test (plan D3).
+#
+# `chacha20`, NOT `rand_chacha`, and not `rand::rngs::StdRng` -- see the note on the
+# `rand` dependency above and plan D3 for the full reasoning. Briefly: `from_rng`'s
+# bounds come from rand_core 0.10 and `rand_chacha` 0.9 is pinned to rand_core 0.9, so
+# it does not satisfy them; and `StdRng` *is* seedable ChaCha12 that compiles fine here
+# but is documented non-portable "even with a fixed seed", which would silently
+# invalidate a committed golden on the next rand release.
+#
+# This one does add crates -- chacha20 and ppv-lite86 -- but only to the *dev* graph.
+# rand 0.10 pulls chacha20 for `StdRng`, which lives behind its `std_rng` feature, and
+# the normal dependency above enables only `sys_rng`. So a consumer never builds it and
+# `cargo tree -e normal` is unchanged; it is here for the seeded tests alone.
+chacha20 = { version = "0.10", default-features = false, features = ["rng"] }
+
+# Enforcement lives here rather than in RUSTFLAGS: a lint set in RUSTFLAGS applies to
+# every crate Cargo compiles, dependencies included, so a new warning in `cfb` or
+# `quick-xml` would fail the build over code nobody here can edit. The [lints] table
+# applies to this package alone.
+#
+# All `warn`, never `deny`. CI already escalates -- `cargo clippy ... -- -D warnings`
+# and RUSTDOCFLAGS: -D warnings -- so these are hard failures there while a
+# work-in-progress `cargo check` stays usable locally.
+[lints.rust]
+missing_docs = "warn"
+# A public type that loses its `Debug` is an API regression a consumer meets at their
+# own `dbg!`, not at ours, and the derive is one line. Clean at `deny` when it was added
+# (2026-09-06), so this costs nothing today and refuses the regression tomorrow --
+# which is the only reason to add a lint a codebase already passes.
+missing_debug_implementations = "warn"
+# A `pub` item in a private module is public to rustc and invisible to a consumer: it
+# reads as API in the source, is documented as API by `missing_docs`, and cannot be named
+# from outside the crate. Five had accumulated (`cfb_reader`'s two functions and its
+# stream struct, `agile::decrypt`, `standard::decrypt`) before this lint was turned on.
+# One deliberate exception carries a targeted `#[allow]` and its reason: `OoXmlCryptoError`
+# in the detection build, whose re-export is feature-gated by design.
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+missing_crate_level_docs = "warn"
+invalid_codeblock_attributes = "warn"
+invalid_rust_codeblocks = "warn"
+bare_urls = "warn"
+unescaped_backticks = "warn"
+redundant_explicit_links = "warn"
+private_doc_tests = "warn"
+
+[lints.clippy]
+# Named individually, not via `pedantic = "warn"`: that group would drag in lints this
+# crate's prose (spec section numbers, `dataIntegrity`, Office product names) trips
+# constantly, the same reason `odf-crypto` names them one by one.
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+too_long_first_doc_paragraph = "warn"

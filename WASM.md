@@ -275,35 +275,27 @@ Encryption errors carry a stable prefix so JS can branch without parsing Rust
 | `incorrect-password: incorrect password` | password supplied but rejected |
 | `unsupported-encryption: {detail}` | encryption this build cannot handle |
 
-**Limitation — wasm supports encrypted PDFs only.** `msoffice-crypto` does not
-compile for `wasm32-unknown-unknown`, so the wasm build links stubs:
-`is_encrypted_office` and `is_encrypted` always return `false`, and `decrypt`
-returns `UnsupportedEncryption`. Consequences in the browser build:
+`password` decrypts an encrypted PDF (via `lopdf`) and an encrypted OOXML
+package (`.docx` / `.xlsx` / `.pptx`, via the vendored `msoffice-crypto`).
+That includes the owner-only PDF case where no user password is needed. A
+password supplied for an unencrypted file is ignored, as on native.
 
-- `password` decrypts an encrypted **PDF** (via `lopdf`) in `to_plain` and
-  `to_markdown`, including the owner-only-lock case where no user password is
-  needed. A password supplied for an unencrypted PDF is ignored, as on native.
-- `password` on `to_sheets` / `to_sheets_stream` is accepted for interface
-  parity with the native API but has **no effect** in this build: tabular
-  extraction only accepts XLS/XLSX, and an encrypted XLS/XLSX is an Office
-  package that cannot be recognised here — it fails as
-  `tabular extraction is only supported for XLS and XLSX` (or an
-  unreadable-container error from `detect_format_with`).
-- An encrypted **Office** package is **not** detected as encrypted and cannot
-  be opened, and no `password-required:` is reported for it, because nothing
-  in this build can tell it is encrypted. The failure differs by container:
-  - A legacy binary `.doc`/`.xls` is an OLE2 CFB that still carries its
-    `/WordDocument` (or `/Workbook`) stream, so `detect_format` recognises it
-    as `DOC`/`XLS`; extraction then reports
-    `unsupported-encryption: encrypted legacy .doc is not supported` (or
-    `.xls`).
-  - An encrypted OOXML package (`.docx`/`.xlsx`/`.pptx`) is an OLE2 CFB with
-    no `/WordDocument`, so no document type is recognised and `detect_format`
-    fails with the unrecognised-container error (`OLE2 file is not a .doc or
-    .xls document`).
-- `detect(data)` therefore never returns `password-required:` on wasm, while
-  the native CLI/library does for an encrypted Office package. Native builds
-  (and the `msoffice-crypto` path generally) are unaffected.
+`msoffice-crypto` 0.1.0-rc.5 does not compile for `wasm32-unknown-unknown`
+as published: `cfb` 0.14 takes `web_time::SystemTime`, which is a different
+type there than `std::time::SystemTime`. This repo vendors the crate and
+returns that type from `cfb_zero_time` (`crates/msoffice-crypto/BATDOC-FORK.md`).
+`[patch.crates-io]` applies to builds of this workspace. A crates.io consumer
+of `batdoc-core` still resolves upstream and will not link Office crypto on wasm
+until that patch is upstream.
+
+Encrypted legacy `.doc` / `.xls` are detected and reported as
+`unsupported-encryption:` on wasm and native. They are not decrypted.
+`detect(data)` returns `password-required:` for an encrypted OOXML package
+when no password was supplied.
+
+Encrypting on wasm is not supported. `web_time`'s wasm `SystemTime` cannot
+represent the CFB zero (1601-01-01), and `cfb_zero_time` panics if the encrypt
+path runs there. Decrypt does not call it.
 
 Passwords are never echoed in errors, `Debug` output, or logs.
 

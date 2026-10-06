@@ -144,19 +144,21 @@ dependencies = [
 
 [[package]]
 name = "batdoc"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "bat",
  "batdoc-core",
  "is-terminal",
  "lopdf",
  "man",
+ "msoffice-crypto",
  "rpassword",
+ "zip",
 ]
 
 [[package]]
 name = "batdoc-core"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "base64",
  "cfb 0.13.0",
@@ -1303,8 +1305,6 @@ dependencies = [
 [[package]]
 name = "msoffice-crypto"
 version = "0.1.0-rc.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ca16f17b55219899b1c5b0576c2c7e34ca23c211245c21699f60d0f59b1dc3c"
 dependencies = [
  "aes",
  "base64",
@@ -1318,6 +1318,7 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror 2.0.18",
+ "web-time",
 ]
 
 [[package]]

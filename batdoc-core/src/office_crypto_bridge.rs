@@ -5,19 +5,15 @@
 //! verifies the package HMAC. This is why a wrong password is reported as
 //! [`BatdocError::IncorrectPassword`] rather than surfacing as garbage bytes.
 //!
-//! On `wasm32-unknown-unknown` the crypto dependency is not in the graph (it
-//! does not compile there), so this module is stubs instead: Office decryption
-//! is unavailable, neither predicate ever reports `true`, and an encrypted
-//! package falls through to the unrecognised-format error. Only PDF password
-//! support applies there. The stubs keep every call site target-agnostic.
+//! The same code runs on `wasm32-unknown-unknown`. The workspace vendors
+//! `msoffice-crypto` so `cfb`'s `web_time::SystemTime` timestamps compile
+//! there; see `crates/msoffice-crypto/BATDOC-FORK.md`.
 
 use crate::error::{BatdocError, Result};
-#[cfg(not(target_arch = "wasm32"))]
 use std::panic::{self, AssertUnwindSafe};
 
 /// Ceiling for decrypted Office payloads (mirrors the CLI's 256 MiB input
 /// cap) so a small ciphertext cannot expand into an unbounded allocation.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const MAX_DECRYPTED_BYTES: usize = 256 * 1024 * 1024;
 
 /// True when `data` is an encrypted OOXML package this build can decrypt —
@@ -33,7 +29,6 @@ pub(crate) const MAX_DECRYPTED_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// `msoffice_crypto::classify` never panics and never fails: unreadable input
 /// collapses to `Family::Unknown`, which `is_encrypted` reports as `false`.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_encrypted_office(data: &[u8]) -> bool {
     if !msoffice_crypto::is_cfb_office(data) {
         return false;
@@ -47,7 +42,6 @@ pub(crate) fn is_encrypted_office(data: &[u8]) -> bool {
 /// True for any encrypted MS-OFFCRYPTO container, including legacy families
 /// this build cannot decrypt. `needs_password` uses this; detection uses
 /// [`is_encrypted_office`], which is narrower.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_encrypted(data: &[u8]) -> bool {
     msoffice_crypto::is_cfb_office(data) && msoffice_crypto::classify(data).is_encrypted()
 }
@@ -59,7 +53,6 @@ pub(crate) fn is_encrypted(data: &[u8]) -> bool {
 /// [`BatdocError::IncorrectPassword`] for a bad password,
 /// [`BatdocError::UnsupportedEncryption`] for an unimplemented algorithm,
 /// [`BatdocError::Document`] for corruption or an over-limit payload.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn decrypt(data: &[u8], password: &str) -> Result<Vec<u8>> {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         msoffice_crypto::decrypt_ooxml_with_policy(
@@ -90,7 +83,6 @@ pub(crate) fn decrypt(data: &[u8], password: &str) -> Result<Vec<u8>> {
 /// required. Messages are this crate's own; the source message is only
 /// interpolated for the generic `Document` case and never contains key
 /// material or the password.
-#[cfg(not(target_arch = "wasm32"))]
 fn map_error(e: msoffice_crypto::Error) -> BatdocError {
     use msoffice_crypto::Error as E;
     match e {
@@ -103,37 +95,6 @@ fn map_error(e: msoffice_crypto::Error) -> BatdocError {
         }
         other => BatdocError::Document(format!("Office decryption failed: {other}")),
     }
-}
-
-/// Always `false` on wasm: the crypto dependency does not compile there, so
-/// an encrypted Office package cannot be recognised or opened in this build.
-// Not `const`: signature parity with the native variant.
-#[allow(clippy::missing_const_for_fn)]
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn is_encrypted_office(_data: &[u8]) -> bool {
-    false
-}
-
-/// Always `false` on wasm, for the same reason as [`is_encrypted_office`]:
-/// without the crypto dependency an Office container cannot be classified at
-/// all, so no password can help.
-// Not `const`: signature parity with the native variant.
-#[allow(clippy::missing_const_for_fn)]
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn is_encrypted(_data: &[u8]) -> bool {
-    false
-}
-
-/// Always [`BatdocError::UnsupportedEncryption`] on wasm: Office decryption
-/// is unavailable because the crypto dependency does not compile for
-/// `wasm32-unknown-unknown`. Unreachable through [`is_encrypted_office`],
-/// which is always `false` here; it exists so call sites stay
-/// target-agnostic.
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn decrypt(_data: &[u8], _password: &str) -> Result<Vec<u8>> {
-    Err(BatdocError::UnsupportedEncryption(
-        "encrypted Office documents are not supported in this build".into(),
-    ))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
